@@ -10,6 +10,7 @@
 #include "PyProgress.h"
 #include "PyGenius.h"
 #include "PySelf.h"
+#include "PyScene.h"
 #include "AutoPallet.h"
 #include <linux/input.h>
 #include <sstream>
@@ -525,6 +526,8 @@ void read_thread(long int PD1,long int PD2,long int PD3)
     PyProgress::start(libbase);
     // 天赋与辅助特质：同一条 CPython 链路，独立线程 500ms 一轮(一局内基本不变，不用刷那么勤)
     PyGenius::start(libbase);
+    // 游戏阶段(大厅/准备/局内)：读 g_ui_mgr.ui_dict 里挂着哪个 UI 对象，独立线程 500ms 一轮
+    PyScene::start(libbase);
     // 自身锚点(g_cam_ctrl.unit)与废弃模型黑名单：100ms 一轮，切换操控对象时要立刻跟上
     PySelf::start(libbase);
     // 自动盖板：独立线程 10ms 一轮，板子列表由下面的读取循环每轮发布过去
@@ -635,12 +638,12 @@ void read_thread(long int PD1,long int PD2,long int PD3)
             uint64_t real_hunter = 0;
             const bool has_real_hunter = PySelf::hunter_body(real_hunter);
             if (show_draw_prophet && has_real_hunter){
-                if (cur_obj == real_hunter) snprintf(prophet_local, sizeof(prophet_local), "%s", getboss(filter_class_name.c_str()));
+                if (cur_obj == real_hunter) snprintf(prophet_local, sizeof(prophet_local), "%s", getboss_prophet(filter_class_name.c_str()));
             }
             else if (show_draw_prophet){//预知开始
                 if (strstr(filter_class_name.c_str(), "burke_console") == NULL&&strstr(filter_class_name.c_str(), "h55_joseph_camera") == NULL&&strstr(filter_class_name.c_str(), "redqueen_e_heijin_yizi") == NULL&&strstr(filter_class_name.c_str(), "_lod") == NULL){
                     if (strstr(filter_class_name.c_str(), "boss") != NULL){
-                        s += getboss(filter_class_name.c_str());
+                        s += getboss_prophet(filter_class_name.c_str());
                         snprintf(prophet_local, sizeof(prophet_local), "%s", s.c_str());
                     }       
                 }
@@ -994,6 +997,8 @@ void Draw_Main(ImDrawList *Draw){
     if (AutoPallet::show_touch_point) {
         ImVec2 tp(AutoPallet::touch_x, AutoPallet::touch_y);
         Draw->AddCircle(tp, 40.0f, ImColor(0, 255, 255, 255), 32, 3.0f);
+        if (AutoPallet::jitter_px > 0)   // 自动点击的随机范围
+            Draw->AddCircle(tp, (float)AutoPallet::jitter_px, ImColor(255, 255, 0, 255), 24, 2.0f);
         Draw->AddLine({tp.x - 12, tp.y}, {tp.x + 12, tp.y}, ImColor(0, 255, 255, 255), 2.0f);
         Draw->AddLine({tp.x, tp.y - 12}, {tp.x, tp.y + 12}, ImColor(0, 255, 255, 255), 2.0f);
         Draw->AddText({tp.x + 46, tp.y - 12}, ImColor(0, 255, 255, 255), "盖板触摸点");
@@ -1655,6 +1660,9 @@ void Layout_tick_UI(bool *main_thread_flag) {
             permeate_record_ini = false;
         }
 
+        // 运行状态 + 结束进程放一个带边框的框里，不用展开折叠框就能退出
+        ImGui::BeginChild("##status_box", ImVec2(0, 0),
+                          ImGuiChildFlags_Border | ImGuiChildFlags_AutoResizeX | ImGuiChildFlags_AutoResizeY);
         ImGui::Text("渲染模式 : %s, gui版本 : %s", graphics->RenderName, IMGUI_VERSION);
         ImGui::TextColored(ImVec4(1.0f, 0.0f, 1.0f, 1.0f), "帧率 %.1f FPS", ImGui::GetIO().Framerate);
 
@@ -1678,6 +1686,9 @@ void Layout_tick_UI(bool *main_thread_flag) {
             ImGui::TextColored(ImVec4(0.0f, 205.0f, 0.0f, 100.0f), "已获取到游戏数据");
         else if (read_state == 1)
             ImGui::TextColored(ImVec4(255.0f, 0.0f, 0.0f, 100.0f), "正在获取游戏数据");
+        if (ImGui::Button("结束进程"))
+            exit(0);
+        ImGui::EndChild();
 
         if (ImGui::CollapsingHeader("基础信息")) {
             ImGui::Text("游戏进程:%d", pid);
@@ -1692,6 +1703,7 @@ void Layout_tick_UI(bool *main_thread_flag) {
             ImGui::Text("Py根:%s", PyRoot::status_text());
             ImGui::Text("密码机进度:%s (已破译%d)", PyProgress::status_text(), PyProgress::decoded_count());
             ImGui::Text("天赋:%s", PyGenius::status_text());
+            ImGui::Text("阶段:%s", PyScene::status_text());
             // 自身锚点：链路一旦失效这里会写明原因，绘制自动退回相机深度启发式
             ImGui::Text("自身:%s", PySelf::status_text());
         }
@@ -1717,10 +1729,6 @@ void Layout_tick_UI(bool *main_thread_flag) {
 
             // 发布版本: 注入功能已停用
             // ImGui::Checkbox("骨骼与进度", &show_sohook);
-
-            ImGui::Text("");
-            if (ImGui::Button("结束进程"))
-                exit(0);
         }
 
         // 模仿者模式：开关 + 身份簿。开着时名字换成"N号 身份"、不画射线；读到的身份记在簿子里，
@@ -1752,7 +1760,7 @@ void Layout_tick_UI(bool *main_thread_flag) {
 
         // 自动盖板(若辰同款判定)：监管走进板子判定区、自己站在板边、两人相距 ≤3 米时点一下交互键
         if (ImGui::CollapsingHeader("自动盖板")) {
-            ImGui::Checkbox("自动盖板", &AutoPallet::enabled);
+            ImGui::Checkbox("开启##auto_pallet", &AutoPallet::enabled);   // 不能跟折叠框同名，同名 ID 冲突会点不动
             ImGui::SameLine();
             ImGui::Checkbox("显示判定范围", &AutoPallet::show_range);
             ImGui::Checkbox("显示触摸点", &AutoPallet::show_touch_point);
@@ -1761,9 +1769,11 @@ void Layout_tick_UI(bool *main_thread_flag) {
 
             static const char *modes[] = {"暴力(宽12)", "演戏(宽8)", "随机(8~12)"};
             ImGui::Combo("模式", &AutoPallet::mode, modes, 3);
-            ImGui::DragFloat("触摸点 X", &AutoPallet::touch_x, 2.0f, 0.0f, (float)displayInfo.width, "%.0f");
-            ImGui::DragFloat("触摸点 Y", &AutoPallet::touch_y, 2.0f, 0.0f, (float)displayInfo.height, "%.0f");
+            ImGui::SliderFloat("触摸点 X", &AutoPallet::touch_x, 0.0f, (float)displayInfo.width, "%.0f");
+            ImGui::SliderFloat("触摸点 Y", &AutoPallet::touch_y, 0.0f, (float)displayInfo.height, "%.0f");
             ImGui::SliderInt("按住(ms)", &AutoPallet::hold_ms, 10, 120);
+            ImGui::SliderInt("位置随机(px)", &AutoPallet::jitter_px, 0, 60);   // 只作用于自动点击，测试点击不随机
+            ImGui::SliderInt("时长随机(±ms)", &AutoPallet::jitter_ms, 0, 30);
 
             ImGui::Text("状态: %s", AutoPallet::status_text());
             ImGui::Text("点击 成功%d 失败%d  确认放下%d", AutoPallet::g_tap_ok.load(), AutoPallet::g_tap_fail.load(),

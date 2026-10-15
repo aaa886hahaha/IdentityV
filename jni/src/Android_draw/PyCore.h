@@ -302,4 +302,49 @@ inline uint64_t get_scene_obj(uint64_t model_obj)
     return is_obj(sp) ? sp : 0;
 }
 
+// ---- 游戏阶段(大厅/准备/局内)判定 ----
+// 判据 = g_ui_mgr.ui_dict 里挂着哪个 UI 对象，纯对象存在性，不用 world_type(用户已否决:多个大厅/地图下它各不同)。
+// 2026-10-15 跨进程实测(py_scene.py)并与 09-24 注入样本一致:
+//   大厅 = {UIHall}   准备 = {UIRoomWait}   局内 = {UIBattle, UIControlCustom}
+// 三态 key 完全不重叠。局内有 2 个 key，所以查"某 key 是否存在"、按 局内->准备->大厅 顺序，
+// reason 回命中的那个 key(= 007 domain 的 selection_reason)。走链见 idv-reverse-resume SKILL「区分三个阶段」。
+// 与 units_by_type 键 1/2(uses_battle_world)互为交叉校验:UIBattle 在 == 有键 1/2。
+enum Phase { PHASE_UNKNOWN = 0, PHASE_LOBBY = 1, PHASE_PREPARE = 2, PHASE_BATTLE = 3 };
+
+inline Phase detect_phase(const char *&reason)
+{
+    // g_ui_mgr 在模块 dict、ui_dict 在 UIManager 实例 dict，两个条目序号进程内稳定、跨对局不变。
+    // thread_local 配合 PyScene 单线程调用(见 PyCore 文件头「线程安全」)。find_key 自带校验，缓存错了会重扫。
+    static thread_local int64_t hint_uimgr = -1, hint_uidict = -1;
+    const char *why = "";
+    uint64_t md = game_kernel_dict(why);
+    if (!md) { reason = why; return PHASE_UNKNOWN; }
+
+    int64_t iu = find_key(md, "g_ui_mgr", hint_uimgr);
+    if (iu < 0) { reason = "没有 g_ui_mgr"; return PHASE_UNKNOWN; }
+    hint_uimgr = iu;
+    uint64_t ud = get_inst_dict(get_attr(md, iu));
+    if (!ud) { reason = "g_ui_mgr 实例 dict 无效"; return PHASE_UNKNOWN; }
+
+    int64_t id = find_key(ud, "ui_dict", hint_uidict);
+    if (id < 0) { reason = "没有 ui_dict"; return PHASE_UNKNOWN; }
+    hint_uidict = id;
+    uint64_t uidict = get_attr(ud, id);
+
+    Dict k;
+    if (!read_dict(uidict, k)) { reason = "ui_dict 读取失败"; return PHASE_UNKNOWN; }
+    bool has_room = false, has_hall = false;
+    for (int64_t i = 0; i < k.n_entries; i++) {
+        uint64_t kp = getPtr64(key_slot(k, i));
+        if (!is_obj(kp)) continue;
+        if (str_equals(kp, "UIBattle")) { reason = "UIBattle"; return PHASE_BATTLE; }
+        else if (str_equals(kp, "UIRoomWait")) has_room = true;
+        else if (str_equals(kp, "UIHall")) has_hall = true;
+    }
+    if (has_room) { reason = "UIRoomWait"; return PHASE_PREPARE; }
+    if (has_hall) { reason = "UIHall"; return PHASE_LOBBY; }
+    reason = "无已知 UI key";
+    return PHASE_UNKNOWN;
+}
+
 } // namespace PyCore

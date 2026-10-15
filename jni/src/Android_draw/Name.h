@@ -72,8 +72,9 @@ static const NameMapping player_table[] = {
     {"w_hds", "[幻灯师]"},
     {"m_ttds", "[逃脱大师]"},
     {"dns", "[斗牛士]"},
-    {"w_moju", "[默剧艺人]"}
-
+    {"w_moju", "[默剧艺人]"},
+    {"boy", "[神童]"}
+    
 };
 
 // ==================== 监管者映射表 ====================
@@ -216,6 +217,16 @@ static const char* getboss(const char* class_name) {
     boss_cache[class_name] = result;
 
     return result;
+}
+
+// ==================== 预知监管用的名字 ====================
+// 预知只关心"对面是哪个监管"，从属单位要归回本体：信徒 -> 梦之女巫、伊斯人(幻影) -> 时空之影。
+// 场上绘制仍用 getboss() 的原名，信徒/幻影要和本体分开显示
+static const char* getboss_prophet(const char* class_name) {
+    const char* name = getboss(class_name);
+    if (strcmp(name, "[信徒]") == 0) return "[梦之女巫]";
+    if (strcmp(name, "[伊斯人]") == 0) return "[时空之影]";
+    return name;
 }
 
 // ==================== 道具查找 (不缓存，出现少) ====================

@@ -28,7 +28,7 @@
 //         |along| <= 8.25 + 0.38  且  |perp| <= 半宽 + 0.38
 //   小丑拉锯(类名含 butcher_sxwd 且动作号在 0x1802CE±3)：改成 |H-P| <= 80 单位(约 6.7 米)，不需要朝向
 //   多块同时命中时取离自己最近的那块
-//   监管是孽蜥(lizard)时整套不触发(若辰按翻译名"孽蜥"判的)
+//   若辰在监管是孽蜥时整套不触发(按翻译名"孽蜥"判)，我们去掉了，见 thread_main 里的 TODO
 //
 // 三、半宽(界面「模式」)
 //   暴力 = 12/2、演戏 = 8/2、随机 = 每次点完在 8.0~12.0 之间(步长 0.1)重抽后/2
@@ -68,10 +68,12 @@ namespace AutoPallet {
 // ---- 界面配置(渲染线程写、盖板线程读；跟 show_draw_* 一样直接共享，单个 bool/int/float 的撕裂无害) ----
 static bool  enabled = false;
 static int   mode = 0;                     // 0 暴力 / 1 演戏 / 2 随机
-static float touch_x = 2450.f, touch_y = 1050.f;   // 屏幕像素(横屏方向)，就是游戏里交互(放板)按钮的位置。若辰默认值
+static float touch_x = 2418.f, touch_y = 1056.f;   // 屏幕像素(横屏方向)，就是游戏里交互(放板)按钮的位置。用户在 3200x1440 上对准的值
 static bool  show_touch_point = false;
 static bool  show_range = false;           // 把附近板子的判定矩形画在地上
 static int   hold_ms = 30;                 // 按住时长
+static int   jitter_px = 50;              // 自动点击的位置随机半径(像素)，0 = 不随机。测试点击不随机
+static int   jitter_ms = 5;                // 自动点击的按住时长随机 ±ms
 
 // ---- 若辰写死的判定参数(游戏单位) ----
 static const float HALF_LEN          = 8.25f;
@@ -214,6 +216,11 @@ static inline uint32_t xorshift(uint32_t &s)
     return s;
 }
 
+static inline float frand01(uint32_t &s)   // [0, 1)
+{
+    return (float)(xorshift(s) >> 8) * (1.0f / 16777216.0f);
+}
+
 static void do_tap(const char *source)
 {
     int r = Touch::InjectTap(touch_x, touch_y, hold_ms);
@@ -271,12 +278,13 @@ static void thread_main()
         }
         bool have_hunter = PySelf::hunter_body(hunter) && read_pos(hunter, H);
 
-        // 监管种类：孽蜥整套不触发；小丑拉锯改圆形判定
-        bool lizard = false, circle = false;
+        // 监管种类：小丑拉锯改圆形判定
+        // TODO(孽蜥)：若辰对孽蜥整套不触发，我们去掉了。那条规则真正想挡的是"飞天(跳跃)中的孽蜥"，
+        //   不是地面上的孽蜥 —— 以后找到跳跃状态的判据(动作号/高度差等)再加回一条只过滤飞天的严格判断
+        bool circle = false;
         int action = 0;
         if (have_hunter) {
             std::string cn = class_name_of(hunter);
-            lizard = cn.find("lizard") != std::string::npos;
             if (cn.find("butcher_sxwd") != std::string::npos && read_state(hunter, action))
                 circle = action > CLOWN_ACTION - 4 && action < CLOWN_ACTION + 4;
         }
@@ -316,7 +324,7 @@ static void thread_main()
             bool standing = state_ok && state == BOARD_STANDING;
             if (standing) standing_n++;
 
-            bool hit = standing && have_hunter && !lizard && hit_test(S, H, bi, g_half_wid, circle);
+            bool hit = standing && have_hunter && hit_test(S, H, bi, g_half_wid, circle);
             if (hit) {
                 float d = hdist(S, bi.pos);
                 if (d < best_d) { best_d = d; best = o; }
@@ -352,7 +360,6 @@ static void thread_main()
             continue;
         }
         if (!have_hunter)      { snprintf(g_status, sizeof(g_status), "没有监管"); continue; }
-        if (lizard)            { snprintf(g_status, sizeof(g_status), "监管是孽蜥，不盖板"); continue; }
         if (near_n == 0)       { snprintf(g_status, sizeof(g_status), "附近没有板子(板子%d)", nb); last_board = 0; continue; }
         if (standing_n == 0)   { snprintf(g_status, sizeof(g_status), "附近没有立着的板子"); }
 
@@ -367,7 +374,17 @@ static void thread_main()
         if (last_tap_ms && t - last_tap_ms < MIN_TAP_INTERVAL_MS) { snprintf(g_status, sizeof(g_status), "冷却中"); continue; }
 
         last_tap_ms = t;
-        int r = Touch::InjectTap(touch_x, touch_y, hold_ms);
+        // 位置：角度均匀、半径均匀(面积上偏向中心)；时长：hold_ms ± jitter_ms，不低于 10ms
+        float tx = touch_x, ty = touch_y;
+        if (jitter_px > 0) {
+            float ang = frand01(rng) * 6.2831853f, rad = frand01(rng) * (float)jitter_px;
+            tx += rad * cosf(ang);
+            ty += rad * sinf(ang);
+        }
+        int hold = hold_ms;
+        if (jitter_ms > 0) hold += (int)(xorshift(rng) % (uint32_t)(2 * jitter_ms + 1)) - jitter_ms;
+        if (hold < 10) hold = 10;
+        int r = Touch::InjectTap(tx, ty, hold);
         if (r == Touch::INJECT_OK) {
             g_tap_ok++;
             last_board = best;
@@ -376,8 +393,8 @@ static void thread_main()
         } else {
             g_tap_fail++;
         }
-        snprintf(g_last_result, sizeof(g_last_result), "auto %s 板子=0x%llx%s",
-                 Touch::InjectResultText(r), (unsigned long long)best, circle ? " 圆形" : "");
+        snprintf(g_last_result, sizeof(g_last_result), "auto %s (%.0f,%.0f) %dms 板子=0x%llx%s",
+                 Touch::InjectResultText(r), tx, ty, hold, (unsigned long long)best, circle ? " 圆形" : "");
         printf("[盖板] %s 半宽=%.1f 模式=%d\n", g_last_result, g_half_wid, mode);
         fflush(stdout);
         if (mode == 2) g_half_wid = (8.0f + (float)(xorshift(rng) % 41) * 0.1f) * 0.5f;

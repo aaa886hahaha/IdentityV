@@ -4,6 +4,7 @@
 2.bat
 .obj/
 .libs/
+
 build_vars.bat
 build_last.bat
 # 编译输出
@@ -18,3 +19,14 @@ __pycache__/
 # 系统文件
 .DS_Store
 Thumbs.db
+
+# 旧 PR 存档（本地保留，不提交）
+pr-archive/
+libs/
+obj/
+
+# PC 侧 /proc 内存分析工具（本地保留，不提交）
+# 这套走 /proc/<pid>/mem，对第五人格会触发网易反作弊，对本目标禁用。
+# 留在本地仅作无反作弊目标用；详见 tools/re/SKILL.md 的调研记录。
+# 同时避免把 config.py 里的本机 adb 路径/偏移常量提交进仓库。
+tools/re/
