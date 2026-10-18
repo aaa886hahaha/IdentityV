@@ -94,7 +94,17 @@ static const int UNIT_TYPE_COUNT = sizeof(UNIT_TYPES) / sizeof(UNIT_TYPES[0]);
 // 所以"谁死了" = 1088 里 unique_id 出现在 1089 里的那些；死者不收进本体集合，绘制侧自然不画。
 static const int COPYCAT_PLAYER_TYPE = 1088;
 static const int COPYCAT_GHOST_TYPE = 1089;
+static const int COPYCAT_DIRECTOR_CLONE = 1210;   // CopycatDirectorCloneUnit = 导演局里的其他玩家
+static const int COPYCAT_DIRECTOR_PUPPET = 1211;  // CopycatDirectorPuppetUnit = 导演傀儡(= 自身)
+static const int COPYCAT_GHOUL_TYPE = 1203;       // CopycatGhoulUnit = 食人鬼(会杀人的地图生物,没身份)
 static const int MAX_COPYCAT = 16;
+// 走"号码+身份"身份簿的玩家类型键。导演局其他玩家是 1210(不在 1088、identity_id 直读为 None,要走
+// combat_unit.components 遍历找身份组件,照若辰,见 read_identity);1211 是自身,靠 self 过滤掉。
+static const int COPYCAT_PLAYER_TYPES[] = {COPYCAT_PLAYER_TYPE, COPYCAT_DIRECTOR_CLONE, COPYCAT_DIRECTOR_PUPPET};
+static const int COPYCAT_PLAYER_TYPE_COUNT = sizeof(COPYCAT_PLAYER_TYPES) / sizeof(COPYCAT_PLAYER_TYPES[0]);
+static inline bool is_copycat_player_type(int t) {
+    return t == COPYCAT_PLAYER_TYPE || t == COPYCAT_DIRECTOR_CLONE || t == COPYCAT_DIRECTOR_PUPPET;
+}
 // identity 0 = 还没赋值/读不到；seat 从 1 开始，0 = 读不到；body 0 = 读不到
 struct CopycatEntry { uint64_t body; int identity; int seat; bool dead; };
 
@@ -134,8 +144,14 @@ static int     g_class_cache_count = 0;
 static int64_t g_i_unit_model = -1, g_i_cpuppet = -1;   // 表满时的共用缓存
 // 模仿者模式只有两个类(CopycatPlayerUnit / GhostCopycatPlayerUnit)，各用一组序号缓存就够
 static int64_t g_cc_i_model = -1, g_cc_i_another = -1, g_cc_i_ident = -1, g_cc_i_index = -1, g_cc_i_uq = -1;
+static int64_t g_cc_i_combat = -1;                      // unit.combat_unit 的序号(导演局走组件读身份用)
 static int64_t g_ccg_i_uq = -1;
-static int64_t g_cc_i_pos = -1;
+// position 的候选属性，学若辰的回退链：position 当前不是活值时(假面舞会把模型换成石像、
+// 有的字段会失活)依次往后试。只要有一个读出合法 Vector3 就用。
+static const char *const POS_ATTRS[6] = {
+    "position", "visual_position", "logic_position", "pos", "world_position", "puppet_position"
+};
+static int64_t g_cc_i_posattr[6] = {-1, -1, -1, -1, -1, -1};
 
 // ---- 模仿者模式的坐标：按 unit.position 画，绕开场景对象(学若辰，2026-09-26) ----
 // 假面舞会时每个人的模型换成石像(场景数组 12 -> 24 个人物对象)，身份簿按 model+0x20 配对就配不上了。
@@ -154,6 +170,23 @@ static std::atomic<uint64_t> g_pos_type{0};                // position 对象的
 static const int64_t POS_HOLD_MS = 300;
 // 校准时 position 与场景坐标的容差(场景单位，约 11.9 单位 = 1 米)。守墓人那次实测两者逐位相同
 static const float POS_CALIB_TOL = 2.0f;
+
+// ---- 模仿者模式里真正"没号码没身份"、只能按 position 画固定标签的额外单位 ----
+// 现在只剩食人鬼(地图生物)。导演分身/傀儡(1210/1211)已改走上面的"号码+身份"身份簿
+// (2026-10-18,见 collect_copycat / read_identity):它们是玩家、带 identity(组件里)和 copycat_index,
+// 以前当"无身份"盖固定"导演"标签是错的。普通模仿者局 1203 键不存在,read_list 返回 false,什么都不收。
+static const int MAX_EXTRA = 12;
+struct ExtraUnit { float x, z, y; uint8_t label; };          // label 索引 EXTRA_LABELS
+static const char *const EXTRA_LABELS[1] = { "食人鬼" };
+static const struct { int type; uint8_t label; } EXTRA_TYPES[1] = {
+    {COPYCAT_GHOUL_TYPE, 0},   // CopycatGhoulUnit 食人鬼(会杀人的地图生物,橙框)
+};
+static const int EXTRA_TYPE_COUNT = sizeof(EXTRA_TYPES) / sizeof(EXTRA_TYPES[0]);
+static ExtraUnit g_extra[2][MAX_EXTRA];
+static int       g_extra_n[2] = {0, 0};
+static std::atomic<int> g_extra_active{0};
+static ExtraUnit g_extra_work[MAX_EXTRA];
+static int       g_extra_work_n = 0;
 
 static int64_t now_ms()
 {
@@ -199,7 +232,7 @@ static bool check_lobby(uint64_t ubt, bool &in_lobby)
         if (!is_obj(kp) || getPtr64(kp + 8) != PyRoot::g_int_type) return false;
         int64_t sz = 0; uint32_t dg = 0;
         if (!vm_readv(kp + 16, &sz, 8) || !vm_readv(kp + 24, &dg, 4)) return false;
-        if (sz == 1 && (dg == 1 || dg == 2 || dg == COPYCAT_PLAYER_TYPE)) has_player = true;
+        if (sz == 1 && (dg == 1 || dg == 2 || is_copycat_player_type(dg))) has_player = true;
     }
     in_lobby = !has_player;
     return true;
@@ -283,39 +316,48 @@ static void collect_units(uint64_t ubt, int type, Snapshot &res)
 // 读指针 -> 读对象 -> 再读一次指针确认没变，refcount > 0，最多三次。类型校准见 g_pos_type 那段注释
 static bool read_position(uint64_t d, const Dict &dk, uint64_t body, float out[3])
 {
-    g_cc_i_pos = resolve_index(d, dk, g_cc_i_pos, "position");
-    if (g_cc_i_pos < 0) return false;
-    uint64_t slot = value_slot(dk, g_cc_i_pos);
-    for (int t = 0; t < 3; t++) {
-        uint64_t vp = getPtr64(slot);
-        if (!is_obj(vp)) continue;
-        uint8_t b[0x1c];
-        if (!vm_readv(vp, b, sizeof(b))) continue;
-        if (getPtr64(slot) != vp) continue;
-        int64_t rc = 0; memcpy(&rc, b, 8);
-        uint64_t tp = 0; memcpy(&tp, b + 8, 8); tp &= 0x00FFFFFFFFFFFFFFULL;
-        if (rc <= 0 || !is_obj(tp)) continue;
-        float v[3]; memcpy(v, b + 0x10, 12);
-        bool sane = true;
-        for (int k = 0; k < 3; k++) if (!std::isfinite(v[k]) || fabsf(v[k]) > 1e5f) sane = false;
-        if (!sane || (v[0] == 0 && v[2] == 0)) continue;
+    // 若辰直接信任 position，不跟场景坐标做硬校准。我们照做：按候选链依次试，第一个读出
+    // 合法 Vector3 的就用。只保留一道"便宜的类型一致性"闸(锁定第一次读到的 Vector3 类型，
+    // 之后只认这个类型)防止偶然读到别的对象；首次锁定时若 body 可读，顺手跟场景坐标比一下
+    // 只为日志提示布局对不对，不作为是否采用的条件(以前这里校准不过就整个不画 -> 假面舞会被滤)。
+    for (int a = 0; a < 6; a++) {
+        g_cc_i_posattr[a] = resolve_index(d, dk, g_cc_i_posattr[a], POS_ATTRS[a]);
+        if (g_cc_i_posattr[a] < 0) continue;
+        uint64_t slot = value_slot(dk, g_cc_i_posattr[a]);
+        for (int t = 0; t < 3; t++) {
+            uint64_t vp = getPtr64(slot);
+            if (!is_obj(vp)) break;                            // 这个候选当前是 None/垃圾，换下一个
+            uint8_t b[0x1c];
+            if (!vm_readv(vp, b, sizeof(b))) continue;         // 读失败重试本候选
+            if (getPtr64(slot) != vp) continue;                // 指针变了(竞态)重试
+            int64_t rc = 0; memcpy(&rc, b, 8);
+            uint64_t tp = 0; memcpy(&tp, b + 8, 8); tp &= 0x00FFFFFFFFFFFFFFULL;
+            if (rc <= 0 || !is_obj(tp)) continue;
+            float v[3]; memcpy(v, b + 0x10, 12);
+            bool sane = true;
+            for (int k = 0; k < 3; k++) if (!std::isfinite(v[k]) || fabsf(v[k]) > 1e5f) sane = false;
+            if (!sane || (v[0] == 0 && v[2] == 0)) continue;
 
-        uint64_t known = g_pos_type.load();
-        if (known == 0) {
-            // 还没校准：跟这个人的场景对象坐标对一下，对上才认这个类型
-            if (!body) return false;
-            uint64_t coor = getPtr64(body + 0x28);
-            float s[3];
-            if (!is_obj(coor) || !vm_readv(coor + 0xa0, s, 12)) return false;
-            for (int k = 0; k < 3; k++) if (!(fabsf(s[k] - v[k]) <= POS_CALIB_TOL)) return false;
-            g_pos_type = tp;
-            printf("[模仿者] position 校准通过 类型=0x%llx (%.1f,%.1f,%.1f)\n", (unsigned long long)tp, v[0], v[1], v[2]);
-            fflush(stdout);
-        } else if (tp != known) {
-            continue;
+            uint64_t known = g_pos_type.load();
+            if (known == 0) {
+                g_pos_type = tp;                               // 锁定类型
+                if (body) {                                    // 只为日志：布局对不对得上场景坐标
+                    uint64_t coor = getPtr64(body + 0x28);
+                    float s[3];
+                    if (is_obj(coor) && vm_readv(coor + 0xa0, s, 12)) {
+                        bool m = fabsf(s[0]-v[0]) <= POS_CALIB_TOL && fabsf(s[1]-v[1]) <= POS_CALIB_TOL
+                              && fabsf(s[2]-v[2]) <= POS_CALIB_TOL;
+                        printf("[模仿者] position 锁定 attr=%s 类型=0x%llx 场景坐标%s (%.1f,%.1f,%.1f)\n",
+                               POS_ATTRS[a], (unsigned long long)tp, m ? "一致" : "不一致·仍采用", v[0], v[1], v[2]);
+                        fflush(stdout);
+                    }
+                }
+            } else if (tp != known) {
+                break;                                         // 这个候选是别的类型，换下一个
+            }
+            memcpy(out, v, 12);
+            return true;
         }
-        memcpy(out, v, 12);
-        return true;
     }
     return false;
 }
@@ -331,11 +373,67 @@ static void pos_publish(int64_t now)
     g_pos_active = w;
 }
 
-// 模仿者模式：1088 里每个活人的 model+0x20 进本体集合，同时记下身份、号码和 unit.position；1089(鬼魂)只用来认死者
+// 读一个玩家单位的隐藏身份(identity_id, 100~399)。
+// 先直读 unit.identity_id(普通模仿者局 1088 就挂这儿,已验证);allow_component=true 且直读没有时,
+// 走 combat_unit.components 遍历找带 identity_id 的身份组件 —— 照若辰。
+//   若辰实读(若辰正式版(4).sh @0x3B60F4,2026-10-18 反汇编确认):getattr "components"(兜底 "_components")
+//   -> 把整个集合枚举出来 -> 逐个组件找 identity_id,**不按定键 1007 索引**(整段汇编没有 0x3ef 立即数)。
+//   导演局的 CopycatDirectorClone/PuppetUnit 直读 identity_id 为 None,只能走这条。
+static int read_identity(uint64_t d, const Dict &dk, bool allow_component)
+{
+    int64_t v = 0;
+    g_cc_i_ident = resolve_index(d, dk, g_cc_i_ident, "identity_id");
+    if (g_cc_i_ident >= 0 && read_int(getPtr64(value_slot(dk, g_cc_i_ident)), v) && v > 100 && v < 400)
+        return (int)v;
+    if (!allow_component) return 0;
+
+    g_cc_i_combat = resolve_index(d, dk, g_cc_i_combat, "combat_unit");
+    if (g_cc_i_combat < 0) return 0;
+    uint64_t cud = get_inst_dict(getPtr64(value_slot(dk, g_cc_i_combat)));
+    if (!cud) return 0;
+    Dict cuk;
+    if (!read_dict(cud, cuk)) return 0;
+    int64_t ci = find_key(cud, "components", -1);
+    if (ci < 0) ci = find_key(cud, "_components", -1);          // 候选名,照若辰
+    if (ci < 0) return 0;
+    uint64_t comps = getPtr64(value_slot(cuk, ci));
+
+    // components 活体里是 dict(int 键 1007 -> 身份组件),但若辰不定键、遍历找;我们照做:取第一个能读出合法 identity_id 的组件
+    Dict compk;
+    if (read_dict(comps, compk)) {
+        for (int64_t i = 0; i < compk.n_entries; i++) {
+            uint64_t cd2 = get_inst_dict(getPtr64(value_slot(compk, i)));
+            if (!cd2) continue;
+            Dict cdk;
+            if (!read_dict(cd2, cdk)) continue;
+            int64_t idx = find_key(cd2, "identity_id", -1);
+            if (idx >= 0 && read_int(getPtr64(value_slot(cdk, idx)), v) && v > 100 && v < 400)
+                return (int)v;
+        }
+        return 0;
+    }
+    int64_t ln = 0; uint64_t litems = 0;                        // 兜底:万一 components 是 list 不是 dict
+    if (read_list(comps, ln, litems)) {
+        for (int64_t i = 0; i < ln; i++) {
+            uint64_t cd2 = get_inst_dict(getPtr64(litems + i * 8));
+            if (!cd2) continue;
+            Dict cdk;
+            if (!read_dict(cd2, cdk)) continue;
+            int64_t idx = find_key(cd2, "identity_id", -1);
+            if (idx >= 0 && read_int(getPtr64(value_slot(cdk, idx)), v) && v > 100 && v < 400)
+                return (int)v;
+        }
+    }
+    return 0;
+}
+
+// 模仿者模式：玩家单位(1088 普通 + 1210 导演局其他玩家 + 1211 导演傀儡=自身)的 model+0x20 进本体集合，
+// 同时记下身份、号码(copycat_index)和 unit.position；1089(鬼魂)只用来认死者。
+// 导演局其他玩家是 CopycatDirectorCloneUnit(不在 1088、身份直读为 None):以前被当"无身份"盖固定"导演"标签,
+// 现在跟 1088 同路 —— 身份走 combat_unit.components(照若辰),号码走 copycat_index,按"N号 身份"进身份簿。
+// 1211 导演傀儡是自身,靠身份簿 self_seat / 绘制侧贴身<1m 过滤掉,不会误画。
 static void collect_copycat(uint64_t ubt, Snapshot &res)
 {
-    int64_t n = 0; uint64_t items = 0;
-    if (!read_list(get_type_list(ubt, COPYCAT_PLAYER_TYPE), n, items) || n == 0) return;
     const int64_t now = now_ms();
 
     // 死者的 unique_id(字符串，账号 uid 这类纯数字)。读不到就当没人死，最坏是多画一具尸体
@@ -353,54 +451,80 @@ static void collect_copycat(uint64_t ubt, Snapshot &res)
         }
     }
 
-    for (int64_t i = 0; i < n; i++) {
-        uint64_t d = get_inst_dict(getPtr64(items + i * 8));
-        Dict dk;
-        if (!d || !read_dict(d, dk)) continue;
+    for (int pt = 0; pt < COPYCAT_PLAYER_TYPE_COUNT; pt++) {
+        const int ptype = COPYCAT_PLAYER_TYPES[pt];
+        // 导演类直读 identity_id 为 None,才走组件遍历;1088 维持原直读(零回归、不触发组件遍历的开销)
+        const bool allow_component = (ptype != COPYCAT_PLAYER_TYPE);
+        int64_t n = 0; uint64_t items = 0;
+        if (!read_list(get_type_list(ubt, ptype), n, items) || n == 0) continue;
 
-        g_cc_i_another = resolve_index(d, dk, g_cc_i_another, "another_model");
-        if (g_cc_i_another >= 0) {
-            uint64_t sp = get_scene_obj(getPtr64(value_slot(dk, g_cc_i_another)));
-            if (sp) add_unique(res.stale, res.stale_count, MAX_STALE, sp);
-        }
+        for (int64_t i = 0; i < n; i++) {
+            uint64_t d = get_inst_dict(getPtr64(items + i * 8));
+            Dict dk;
+            if (!d || !read_dict(d, dk)) continue;
 
-        // 每一项都可能单独读失败(内存压力下页被换出)，读不到的留 0，交给身份簿沿用旧值
-        uint64_t body = 0;
-        g_cc_i_model = resolve_index(d, dk, g_cc_i_model, "model");
-        if (g_cc_i_model >= 0) body = get_scene_obj(getPtr64(value_slot(dk, g_cc_i_model)));
+            g_cc_i_another = resolve_index(d, dk, g_cc_i_another, "another_model");
+            if (g_cc_i_another >= 0) {
+                uint64_t sp = get_scene_obj(getPtr64(value_slot(dk, g_cc_i_another)));
+                if (sp) add_unique(res.stale, res.stale_count, MAX_STALE, sp);
+            }
 
-        bool is_dead = false;
-        if (dead_n > 0) {
-            g_cc_i_uq = resolve_index(d, dk, g_cc_i_uq, "unique_id");
-            char uq[24];
-            if (g_cc_i_uq >= 0 && PyCore::read_str(getPtr64(value_slot(dk, g_cc_i_uq)), uq, sizeof(uq)))
-                for (int j = 0; j < dead_n && !is_dead; j++) is_dead = strcmp(uq, dead[j]) == 0;
-        }
+            // 每一项都可能单独读失败(内存压力下页被换出)，读不到的留 0，交给身份簿沿用旧值
+            uint64_t body = 0;
+            g_cc_i_model = resolve_index(d, dk, g_cc_i_model, "model");
+            if (g_cc_i_model >= 0) body = get_scene_obj(getPtr64(value_slot(dk, g_cc_i_model)));
 
-        if (body && !is_dead) add_unique(res.body, res.body_count, MAX_BODIES, body);
-        if (res.copycat_count >= MAX_COPYCAT) continue;
+            bool is_dead = false;
+            if (dead_n > 0) {
+                g_cc_i_uq = resolve_index(d, dk, g_cc_i_uq, "unique_id");
+                char uq[24];
+                if (g_cc_i_uq >= 0 && PyCore::read_str(getPtr64(value_slot(dk, g_cc_i_uq)), uq, sizeof(uq)))
+                    for (int j = 0; j < dead_n && !is_dead; j++) is_dead = strcmp(uq, dead[j]) == 0;
+            }
 
-        CopycatEntry &e = res.copycat[res.copycat_count++];
-        e.body = body;
-        e.identity = 0;
-        e.seat = 0;
-        e.dead = is_dead;
-        int64_t v = 0;
-        g_cc_i_ident = resolve_index(d, dk, g_cc_i_ident, "identity_id");
-        if (g_cc_i_ident >= 0 && read_int(getPtr64(value_slot(dk, g_cc_i_ident)), v) && v > 100 && v < 400)
-            e.identity = (int)v;
-        g_cc_i_index = resolve_index(d, dk, g_cc_i_index, "copycat_index");
-        if (g_cc_i_index >= 0 && read_int(getPtr64(value_slot(dk, g_cc_i_index)), v) && v >= 0 && v < MAX_COPYCAT)
-            e.seat = (int)v + 1;
+            if (body && !is_dead) add_unique(res.body, res.body_count, MAX_BODIES, body);
+            if (res.copycat_count >= MAX_COPYCAT) continue;
 
-        // 坐标只给活人读；号码读不到就不知道记到哪一格
-        float p[3];
-        if (e.seat > 0 && !is_dead && read_position(d, dk, body, p)) {
-            CopycatPos &w = g_pos_work[e.seat - 1];
-            w.x = p[0]; w.z = p[1]; w.y = p[2];
-            g_pos_ms[e.seat - 1] = now;
+            CopycatEntry &e = res.copycat[res.copycat_count++];
+            e.body = body;
+            e.identity = read_identity(d, dk, allow_component);
+            e.seat = 0;
+            e.dead = is_dead;
+            int64_t v = 0;
+            g_cc_i_index = resolve_index(d, dk, g_cc_i_index, "copycat_index");
+            if (g_cc_i_index >= 0 && read_int(getPtr64(value_slot(dk, g_cc_i_index)), v) && v >= 0 && v < MAX_COPYCAT)
+                e.seat = (int)v + 1;
+
+            // 坐标只给活人读；号码读不到就不知道记到哪一格
+            float p[3];
+            if (e.seat > 0 && !is_dead && read_position(d, dk, body, p)) {
+                CopycatPos &w = g_pos_work[e.seat - 1];
+                w.x = p[0]; w.z = p[1]; w.y = p[2];
+                g_pos_ms[e.seat - 1] = now;
+            }
         }
     }
+
+    // 额外单位:真正没号码没身份、只能按 position 画固定标签的 —— 只剩食人鬼(地图生物)。
+    // 导演分身/傀儡(1210/1211)已改走上面的"号码+身份"身份簿。普通模仿者局 1203 键不存在,收不到东西。
+    g_extra_work_n = 0;
+    for (int ti = 0; ti < EXTRA_TYPE_COUNT; ti++) {
+        int64_t en = 0; uint64_t eitems = 0;
+        if (!read_list(get_type_list(ubt, EXTRA_TYPES[ti].type), en, eitems)) continue;
+        for (int64_t i = 0; i < en && g_extra_work_n < MAX_EXTRA; i++) {
+            uint64_t de = get_inst_dict(getPtr64(eitems + i * 8));
+            Dict dke;
+            if (!de || !read_dict(de, dke)) continue;
+            float p[3];
+            if (!read_position(de, dke, 0, p)) continue;    // body=0：这些单位本就不做模型配对
+            ExtraUnit &x = g_extra_work[g_extra_work_n++];
+            x.x = p[0]; x.z = p[1]; x.y = p[2]; x.label = EXTRA_TYPES[ti].label;
+        }
+    }
+    int ew = 1 - g_extra_active.load();
+    memcpy(g_extra[ew], g_extra_work, sizeof(ExtraUnit) * g_extra_work_n);
+    g_extra_n[ew] = g_extra_work_n;
+    g_extra_active.store(ew);
 }
 
 // ---- 身份簿(锁存)：模仿者开会阶段游戏负载低，Python 堆页会被换进 zram，身份/模型全读不到 ----
@@ -539,7 +663,7 @@ static bool try_refresh()
     int pos_ok = 0;
     for (int i = 0; i < MAX_COPYCAT; i++) if (g_pos[g_pos_active][i].ok) pos_ok++;
     snprintf(g_status, sizeof(g_status), "正常 %s uid=%lld 本体%d 废弃%d 身份%d 坐标%d%s",
-             res.camp == 1 ? "监管" : (res.camp == 2 ? "求生" : (res.camp == COPYCAT_PLAYER_TYPE ? "模仿者局" : "从属")),
+             res.camp == 1 ? "监管" : (res.camp == 2 ? "求生" : (is_copycat_player_type(res.camp) ? "模仿者局" : "从属")),
              (long long)res.uid, res.body_count, res.stale_count, res.copycat_count,
              pos_ok, (res.copycat_count > 0 && g_pos_type.load() == 0) ? "(未校准)" : "");
     return true;
@@ -560,7 +684,9 @@ static void refresh_once()
         g_i_cam = g_i_cam_unit = g_i_unit_mgr = g_i_ubt = -1;
         g_i_model = g_i_another = g_i_utype = g_i_uid = -1;
         g_i_unit_model = g_i_cpuppet = -1;
-        g_cc_i_model = g_cc_i_another = g_cc_i_ident = g_cc_i_index = g_cc_i_uq = g_ccg_i_uq = g_cc_i_pos = -1;
+        g_cc_i_model = g_cc_i_another = g_cc_i_ident = g_cc_i_index = g_cc_i_uq = g_ccg_i_uq = -1;
+        g_cc_i_combat = -1;
+        for (int a = 0; a < 6; a++) g_cc_i_posattr[a] = -1;
         g_class_cache_count = 0;
         g_fail_streak = 0;
     }
@@ -632,6 +758,16 @@ static bool is_body(uintptr_t obj)
     return false;
 }
 
+// 拷出本体集合(每个 = unit.model+0x20 场景对象，正好是 NativeBones 要的 M)。返回个数
+static int copy_bodies(uint64_t *out, int cap)
+{
+    if (!g_available) return 0;
+    const Snapshot &s = g_buf[g_active];
+    int n = s.body_count < cap ? s.body_count : cap;
+    for (int i = 0; i < n; i++) out[i] = s.body[i];
+    return n;
+}
+
 // 局内监管本体的场景对象(跳过巡视者)。准备阶段没有 [1] 单位，返回 false
 static bool hunter_body(uint64_t &obj)
 {
@@ -685,6 +821,17 @@ static bool copycat_seat_pos(int seat, float &x, float &z, float &y)
     x = p.x; z = p.z; y = p.y;
     return true;
 }
+
+// 额外单位(食人鬼 / 导演分身 / 导演傀儡)的当前快照：没号码没身份，绘制侧按 position 画、打固定标签
+static int copycat_extra(ExtraUnit *out, int cap)
+{
+    int a = g_extra_active.load();
+    int n = g_extra_n[a];
+    if (n > cap) n = cap;
+    memcpy(out, g_extra[a], sizeof(ExtraUnit) * n);
+    return n;
+}
+static inline const char *copycat_extra_label(uint8_t l) { return l < EXTRA_TYPE_COUNT ? EXTRA_LABELS[l] : "?"; }
 
 // 阵营按号段：1xx 侦探团 / 2xx 模仿者 / 3xx 中立(没有独立的阵营字段，若辰那些 camp* 属性在这个模式下全不存在)
 static inline int copycat_camp(int identity) { return identity / 100; }

@@ -83,6 +83,13 @@ static const int DOOR_UNIT_TYPE = 6;
 struct Entry { uint64_t scene_obj; float x, y, z; float progress; };
 struct DoorEntry { uint64_t scene_obj; float progress; bool can_open, has_open, is_opening; };
 
+// 红夫人镜面：units_by_type[246] = MaryMirrorUnit，一局 0/1 个。
+// 2026-10-18 probe2 实测：position(镜面上一点) 与 direction(单位法向) 都是 `vector` 类型、同一布局
+// (+0x10/+0x14/+0x18 = X/高度/Y)。未放下时整条在地下(高度≈-999.8)，放下即为最终值，
+// 且比"本体+247 垂直平分线"早一帧可用(那一帧 247 镜中红夫人还在地下) —— 正好补上衔接空窗。
+static const int MARY_MIRROR_UNIT_TYPE = 246;
+struct MirrorPlane { bool valid; float px, pz, nx, nz; };   // 水平：镜面点(px,pz) + 归一化法向(nx,nz)
+
 // 双缓冲发布：写线程填非活跃缓冲，填完再翻转，绘制线程永远读到一份完整的数据
 static Entry   g_buf[2][MAX_GENERATORS];
 static volatile int g_count[2] = {0, 0};
@@ -96,12 +103,16 @@ static std::atomic<int> g_active{0};
 static DoorEntry g_door_buf[2][MAX_DOORS];
 static volatile int g_door_count[2] = {0, 0};
 
+// 镜面也在同一次刷新里填、共用 g_active 翻转
+static MirrorPlane g_mirror_buf[2] = {};
+
 static uintptr_t g_libbase = 0;
 static uint64_t  g_module_dict = 0;                 // game_kernel 的 md_dict，进程内稳定
 static int64_t   g_i_unit_mgr = -1, g_i_ubt = -1, g_i_fix = -1, g_i_pos = -1, g_i_model = -1;
 // 大门自己的一套序号缓存：DoorUnit 和 GeneratorUnit 是两个类，插入顺序不同，
 // 序号不能共用(共用的话每个单位都要重扫一遍，白白浪费)
 static int64_t   g_i_hack = -1, g_i_door_model = -1, g_i_can_open = -1, g_i_has_open = -1, g_i_is_opening = -1;
+static int64_t   g_i_m_pos = -1, g_i_m_dir = -1;    // MaryMirrorUnit 的 position/direction 序号缓存
 static volatile bool g_available = false;
 static volatile int  g_fail_streak = 0;
 static char g_status[96] = "未启动";
@@ -182,6 +193,48 @@ static void collect_doors(uint64_t ubt, int write_idx)
     g_door_count[write_idx] = count;
 }
 
+// 红夫人镜面：units_by_type[246][0] 的 position(点) + direction(法向)。
+// 读不到不算整轮失败，和大门一样独立。只在红夫人局会有这个单位。
+static void collect_mirror(uint64_t ubt, int write_idx)
+{
+    g_mirror_buf[write_idx].valid = false;
+    uint64_t lst = get_type_list(ubt, MARY_MIRROR_UNIT_TYPE);
+    if (!is_obj(lst)) return;                        // 没有镜子单位(没放过/不是红夫人局)
+    int64_t n = 0;
+    vm_readv(lst + 0x10, &n, 8);
+    uint64_t items = getPtr64(lst + 0x18);
+    if (n <= 0 || !is_obj(items)) return;
+    uint64_t inst = getPtr64(items);                 // 只有 1 个 MaryMirrorUnit，取第 0 个
+    if (!is_obj(inst)) return;
+    uint64_t d = getPtr64(inst - 0x18);
+    Dict dk;
+    if (!read_dict(d, dk)) return;
+
+    g_i_m_pos = resolve_index(d, dk, g_i_m_pos, "position");
+    g_i_m_dir = resolve_index(d, dk, g_i_m_dir, "direction");
+    if (g_i_m_pos < 0 || g_i_m_dir < 0) return;
+
+    // position / direction 都是 vector 类型，+0x10/+0x14/+0x18 = X/高度/Y(实测 same_type)。
+    // 取指针->读 12 字节->重读指针确认没变(防竞态，同密码机那套)。
+    float pos[3], dir[3];
+    uint64_t pp = getPtr64(value_slot(dk, g_i_m_pos));
+    if (!is_obj(pp) || !vm_readv(pp + 0x10, pos, 12)) return;
+    if (getPtr64(value_slot(dk, g_i_m_pos)) != pp) return;
+    uint64_t dp = getPtr64(value_slot(dk, g_i_m_dir));
+    if (!is_obj(dp) || !vm_readv(dp + 0x10, dir, 12)) return;
+    if (getPtr64(value_slot(dk, g_i_m_dir)) != dp) return;
+
+    if (!(std::isfinite(pos[0]) && std::isfinite(pos[2]) && std::isfinite(dir[0]) && std::isfinite(dir[2]))) return;
+    if (pos[1] <= -300.f) return;                    // pos[1]=高度；未放下时在地下(≈-999.8)
+    float nlen = sqrtf(dir[0] * dir[0] + dir[2] * dir[2]);   // 水平法向模(实测整向量 |dir|=1，竖直分量≈0)
+    if (nlen < 0.1f) return;                          // 法向几乎竖直/无效
+    g_mirror_buf[write_idx].px = pos[0];
+    g_mirror_buf[write_idx].pz = pos[2];
+    g_mirror_buf[write_idx].nx = dir[0] / nlen;       // 归一化水平法向
+    g_mirror_buf[write_idx].nz = dir[2] / nlen;
+    g_mirror_buf[write_idx].valid = true;
+}
+
 static bool try_refresh()
 {
     if (g_module_dict == 0 && !resolve_module()) return false;
@@ -195,9 +248,10 @@ static bool try_refresh()
     uint64_t ubt = (g_i_ubt >= 0) ? get_attr(ud, g_i_ubt) : 0;
     if (!is_obj(ubt)) { snprintf(g_status, sizeof(g_status), "units_by_type 无效"); return false; }
 
-    // 大门先收：放在密码机那几个 return false 之前，免得"没有密码机列表"把门也带下水
+    // 大门、镜面先收：放在密码机那几个 return false 之前，免得"没有密码机列表"把它们也带下水
     int write_idx = 1 - g_active;
     collect_doors(ubt, write_idx);
+    collect_mirror(ubt, write_idx);
 
     // 在 int->list 的表里找键 3
     Dict k;
@@ -335,6 +389,18 @@ static bool lookup(uintptr_t obj, float x, float y, float &progress)
 
 static inline bool is_decoded(float progress) { return progress >= 99.95f; }
 
+// 枚举本局全部密码机(含 0%、含已破译)，给左侧汇总面板用。
+// 绘制侧自行按 is_decoded() 过滤掉修完的，使其从面板消失。
+static inline int gen_total() { return g_available ? g_count[g_active] : 0; }
+static bool get_gen(int i, float &progress)
+{
+    if (!g_available) return false;
+    int b = g_active;
+    if (i < 0 || i >= g_count[b]) return false;
+    progress = g_buf[b][i].progress;
+    return true;
+}
+
 // ---------------- 大门 ----------------
 // 大门不进 data[] 数组(getscene() 只认 prop_76/sender，大门那条分支收不到)，
 // 所以绘制侧不走实体循环，直接遍历这里拿到场景对象再自己投影。
@@ -346,6 +412,18 @@ static bool get_door(int i, DoorEntry &out)
     int b = g_active;
     if (i < 0 || i >= g_door_count[b]) return false;
     out = g_door_buf[b][i];
+    return true;
+}
+
+// 红夫人镜面(权威来源)：已放下的镜子的 镜面点(px,pz) + 归一化水平法向(nx,nz)。
+// 返回 false = 没放下/不是红夫人局/读不到 —— 此时绘制侧退回老的"本体+247 垂直平分线"/预览模型。
+static bool mirror_plane(float &px, float &pz, float &nx, float &nz)
+{
+    if (!g_available) return false;
+    int b = g_active;
+    if (!g_mirror_buf[b].valid) return false;
+    px = g_mirror_buf[b].px; pz = g_mirror_buf[b].pz;
+    nx = g_mirror_buf[b].nx; nz = g_mirror_buf[b].nz;
     return true;
 }
 

@@ -12,6 +12,8 @@
 #include "PySelf.h"
 #include "PyScene.h"
 #include "AutoPallet.h"
+#include "NativeBones.h"
+#include "GeniusTree.h"
 #include <linux/input.h>
 #include <sstream>
 #include <iomanip>
@@ -141,7 +143,8 @@ int data_count,zfcz,zfc;
 float matrix[16];
 float angle;
 
-static bool show_draw_Rect = true;//方框
+static bool show_draw_Rect = false;//方框
+static bool show_draw_Bones = true;//原生骨骼(抄若辰链,驱动读)
 static bool show_draw_Line = true;//射线
 static bool show_draw_Camera = false;//相机
 static bool show_draw_Door = true;//门(开门进度，走 Python 层单独绘制，不依赖 getscene)
@@ -166,6 +169,17 @@ static bool show_window = true;  // 音量键控制：音量下=隐藏，音量�
 static bool voice = true;
 static bool inform_ghost = true; // 显示鬼魂
 static bool show_sohook = false;  // 骨骼与进度覆盖层
+static bool show_genius_tree = false;  // 监管天赋树(径向图，独立可拖动窗口)
+
+// ===== 固定信息：屏幕坐标 HUD 汇总，不依赖矩阵。每块独立开关 + 独立 X/Y/大小(size=文字像素高) =====
+//   调试阶段用菜单里的滑动条摆位置/大小，调好后把下面的初值固化即可。
+//   x<=0 的块(监管特质默认)表示"水平居中"，用 px 算。
+static bool  fi_gen_on    = true;                                        // 密码机/大门 汇总面板(左中)
+static float fi_gen_x     = 40.0f,   fi_gen_y    = 320.0f, fi_gen_size    = 25.0f;
+static bool  fi_hunter_on = true;                                        // 监管 辅助特质 + 大天赋(顶中，只在我是求生者时显示)
+static float fi_hunter_x  = 0.0f,    fi_hunter_y = 173.0f, fi_hunter_size = 30.0f;
+static bool  fi_civ_on    = true;                                        // 求生者天赋(右上横排，只在我是监管时显示)
+static float fi_civ_x     = 1894.0f, fi_civ_y    = 328.0f, fi_civ_size    = 28.0f, fi_civ_gap = 80.0f;
 
 float z_x, z_y, z_z, d_x, d_y, d_z, camera, r_x, r_y, r_w;
 float X1,Y1,X2,Y2,W,H,MIDDLE,TOP,BOTTOM;
@@ -179,6 +193,24 @@ char prophet_text[1024];
 float px,py;
 Vector3A D,Z;
 
+
+// 监管天赋 id(1~40) -> 名称 / 最大等级。来自游戏配表 GK.DM.butcher_genius，
+// 探针 cmd_hunter_tree.py 实测逐条对齐(idv-replay-genius/genius-table.md)。下标 0 占位。
+static const char *const BUTCHER_GENIUS_NAME[41] = {
+    "",
+    "恶化","执念","枯萎","恐慌","破坏欲","狂暴","愤怒","禁闭空间",
+    "封禁","困兽之斗","狩猎本能","报幕","好客之道","崩坏","通缉","底牌",
+    "惯性","摧枯拉朽","嘲弄","临界点","狂欢","巨钳","拘禁狂","挽留",
+    "狩鹿","掌控欲","耐受力","表现欲","后遗症","清道夫","追猎","张狂",
+    "嬉弄","幽闭恐惧","冲动","成瘾症","余威","饥荒","惊弓之鸟","念旧癖"
+};
+static const unsigned char BUTCHER_GENIUS_MAXLV[41] = {
+    0,
+    1,1,3,1,3,3,3,1,   1,1,3,1,3,3,3,1,
+    1,1,3,1,3,3,3,1,   1,1,3,1,3,3,3,1,
+    1,1,1,1,1,1,1,1
+};
+static inline bool is_terminal_genius(int id){ return id==8||id==16||id==24||id==32; }
 
 ImColor color_red = ImColor(255,0,0,255);
 ImColor color_green = ImColor(0,255,0,255);
@@ -802,6 +834,61 @@ static inline ImColor progress_color(float v)
     return color_red;
 }
 
+// 固定信息用：按指定像素字号画文字 / 量文字宽高(默认字号由字体决定，这里显式传 size 才能跟随滑动条)
+static inline void fi_text(ImDrawList *dl, float x, float y, float size, ImU32 col, const char *txt)
+{
+    dl->AddText(ImGui::GetFont(), size, ImVec2(x, y), col, txt);
+}
+static inline ImVec2 fi_calc(float size, const char *txt)
+{
+    return ImGui::GetFont()->CalcTextSizeA(size, 99999.0f, 0.0f, txt);
+}
+
+// 画监管天赋树(径向图)。center/scale 给几何，gi.genius_levels[1..40] 给亮灭+等级。
+static void DrawGeniusTree(ImDrawList *dl, ImVec2 center, float scale, const PyGenius::Info &gi)
+{
+    GeniusTree::ensure();
+    auto POS = [&](int id) { return ImVec2(center.x + GeniusTree::g_px[id] * scale,
+                                           center.y + GeniusTree::g_py[id] * scale); };
+    ImFont *font = ImGui::GetFont();
+    // 连线：只画两端都点亮的(未点节点整个不画，所以未点的连线也不画)
+    for (int id = 1; id < GeniusTree::N; id++) {
+        int p = GeniusTree::PARENT[id];
+        if (!p) continue;
+        if (!(gi.genius_levels[id] && gi.genius_levels[p])) continue;
+        dl->AddLine(POS(p), POS(id), IM_COL32(255,190,60,255), scale*0.07f+1.0f);
+    }
+    // 中心枢纽
+    dl->AddCircleFilled(center, scale * 0.26f, IM_COL32(150,80,110,255), 28);
+    dl->AddCircle(center, scale * 0.26f, IM_COL32(220,170,200,255), 28, 2.0f);
+    // 节点：只画已点的
+    float rad = scale * 0.34f;
+    float name_sz = rad * 0.95f; if (name_sz < 10) name_sz = 10;
+    float lv_sz   = rad * 0.85f; if (lv_sz   < 11) lv_sz   = 11;
+    for (int id = 1; id < GeniusTree::N; id++) {
+        int lv = gi.genius_levels[id];
+        if (!lv) continue;                                   // 没点的完全不显示
+        ImVec2 p = POS(id);
+        bool term = GeniusTree::is_terminal(id);
+        ImU32 fill = term ? IM_COL32(255,195,30,255) : IM_COL32(255,130,35,255);
+        ImU32 ring = term ? IM_COL32(255,240,120,255) : IM_COL32(255,230,170,255);
+        dl->AddCircleFilled(p, rad, fill, 24);
+        dl->AddCircle(p, rad, ring, 24, term ? scale*0.05f+2.0f : 2.0f);
+        // 名称前 2 字(全中文，每字 3 字节 → 取前 6 字节不切断)，亮底黑字
+        char head[7] = {0};
+        const char *nm = BUTCHER_GENIUS_NAME[id];
+        int blen = 0; while (nm[blen] && blen < 6) blen++;
+        memcpy(head, nm, blen);
+        ImVec2 ts = font->CalcTextSizeA(name_sz, 99999.0f, 0.0f, head);
+        dl->AddText(font, name_sz, ImVec2(p.x - ts.x/2, p.y - ts.y/2), IM_COL32(25,20,10,255), head);
+        char ls[12]; snprintf(ls, sizeof(ls), "%d/%d", lv, BUTCHER_GENIUS_MAXLV[id]);
+        ImVec2 lss = font->CalcTextSizeA(lv_sz, 99999.0f, 0.0f, ls);
+        ImVec2 lp(p.x - lss.x/2, p.y + rad + 1.0f);
+        dl->AddText(font, lv_sz, ImVec2(lp.x+1, lp.y+1), IM_COL32(0,0,0,220), ls);   // 黑描边
+        dl->AddText(font, lv_sz, lp, IM_COL32(255,245,80,255), ls);
+    }
+}
+
 static inline bool is_real_generator(uintptr_t obj)
 {
     // 活跃位 + 一个密码机专用的辅助值。单用任何一个都不够：
@@ -891,6 +978,17 @@ void Draw_Main(ImDrawList *Draw){
     //       +0x90/+0x98 = 局部 Z 轴 = 投掷方向 = 镜面法向(与 Python rtc_model.world_transformation 第 3 行一致)
     //     可见位 +0x73 只在准备阶段为 1。
     mirror = false;
+    // 来源1(最优先): Python MaryMirrorUnit(246) 的权威镜面点 + 法向(2026-10-18 probe2 实测布局/时机)。
+    //   放下即可用、放下后平面固定不抖；且比下面"本体+247 垂直平分线"早一帧(那一帧 247 镜中红夫人
+    //   还在地下、老来源算不出) —— 正好补上预览→放出的衔接空窗。读不到(没放/非红夫人局)才退回老来源。
+    {
+        float mpx, mpz, mnx, mnz;
+        if (redqueenmod && PyProgress::mirror_plane(mpx, mpz, mnx, mnz)) {
+            mirror_line_x1 = mpx;        mirror_line_y1 = mpz;
+            mirror_line_x2 = mpx - mnz;  mirror_line_y2 = mpz + mnx;   // 沿镜面方向 = 法向的垂线
+            mirror = true;
+        }
+    }
     bool body_valid = false, mirror_valid = false;
     if (redqueen_obj != 0) {
         uintptr_t redqueen_coor = getPtr64(redqueen_obj + 0x28);
@@ -910,7 +1008,7 @@ void Draw_Main(ImDrawList *Draw){
             mirror_valid = redqueen_mirror_z >= -300 && redqueen_mirror_x != 0 && redqueen_mirror_y != 0;
         }
     }
-    if (body_valid && mirror_valid) {
+    if (!mirror && body_valid && mirror_valid) {   // 来源2(兜底): 本体+247 垂直平分线。246 没给出时才用
         float mx = (redqueen_x + redqueen_mirror_x) / 2.0f, my = (redqueen_y + redqueen_mirror_y) / 2.0f;
         float dx = redqueen_mirror_x - redqueen_x,      dy = redqueen_mirror_y - redqueen_y;   // 法向
         if (dx * dx + dy * dy > 1e-4f) {
@@ -934,6 +1032,29 @@ void Draw_Main(ImDrawList *Draw){
             }
         }
     }
+    // 预览镜 → 实际放出的衔接空窗修复：某一帧两个来源都算不出镜线(镜中红夫人正从地下升起、预览刚消失)时，
+    // 沿用上一帧的有效镜线一小段时间，避免整帧 mirror=false 的黑帧。镜子放下瞬间几乎不动，沿用几帧无害；
+    // 超时才真的停。思路同 read_thread 的"读空不发布、沿用上一轮"(SKILL 待办 #19)。
+    {
+        static bool have_last_mirror = false;
+        static float last_ml_x1 = 0, last_ml_y1 = 0, last_ml_x2 = 0, last_ml_y2 = 0;
+        static int mirror_stale = 0;
+        const int MIRROR_STALE_MAX = 30;   // 约 0.5s@60fps
+        if (!redqueenmod) {
+            have_last_mirror = false;                     // 非红夫人模式不保留，防切回来用到陈旧镜线
+        } else if (mirror) {
+            have_last_mirror = true; mirror_stale = 0;    // 本帧有新镜线，刷新缓存
+            last_ml_x1 = mirror_line_x1; last_ml_y1 = mirror_line_y1;
+            last_ml_x2 = mirror_line_x2; last_ml_y2 = mirror_line_y2;
+        } else if (have_last_mirror && mirror_stale < MIRROR_STALE_MAX) {
+            mirror_stale++;                               // 本帧读空，沿用上一帧
+            mirror_line_x1 = last_ml_x1; mirror_line_y1 = last_ml_y1;
+            mirror_line_x2 = last_ml_x2; mirror_line_y2 = last_ml_y2;
+            mirror = true;
+        } else {
+            have_last_mirror = false;                     // 超时，真的停
+        }
+    }
     if (matrix_fresh && !first_matrix_logged){
         first_matrix_logged = true;
         printf("[矩阵]");
@@ -942,8 +1063,15 @@ void Draw_Main(ImDrawList *Draw){
     }  // 直接从Matrix读16个float
     // 模仿者局没有监管，类名兜底会把场景里的 chr\boss\spkantan(磁铁)当成监管报出来，不显示
     if (show_draw_prophet && !PySelf::copycat_active()){
-        auto textSize = ImGui::CalcTextSize(prophet_text, 0, 25);
-        Draw->AddText({px-(textSize.x/2),130}, color_red, prophet_text);
+        if (PyScene::in_lobby()){
+            // 大厅：不报上一局残留的监管名，改显示运行状态(绿字)
+            const char *ok = "当前运行正常";
+            auto ts = ImGui::CalcTextSize(ok, 0, 25);
+            Draw->AddText({px-(ts.x/2),130}, color_green, ok);
+        } else {
+            auto textSize = ImGui::CalcTextSize(prophet_text, 0, 25);
+            Draw->AddText({px-(textSize.x/2),130}, color_red, prophet_text);
+        }
     }
 
     // 准备阶段：预知那行下面按座位号列出四个求生者的大天赋，**只在我是监管时显示**(用户要求)
@@ -974,25 +1102,6 @@ void Draw_Main(ImDrawList *Draw){
         }
     }
 
-    // 已破译 4 台后，剩下那台在修的就是最后一台 —— 单独用进度条标出来
-    {
-        float last_progress = 0.f;
-        if (show_draw_secret_mechine && PyProgress::last_generator(last_progress)){
-            char label[64];
-            snprintf(label, sizeof(label), "最后一台 %.1f%%", last_progress);
-            auto ts = ImGui::CalcTextSize(label, 0, 25);
-            const float bar_w = 160.0f, bar_h = 14.0f, gap = 8.0f;
-            float x0 = px - (bar_w + gap + ts.x) / 2.0f;
-            float y0 = 158.0f;                                  // 预知监管那行(y=130)的下一行
-            ImColor c = progress_color(last_progress);
-            float fill_w = bar_w * (last_progress / 100.0f);
-            if (fill_w > 0.0f)
-                Draw->AddRectFilled({x0, y0}, {x0 + fill_w, y0 + bar_h}, c);
-            Draw->AddRect({x0, y0}, {x0 + bar_w, y0 + bar_h}, ImColor(255,255,255,255));
-            Draw->AddText({x0 + bar_w + gap, y0 + bar_h/2.0f - ts.y/2.0f}, c, label);
-        }
-    }
-
     // 自动盖板的触摸点：对准游戏里的交互(放板)按钮
     if (AutoPallet::show_touch_point) {
         ImVec2 tp(AutoPallet::touch_x, AutoPallet::touch_y);
@@ -1002,6 +1111,120 @@ void Draw_Main(ImDrawList *Draw){
         Draw->AddLine({tp.x - 12, tp.y}, {tp.x + 12, tp.y}, ImColor(0, 255, 255, 255), 2.0f);
         Draw->AddLine({tp.x, tp.y - 12}, {tp.x, tp.y + 12}, ImColor(0, 255, 255, 255), 2.0f);
         Draw->AddText({tp.x + 46, tp.y - 12}, ImColor(0, 255, 255, 255), "盖板触摸点");
+    }
+
+    // ===== 固定信息(屏幕坐标 HUD 汇总，增量叠加，不改上面任何现有逻辑) =====
+    // A. 密码机 / 大门 面板(左中)。破译未满 5 台时列有进度(>0)且未破译满的机器；
+    //    全部破译完后改画两扇门进度(门数据是现有的 PyProgress 门缓冲)。
+    if (fi_gen_on && PyProgress::available()){
+        float x = fi_gen_x, y = fi_gen_y, sz = fi_gen_size;
+        float bar_w = sz * 7.0f, bar_h = sz * 0.8f, gap = sz * 0.4f, line_h = sz + 6.0f;
+        int decoded = PyProgress::decoded_count();
+        if (decoded < 5){
+            int gn = PyProgress::gen_total();
+            for (int i = 0; i < gn; i++){
+                float p = 0.f;
+                if (!PyProgress::get_gen(i, p)) continue;
+                if (p <= 0.05f) continue;                    // 没进度的不显示
+                if (PyProgress::is_decoded(p)) continue;      // 破译满的消失
+                ImColor c = progress_color(p);
+                float fill = bar_w * (p / 100.0f);
+                if (fill > 0.f) Draw->AddRectFilled({x, y}, {x + fill, y + bar_h}, c);
+                Draw->AddRect({x, y}, {x + bar_w, y + bar_h}, ImColor(255,255,255,255));
+                char pct[16]; snprintf(pct, sizeof(pct), "%.0f%%", p);
+                fi_text(Draw, x + bar_w + gap, y + (bar_h - sz)/2.0f, sz, c, pct);
+                y += line_h;
+            }
+        } else {
+            int dn = PyProgress::door_count();
+            for (int i = 0; i < dn; i++){
+                PyProgress::DoorEntry d;
+                if (!PyProgress::get_door(i, d)) continue;
+                ImColor c = d.can_open ? progress_color(d.progress) : ImColor(180,180,180,255);
+                float fill = bar_w * (d.progress / 100.0f);
+                if (fill > 0.f) Draw->AddRectFilled({x, y}, {x + fill, y + bar_h}, c);
+                Draw->AddRect({x, y}, {x + bar_w, y + bar_h}, ImColor(255,255,255,255));
+                char lbl[24]; snprintf(lbl, sizeof(lbl), "门 %.0f%%", d.progress);
+                fi_text(Draw, x + bar_w + gap, y + (bar_h - sz)/2.0f, sz, c, lbl);
+                y += line_h;
+            }
+        }
+    }
+
+    // B. 监管 辅助特质 + 大天赋(默认顶中)。只在局内、监管单位存在时有内容。
+    //    大天赋游戏不公开对手监管的，lookup 读到才画、读不到就空着。
+    if (fi_hunter_on && PyScene::in_battle() && PySelf::camp() == 2){   // 我是求生者才看监管天赋
+        uint64_t hb = 0;
+        if (PySelf::hunter_body(hb)){
+            PyGenius::Info gi;
+            if (PyGenius::lookup((uintptr_t)hb, 0.f, 0.f, gi)){
+                float sz = fi_hunter_size, line_h = sz + 6.0f, y = fi_hunter_y;
+                if (gi.support_trait != 0){
+                    char tl[48];
+                    PyGenius::trait_line_text(gi, PyGenius::trait_name(gi.support_trait), tl, sizeof(tl));
+                    if (tl[0]){
+                        ImColor cc = PyGenius::cd_ready(gi) ? color_green : ImColor(255,255,255,255);
+                        ImVec2 ts = fi_calc(sz, tl);
+                        float x = fi_hunter_x > 0.f ? fi_hunter_x : px - ts.x/2.0f;
+                        fi_text(Draw, x, y, sz, cc, tl);
+                        y += line_h;
+                    }
+                }
+                PyGenius::GeniusLine seg;
+                PyGenius::genius_segments(gi, seg);
+                if (seg.pre[0] || seg.flywheel[0] || seg.post[0]){
+                    char gl[96];
+                    snprintf(gl, sizeof(gl), "%s%s%s", seg.pre, seg.flywheel, seg.post);
+                    ImVec2 ts = fi_calc(sz, gl);
+                    float x = fi_hunter_x > 0.f ? fi_hunter_x : px - ts.x/2.0f;
+                    fi_text(Draw, x, y, sz, ImColor(255,200,0,255), gl);
+                }
+            }
+        }
+    }
+
+    // C. 求生者天赋(右上横排)。按绝处逢生三态着色(没带=白/带了没用=绿/已用=灰)。
+    //    ★ 带锁存：求生者死亡/逃离后从 data[] 消失，若直接不画会让横排左移、对齐乱。
+    //    所以按 obj 固定槽位，读到就更新，消失的槽位保留上次文本 —— 一局内槽位数只增不减。
+    static uint64_t fic_obj[4] = {0, 0, 0, 0};
+    static char     fic_txt[4][128] = {};
+    static ImColor  fic_col[4];
+    static int      fic_n = 0;
+    static bool     fic_prev_on = false;
+    {
+        bool on_now = (PySelf::camp() == 1) && PyScene::in_battle();   // 进入局内第一帧清锁存(跨局不串台)
+        if (on_now && !fic_prev_on) { fic_n = 0; for (int k = 0; k < 4; k++) { fic_obj[k] = 0; fic_txt[k][0] = 0; } }
+        fic_prev_on = on_now;
+    }
+    if (fi_civ_on && PyScene::in_battle() && PySelf::camp() == 1){   // 我是监管才看求生者天赋
+        for (int i = 0; i < data_count; i++){
+            if (data[i].camp != 2) continue;
+            if (PySelf::body_set_ready() && !PySelf::is_body(data[i].obj)) continue;
+            PyGenius::Info gi;
+            if (!PyGenius::lookup(data[i].obj, 0.f, 0.f, gi)) continue;
+            PyGenius::GeniusLine seg;
+            PyGenius::genius_segments(gi, seg);
+            char gl[128];
+            snprintf(gl, sizeof(gl), "%s%s%s", seg.pre, seg.flywheel, seg.post);
+            if (!gl[0]) continue;
+            ImColor c;
+            switch (PyGenius::desperate_state(gi)){
+                case PyGenius::DESPERATE_AVAILABLE: c = color_green; break;
+                case PyGenius::DESPERATE_USED:      c = ImColor(140,140,140,255); break;
+                default:                            c = ImColor(255,255,255,255); break;
+            }
+            int slot = -1;                                  // 找已有槽(按 obj)，没有就开新槽
+            for (int k = 0; k < fic_n; k++) if (fic_obj[k] == data[i].obj) { slot = k; break; }
+            if (slot < 0 && fic_n < 4) { slot = fic_n++; fic_obj[slot] = data[i].obj; }
+            if (slot >= 0) { snprintf(fic_txt[slot], sizeof(fic_txt[slot]), "%s", gl); fic_col[slot] = c; }
+        }
+        // 反向画(求生1 对齐求生1)；死亡的槽位保留文本 -> 不会左移、对齐不乱
+        float sz = fi_civ_size, x = fi_civ_x, y = fi_civ_y;
+        for (int k = fic_n - 1; k >= 0; k--){
+            if (!fic_txt[k][0]) continue;
+            fi_text(Draw, x, y, sz, fic_col[k], fic_txt[k]);
+            x += fi_calc(sz, fic_txt[k]).x + fi_civ_gap;
+        }
     }
 
     // 以上是屏幕坐标的 HUD(预知/花名册/最后一台)，不依赖矩阵；以下全部要投影
@@ -1123,10 +1346,99 @@ void Draw_Main(ImDrawList *Draw){
             }
             // 模仿者模式不画射线(用户要求)
         }
+
+        // 食人鬼 / 导演分身 / 导演傀儡：没号码没身份，进不了身份簿，按 unit.position 画、打固定标签。
+        // 食人鬼橙、导演类紫。普通模仿者局收不到这些，en=0 不画。
+        PySelf::ExtraUnit ex[PySelf::MAX_EXTRA];
+        int en = PySelf::copycat_extra(ex, PySelf::MAX_EXTRA);
+        for (int k = 0; k < en; k++) {
+            float qx = ex[k].x, qz = ex[k].z, qy = ex[k].y;
+            float cam = matrix[3]*qx + matrix[7]*qz + matrix[11]*qy + matrix[15];
+            if (cam <= 0.01f) continue;
+            float d = sqrt(pow(qx - Z.X, 2) + pow(qy - Z.Y, 2) + pow(qz - Z.Z, 2)) / dist_scale;
+            if (d >= 300) continue;
+            float cx = px + (matrix[0]*qx + matrix[4]*qz + matrix[8]*qy + matrix[12]) / cam * px;
+            float cy = py - (matrix[1]*qx + matrix[5]*(qz + 8.5f) + matrix[9]*qy + matrix[13]) / cam * py;
+            float cw = py - (matrix[1]*qx + matrix[5]*(qz + 28.5f) + matrix[9]*qy + matrix[13]) / cam * py;
+            float bw = (cy - cw) / 2, bh = cy - cw;
+            if (bw <= 0) continue;
+            float bx1 = cx - bh / 4, by1 = cy - bh / 2;
+            char_count++;
+            const char *lbl = PySelf::copycat_extra_label(ex[k].label);
+            ImColor c = ex[k].label == 0 ? ImColor(255,140,0,255) : ImColor(200,80,255,255);
+            auto ts = ImGui::CalcTextSize(lbl, 0, 25);
+            Draw->AddText({bx1 + bw/2 - ts.x/2, by1 - 45}, c, lbl);
+            if (show_draw_Rect)
+                ImGui::GetForegroundDrawList()->AddRect({bx1, by1}, {bx1 + bw, by1 + bh}, c, 3, 0, 1.8f);
+            if (show_draw_Distance) {
+                char dt[24];
+                snprintf(dt, sizeof(dt), "%d 米", (int)d);
+                auto ds = ImGui::CalcTextSize(dt, 0, 25);
+                Draw->AddText({bx1 + bw/2 - ds.x/2, by1 + bh + 10}, ImColor(255,200,0,255), dt);
+            }
+        }
+    }
+
+    // ---- 原生骨骼(抄若辰 sob_3A6074/39F0CC 偏移链,驱动读,零注入;见 NativeBones.h) ----
+    if (show_draw_Bones && PySelf::available()) {
+        uint64_t self_m = 0; PySelf::anchor(self_m);
+        uint64_t hunter_m = 0; bool has_hunter = PySelf::hunter_body(hunter_m);
+        uint64_t Ms[32];
+        int bn = PySelf::copy_bodies(Ms, 32);
+        for (int u = 0; u < bn; u++) {
+            bool is_self = (Ms[u] == self_m);
+            NativeBones::Skeleton sk;
+            if (!NativeBones::read_unit(Ms[u], is_self, sk) || !sk.valid) continue;
+            if (is_self) continue;                                // 自身只用于 swap 校准,不画(若辰 ignoreSelfBones)
+            // 和其它绘制一样：离自己 <1m 的不画(多是自己身上的残留模型),没自身锚点时不过滤
+            uint64_t coor = getPtr64(Ms[u] + 0x28);
+            if (self_obj != 0 && coor >= 0x5000000000ULL && coor < 0x8000000000ULL) {
+                float c[3];
+                if (vm_readv(coor + 0xa0, c, 12)) {
+                    float d = sqrt(pow(c[0]-Z.X,2) + pow(c[2]-Z.Y,2) + pow(c[1]-Z.Z,2)) / dist_scale;
+                    if (d < 1.0f) continue;
+                }
+            }
+            ImVec2 bp[NativeBones::NUM_TARGET];
+            bool bok[NativeBones::NUM_TARGET];
+            for (int t = 0; t < NativeBones::NUM_TARGET; t++) {
+                bok[t] = false;
+                if (!sk.ok[t]) continue;
+                float ox = sk.x[t], oy = sk.y[t], oz = sk.z[t];
+                float cam = matrix[3]*ox + matrix[7]*oy + matrix[11]*oz + matrix[15];
+                if (cam <= 0.01f) continue;                       // 相机背后
+                float sx = px + (matrix[0]*ox + matrix[4]*oy + matrix[8]*oz + matrix[12]) / cam * px;
+                float sy = py - (matrix[1]*ox + matrix[5]*oy + matrix[9]*oz + matrix[13]) / cam * py;
+                bp[t] = ImVec2(sx, sy); bok[t] = true;
+            }
+            // 监管红、求生者绿(监管本体 = PySelf::hunter_body)
+            ImU32 bcol = (has_hunter && Ms[u] == hunter_m) ? ImColor(255, 60, 60, 230) : ImColor(40, 255, 90, 230);
+            for (int e = 0; e < NativeBones::NUM_EDGE; e++) {
+                int a = NativeBones::EDGES[e][0], b = NativeBones::EDGES[e][1];
+                if (a == 0 || b == 0) continue;                   // 头(slot0)单独画,见下
+                if (bok[a] && bok[b]) Draw->AddLine(bp[a], bp[b], bcol, 2.2f);
+            }
+            // 头:引擎颈->头段极短,圆压在颈上不好看。沿 脊椎->颈 的身体朝向把头圆往上顶、脖子接到圆底(不重合)
+            if (bok[0]) {
+                ImVec2 up(0.f, -1.f);
+                float r = 6.0f;
+                if (bok[1] && bok[2]) {                            // 颈 + 脊椎 → 身体上方向 + 躯干尺度
+                    float dx = bp[1].x - bp[2].x, dy = bp[1].y - bp[2].y;   // 脊椎->颈
+                    float L = sqrtf(dx*dx + dy*dy);
+                    if (L > 0.5f) { up.x = dx / L; up.y = dy / L; r = L * 0.28f; }  // 头半径≈躯干的 ~1/4(原 0.5 中近距偏大)
+                }
+                if (r < 3.0f) r = 3.0f;
+                if (r > 26.0f) r = 26.0f;
+                ImVec2 base = bok[1] ? bp[1] : bp[0];             // 以颈为底
+                ImVec2 hc(base.x + up.x * (r + 3.0f), base.y + up.y * (r + 3.0f));
+                if (bok[1]) Draw->AddLine(bp[1], ImVec2(hc.x - up.x * r, hc.y - up.y * r), bcol, 2.2f);  // 脖子接圆底
+                Draw->AddCircleFilled(hc, r, bcol, 16);
+            }
+        }
     }
 
     for (int i = 0; i < data_count; i++){
-    
+
         if (strstr(data[i].class_name, "buzz") != NULL)
             continue;//跳过不知所谓的东西
         if (strstr(data[i].class_name, "nvyao.gim") != NULL)
@@ -1392,7 +1704,8 @@ void Draw_Main(ImDrawList *Draw){
                         copycat_label(cc_identity, cc_seat, cc_text, sizeof(cc_text));
                         s += cc_text;
                         name_color = copycat_color(cc_identity);
-                    } else {
+                    } else 
+                    {
                         s+=data[i].str;
                     }
                     auto textSize = ImGui::CalcTextSize(s.c_str(), 0, 25);
@@ -1482,6 +1795,7 @@ void Draw_Main(ImDrawList *Draw){
                 calculate_line_reflection(mirror_line_x1, mirror_line_y1, mirror_line_x2, mirror_line_y2, orig_x, orig_y, &D.X, &D.Y);
                 camera = matrix[3] * D.X + matrix[7] * D.Z + matrix[11] * D.Y + matrix[15];
                 dist = sqrt(pow(D.X - Z.X, 2) + pow(D.Y - Z.Y, 2) + pow(D.Z - Z.Z, 2)) / dist_scale;
+                if (dist > 60) continue;   // 用户要求：过滤 60m 外的镜像求生者(镜像反射点到自身的距离)，别让远处镜像刷屏
         		r_x = px + (matrix[0] * D.X + matrix[4] * D.Z + matrix[8] * D.Y + matrix[12]) / camera * px;
                 r_y = py - (matrix[1] * D.X + matrix[5] * (D.Z+ 8.5) + matrix[9] * (D.Y) + matrix[13]) / camera * py;
                 r_w = py - (matrix[1] * D.X + matrix[5] * (D.Z+ 28.5) + matrix[9] * (D.Y) + matrix[13]) / camera * py;
@@ -1499,7 +1813,7 @@ void Draw_Main(ImDrawList *Draw){
                     auto textSize = ImGui::CalcTextSize(ss.c_str(), 0, 25);
                     Draw->AddText({X1 + W/2-(textSize.x/2),Y1-45}, BotBoneColor, ss.c_str());
                         
-                    if (show_draw_Rect){
+                    if (true){   // 方框默认画(不受"方框绘制"开关影响，用户要求)
                         ImGui::GetForegroundDrawList()->AddRect({X1, Y1},{X2, Y2}, BotBoneColor,3, 0,1.8f);
     			    }
     			        
@@ -1511,9 +1825,56 @@ void Draw_Main(ImDrawList *Draw){
                         Draw->AddText({X1 + W/2-(textSize.x/2),Y2+10}, BotBoneColor, mirror_dist_str.c_str());
                     }
                         
-                    if (show_draw_Line){
-                        ImGui::GetForegroundDrawList()->AddLine({px, 160},{X1 + W/2, Y1}, ImColor(255, 255, 255),2);
-                    }            
+                    // 射线不画(用户要求)。
+                    // 骨骼默认画(不受"显示骨骼"开关影响)。大小换算修复(用户反馈"镜像骨骼巨大")：
+                    //   镜像只挪位置、不改尺寸 —— 不再逐根反射进世界空间(那样每根骨骼离相机的距离各自变、
+                    //   透视除数失真，骨架忽大忽小)。改成只反射【根】得到镜像落点 mroot=(D.X,D.Z,D.Y)，每根
+                    //   骨骼保持相对真实根(orig_x,D.Z,orig_y)的世界偏移原样搬到 mroot 上(bone-root 的 delta)，
+                    //   再在镜像落点的真实深度上投影。这样骨架尺寸=真人尺寸、透视与方框一致；且求生者在相机
+                    //   背后(照镜子的主要用途)时，镜像落点仍在相机前方，照样画得出(方案"真实投影再平移"做不到)。
+                    //   高度(y)不参与反射，oy 恒=真实高度 msk.y；朝向不左右翻转(ESP 用途反而更好认)。
+                    // swap_yz 只在主骨骼轮读自身时校准；若"显示骨骼"关着主轮没跑，这里先拿自身补一次。
+                    if (NativeBones::g_swap_yz.load() < 0) {
+                        uint64_t self_cal = 0;
+                        if (PySelf::anchor(self_cal)) { NativeBones::Skeleton tmp; NativeBones::read_unit(self_cal, true, tmp); }
+                    }
+                    NativeBones::Skeleton msk;
+                    if (camera > 0.01f && NativeBones::read_unit(data[i].obj, false, msk) && msk.valid) {
+                        ImVec2 bp[NativeBones::NUM_TARGET];
+                        bool bok[NativeBones::NUM_TARGET];
+                        for (int t = 0; t < NativeBones::NUM_TARGET; t++) {
+                            bok[t] = false;
+                            if (!msk.ok[t]) continue;
+                            float ox = D.X + (msk.x[t] - orig_x);   // 根搬到镜像落点，骨骼保持相对偏移
+                            float oy = msk.y[t];                    // 高度不反射
+                            float oz = D.Y + (msk.z[t] - orig_y);
+                            float cam = matrix[3]*ox + matrix[7]*oy + matrix[11]*oz + matrix[15];
+                            if (cam <= 0.01f) continue;
+                            float sx = px + (matrix[0]*ox + matrix[4]*oy + matrix[8]*oz + matrix[12]) / cam * px;
+                            float sy = py - (matrix[1]*ox + matrix[5]*oy + matrix[9]*oz + matrix[13]) / cam * py;
+                            bp[t] = ImVec2(sx, sy); bok[t] = true;
+                        }
+                        for (int e = 0; e < NativeBones::NUM_EDGE; e++) {
+                            int a = NativeBones::EDGES[e][0], b = NativeBones::EDGES[e][1];
+                            if (a == 0 || b == 0) continue;           // 头单独画
+                            if (bok[a] && bok[b]) Draw->AddLine(bp[a], bp[b], BotBoneColor, 2.2f);
+                        }
+                        if (bok[0]) {                                  // 头圆，抄主骨骼轮的画法
+                            ImVec2 up(0.f, -1.f);
+                            float r = 6.0f;
+                            if (bok[1] && bok[2]) {
+                                float dx = bp[1].x - bp[2].x, dy = bp[1].y - bp[2].y;
+                                float L = sqrtf(dx*dx + dy*dy);
+                                if (L > 0.5f) { up.x = dx / L; up.y = dy / L; r = L * 0.28f; }
+                            }
+                            if (r < 3.0f) r = 3.0f;
+                            if (r > 26.0f) r = 26.0f;
+                            ImVec2 base = bok[1] ? bp[1] : bp[0];
+                            ImVec2 hc(base.x + up.x * (r + 3.0f), base.y + up.y * (r + 3.0f));
+                            if (bok[1]) Draw->AddLine(bp[1], ImVec2(hc.x - up.x * r, hc.y - up.y * r), BotBoneColor, 2.2f);
+                            Draw->AddCircleFilled(hc, r, BotBoneColor, 16);
+                        }
+                    }
                 }//判断W
             }                
         }
@@ -1721,15 +2082,52 @@ void Layout_tick_UI(bool *main_thread_flag) {
 
             ImGui::Checkbox("绘制调试", &Debugging);
             ImGui::SameLine();
-            ImGui::Checkbox("显示密码机", &show_draw_secret_mechine);   // 进度/进度条/最后一台 都跟着它
+            ImGui::Checkbox("显示密码机", &show_draw_secret_mechine);   // 局内进度/进度条 跟着它
 
-            ImGui::Checkbox("显示天赋", &show_draw_Genius);             // 天赋行 + 监管辅助特质行
-            ImGui::SameLine();
-            ImGui::Checkbox("显示大门", &show_draw_Door);
+            // 「显示天赋」「显示大门」已移到「固定信息」折叠框(用户要求)
 
             // 发布版本: 注入功能已停用
             // ImGui::Checkbox("骨骼与进度", &show_sohook);
+            ImGui::Checkbox("显示骨骼", &show_draw_Bones);   // 原生骨骼,抄若辰链驱动读
+            ImGui::SameLine();
+            ImGui::Checkbox("显示方框", &show_draw_Rect);
+
+            ImGui::Checkbox("监管天赋树", &show_genius_tree);   // 径向图，独立可拖动窗口(单独一行)
         }
+
+        // 固定信息(屏幕 HUD 汇总)：每块独立开关 + 独立 X/Y/大小。调好位置后把初值固化即可
+        if (ImGui::CollapsingHeader("固定信息")) {
+            float mw = (float)displayInfo.width, mh = (float)displayInfo.height;
+
+            // 局内绘制的天赋行 / 大门：各自独立 bool，跟下面的固定信息面板互不共用
+            ImGui::Checkbox("显示天赋", &show_draw_Genius);   // 天赋行 + 监管辅助特质行(局内画框那套)
+            ImGui::SameLine();
+            ImGui::Checkbox("显示大门", &show_draw_Door);
+            ImGui::Separator();
+
+            ImGui::Checkbox("密码机/门面板##fi_gen", &fi_gen_on);
+            if (fi_gen_on) {
+                ImGui::SliderFloat("机 X##fi_gen", &fi_gen_x, 0.0f, mw, "%.0f");
+                ImGui::SliderFloat("机 Y##fi_gen", &fi_gen_y, 0.0f, mh, "%.0f");
+                ImGui::SliderFloat("机 大小##fi_gen", &fi_gen_size, 10.0f, 60.0f, "%.0f");
+            }
+
+            ImGui::Checkbox("监管特质/天赋##fi_hunter", &fi_hunter_on);
+            if (fi_hunter_on) {
+                ImGui::SliderFloat("监 X(0=居中)##fi_hunter", &fi_hunter_x, 0.0f, mw, "%.0f");
+                ImGui::SliderFloat("监 Y##fi_hunter", &fi_hunter_y, 0.0f, mh, "%.0f");
+                ImGui::SliderFloat("监 大小##fi_hunter", &fi_hunter_size, 10.0f, 60.0f, "%.0f");
+            }
+
+            ImGui::Checkbox("求生者天赋##fi_civ", &fi_civ_on);
+            if (fi_civ_on) {
+                ImGui::SliderFloat("求 X##fi_civ", &fi_civ_x, 0.0f, mw, "%.0f");
+                ImGui::SliderFloat("求 Y##fi_civ", &fi_civ_y, 0.0f, mh, "%.0f");
+                ImGui::SliderFloat("求 大小##fi_civ", &fi_civ_size, 10.0f, 60.0f, "%.0f");
+                ImGui::SliderFloat("求 间距##fi_civ", &fi_civ_gap, 0.0f, 300.0f, "%.0f");
+            }
+        }
+
 
         // 模仿者模式：开关 + 身份簿。开着时名字换成"N号 身份"、不画射线；读到的身份记在簿子里，
         // 开会阶段页被换出读不到时沿用(见 PySelf.h 身份簿)。关掉开关簿子清空
@@ -1790,6 +2188,38 @@ void Layout_tick_UI(bool *main_thread_flag) {
         // }
 
         g_window = ImGui::GetCurrentWindow();
+        ImGui::End();
+    }
+
+    // 监管天赋树(径向图)：独立可拖动/缩放窗口。数据用 Info.genius_levels[1..40]，纯显示。
+    // 跟主菜单一样绑音量键(show_window)：音量下一起隐藏、音量上一起显示。
+    if (show_genius_tree && show_window) {
+        float side = displayInfo.height * 0.8f;          // 默认占 80% 屏高(正方形)
+        ImGui::SetNextWindowSize(ImVec2(side, side), ImGuiCond_FirstUseEver);
+        if (ImGui::Begin("监管天赋树", &show_genius_tree)) {
+            uint64_t hb = 0; PyGenius::Info gi;
+            bool ok = PyScene::in_battle() && PySelf::hunter_body(hb)
+                      && PyGenius::lookup((uintptr_t)hb, 0.f, 0.f, gi);
+            if (ok) {
+                int cnt = 0, term = 0, pts = 0;
+                for (int id = 1; id <= 40; id++) {
+                    int lv = gi.genius_levels[id];
+                    if (!lv) continue; cnt++; pts += lv;
+                    if (GeniusTree::is_terminal(id)) term++;
+                }
+                ImGui::Text("已点 %d 项   终端 %d/4   合计 %d 点", cnt, term, pts);
+                ImVec2 p0 = ImGui::GetCursorScreenPos();
+                ImVec2 avail = ImGui::GetContentRegionAvail();
+                if (avail.x > 40 && avail.y > 40) {
+                    ImVec2 center(p0.x + avail.x / 2.0f, p0.y + avail.y / 2.0f);
+                    float scale = fminf(avail.x, avail.y) / 9.5f;   // 最大半径 depth3→4 单位 + 节点
+                    DrawGeniusTree(ImGui::GetWindowDrawList(), center, scale, gi);
+                    ImGui::Dummy(avail);
+                }
+            } else {
+                ImGui::TextDisabled("未在局内 / 监管天赋读取中…");
+            }
+        }
         ImGui::End();
     }
 }
