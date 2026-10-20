@@ -14,6 +14,7 @@
 #include "AutoPallet.h"
 #include "NativeBones.h"
 #include "GeniusTree.h"
+#include "PyWaterFight.h"
 #include <linux/input.h>
 #include <sstream>
 #include <iomanip>
@@ -158,6 +159,7 @@ static bool show_draw_Genius = true;//天赋/辅助特质(走 CPython 链路，�
 static bool show_draw_prophet = true;//预知监管者
 static bool redqueenmod = false;//红夫人模式
 static bool copycat_mode = false;//模仿者模式：角色名换成"N号 身份"，按阵营着色(见 PySelf.h 模仿者模式那节)
+static bool waterfight_mode = false;//林中童话(娱乐模式,底层打水仗)：独立绘制玩家(动物阵营配色)+物资，见 PyWaterFight.h
 static bool show_draw_secret_mechine = true;//密码机(含破译进度/进度条/最后一台)
 static bool show_draw_Role = false;//角色
 static bool show_draw_touch = false;//孽蜥
@@ -562,6 +564,8 @@ void read_thread(long int PD1,long int PD2,long int PD3)
     PyScene::start(libbase);
     // 自身锚点(g_cam_ctrl.unit)与废弃模型黑名单：100ms 一轮，切换操控对象时要立刻跟上
     PySelf::start(libbase);
+    // 林中童话(打水仗 BR)：玩家[1601]+物资[1602/1606]，独立线程 100ms 一轮，只在 waterfight_mode 时绘制
+    PyWaterFight::start(libbase);
     // 自动盖板：独立线程 10ms 一轮，板子列表由下面的读取循环每轮发布过去
     AutoPallet::start();
 
@@ -932,6 +936,28 @@ static void copycat_label(int identity, int seat, char *out, size_t cap)
     else snprintf(out + len, cap - len, "?");
 }
 
+// 林中童话配色按 water_fight_team(1~8，"八个阵营两两组队"指的就是它)：同队两人同色；0=未读到 白
+static ImColor waterfight_color(int team)
+{
+    switch (team) {
+        case 1:  return ImColor(240, 50, 50,255);   // 红
+        case 2:  return ImColor(255,140,  0,255);   // 橙
+        case 3:  return ImColor(255,225,  0,255);   // 黄
+        case 4:  return ImColor( 70,210, 70,255);   // 绿
+        case 5:  return ImColor(  0,220,210,255);   // 青
+        case 6:  return ImColor( 60,150,255,255);   // 蓝
+        case 7:  return ImColor(190,110,245,255);   // 紫
+        case 8:  return ImColor(255, 80,190,255);   // 品红
+        default: return ImColor(255,255,255,255);   // 未读到
+    }
+}
+// label 用 water_fight_identity 动物名(个人，不是队)：1马鹿…10野猪
+static const char *waterfight_name(int identity)
+{
+    static const char *N[11] = {"?","马鹿","野猫","狐狸","獾","雪兔","金雕","松鼠","草蛇","蝙蝠","野猪"};
+    return (identity >= 1 && identity <= 10) ? N[identity] : "?";
+}
+
 void Draw_Main(ImDrawList *Draw){
     PySelf::set_copycat_book(copycat_mode);        // 身份簿只在开关打开时记，见 PySelf.h
     if (libbase == 0 || read_state == 0) return;  // 数据未就绪，跳过本帧绘制
@@ -1061,6 +1087,75 @@ void Draw_Main(ImDrawList *Draw){
         for (int i = 0; i < 16; i++) printf(" %.4f", matrix[i]);
         printf("\n");
     }  // 直接从Matrix读16个float
+
+    // ======== 林中童话(娱乐模式，底层打水仗)：独立渲染，矩阵就绪后在这里一刀切掉所有经典绘制 ========
+    // 玩家按 water_fight_identity 动物阵营上色(同阵营两名队友同色)、上动物名下距离、不画射线；
+    // 物资(箱子/掉落)白点、水平 10m 去重。数据来自 PyWaterFight(Python 层，AOI 内可见)。
+    // 自身坐标取自快照里的 is_self 玩家(WaterFight 玩家 model_path=None，没有经典锚点)。
+    if (waterfight_mode) {
+        float sx0 = 0, sh0 = 0, sz0 = 0; int self_team = 0;
+        bool has_self = PyWaterFight::self_ref(sx0, sh0, sz0, self_team);
+        // ---- 玩家 ----
+        int pn = PyWaterFight::player_count();
+        for (int i = 0; i < pn; i++) {
+            PyWaterFight::Player pl;
+            if (!PyWaterFight::get_player(i, pl)) continue;
+            if (pl.is_self) continue;                                   // 自己不画
+            if (self_team != 0 && pl.team == self_team) continue;       // 队友不画(同 water_fight_team)
+            float qx = pl.x, qz = pl.h, qy = pl.z;                      // qz = 高度轴
+            float cam = matrix[3]*qx + matrix[7]*qz + matrix[11]*qy + matrix[15];
+            if (cam <= 0.01f) continue;                                 // 相机背后
+            float d = has_self ? sqrt(pow(qx - sx0, 2) + pow(qy - sz0, 2) + pow(qz - sh0, 2)) / dist_scale : 0;
+            if (has_self && d >= 300) continue;
+            float cx = px + (matrix[0]*qx + matrix[4]*qz + matrix[8]*qy + matrix[12]) / cam * px;
+            float cy = py - (matrix[1]*qx + matrix[5]*(qz + 8.5f) + matrix[9]*qy + matrix[13]) / cam * py;
+            float cw = py - (matrix[1]*qx + matrix[5]*(qz + 28.5f) + matrix[9]*qy + matrix[13]) / cam * py;
+            float bw = (cy - cw) / 2, bh = cy - cw;                     // 跟实体循环同一套方框算法
+            if (bw <= 0) continue;
+            float bx1 = cx - bh / 4, by1 = cy - bh / 2;
+            char_count++;
+            ImColor c = waterfight_color(pl.team);                      // 按队伍上色(8 队)
+            const char *nm = waterfight_name(pl.identity);             // label 用动物名
+            auto ts = ImGui::CalcTextSize(nm, 0, 25);
+            Draw->AddText({bx1 + bw/2 - ts.x/2, by1 - 45}, c, nm);      // 上：动物名
+            ImGui::GetForegroundDrawList()->AddRect({bx1, by1}, {bx1 + bw, by1 + bh}, c, 3, 0, 1.8f);
+            if (has_self) {                                             // 下：距离
+                char dt[24];
+                snprintf(dt, sizeof(dt), "%d 米", (int)d);
+                auto ds = ImGui::CalcTextSize(dt, 0, 25);
+                Draw->AddText({bx1 + bw/2 - ds.x/2, by1 + bh + 10}, ImColor(255,200,0,255), dt);
+            }
+            // 不画射线(用户要求)
+        }
+        // ---- 物资(箱子/掉落)：白点，水平 10m 去重，只记录真正画出来的 ----
+        int ln = PyWaterFight::loot_count();
+        static float drawn_x[PyWaterFight::MAX_LOOT], drawn_z[PyWaterFight::MAX_LOOT];
+        int drawn = 0;
+        const float DEDUP_M = 10.0f;
+        for (int i = 0; i < ln; i++) {
+            PyWaterFight::Loot lt;
+            if (!PyWaterFight::get_loot(i, lt)) continue;
+            float qx = lt.x, qz = lt.h, qy = lt.z;
+            bool near_other = false;                                    // 跟已画的任意一个水平 <10m 就跳过
+            for (int j = 0; j < drawn; j++) {
+                float dm = sqrt(pow(qx - drawn_x[j], 2) + pow(qy - drawn_z[j], 2)) / dist_scale;
+                if (dm < DEDUP_M) { near_other = true; break; }
+            }
+            if (near_other) continue;
+            float cam = matrix[3]*qx + matrix[7]*qz + matrix[11]*qy + matrix[15];
+            if (cam <= 0.01f) continue;
+            if (has_self) {
+                float d = sqrt(pow(qx - sx0, 2) + pow(qy - sz0, 2) + pow(qz - sh0, 2)) / dist_scale;
+                if (d >= 300) continue;
+            }
+            float scx = px + (matrix[0]*qx + matrix[4]*qz + matrix[8]*qy + matrix[12]) / cam * px;
+            float scy = py - (matrix[1]*qx + matrix[5]*qz + matrix[9]*qy + matrix[13]) / cam * py;
+            Draw->AddCircleFilled({scx, scy}, 4.0f, ImColor(255,255,255,255));
+            if (drawn < PyWaterFight::MAX_LOOT) { drawn_x[drawn] = qx; drawn_z[drawn] = qy; drawn++; }
+        }
+        return;   // 林中童话独立渲染，后面的经典 HUD/实体循环/骨骼全部不走
+    }
+
     // 模仿者局没有监管，类名兜底会把场景里的 chr\boss\spkantan(磁铁)当成监管报出来，不显示
     if (show_draw_prophet && !PySelf::copycat_active()){
         if (PyScene::in_lobby()){
@@ -1385,8 +1480,10 @@ void Draw_Main(ImDrawList *Draw){
         uint64_t hunter_m = 0; bool has_hunter = PySelf::hunter_body(hunter_m);
         uint64_t Ms[32];
         int bn = PySelf::copy_bodies(Ms, 32);
+        bool hunter_view = (PySelf::camp() == 1);   // 监管视角：被自己扛气球的求生者不画骨骼(同方框过滤)
         for (int u = 0; u < bn; u++) {
             bool is_self = (Ms[u] == self_m);
+            if (!is_self && hunter_view && PySelf::is_carried(Ms[u])) continue;
             NativeBones::Skeleton sk;
             if (!NativeBones::read_unit(Ms[u], is_self, sk) || !sk.valid) continue;
             if (is_self) continue;                                // 自身只用于 swap 校准,不画(若辰 ignoreSelfBones)
@@ -1497,6 +1594,9 @@ void Draw_Main(ImDrawList *Draw){
 		// 只认 CPython 锚点给的阵营：兜底的相机深度启发式可能把求生者误判成监管，
 		// 那样会让求生者视角下的监管整个消失，代价远大于多画一个。
 		if (has_auth_self && self_camp == 1 && data[i].camp == 1) continue;
+		// 本体是监管时，被自己扛在气球上的求生者会糊在自己身上(模型挂在气球挂点)，游戏自己也会显示，
+		// 这里不重复画。判据 b_catch(= 监管 carry_uid 指向的人)在 PySelf 里收集，只在监管视角过滤。
+		if (has_auth_self && self_camp == 1 && data[i].camp == 2 && PySelf::is_carried(data[i].obj)) continue;
 		// 这里原本还读一次 +0x70(jxpd) 并算 cam_dist / niexi_dist，三者都没有任何地方使用，已删。
 		// jxpd 那次是每实体每帧一次驱动读，删掉直接省 CPU；另两个只是浮点运算。
 		camera = matrix[3] * D.X + matrix[7] * D.Z + matrix[11] * D.Y + matrix[15];
@@ -1826,28 +1926,34 @@ void Draw_Main(ImDrawList *Draw){
                     }
                         
                     // 射线不画(用户要求)。
-                    // 骨骼默认画(不受"显示骨骼"开关影响)。大小换算修复(用户反馈"镜像骨骼巨大")：
-                    //   镜像只挪位置、不改尺寸 —— 不再逐根反射进世界空间(那样每根骨骼离相机的距离各自变、
-                    //   透视除数失真，骨架忽大忽小)。改成只反射【根】得到镜像落点 mroot=(D.X,D.Z,D.Y)，每根
-                    //   骨骼保持相对真实根(orig_x,D.Z,orig_y)的世界偏移原样搬到 mroot 上(bone-root 的 delta)，
-                    //   再在镜像落点的真实深度上投影。这样骨架尺寸=真人尺寸、透视与方框一致；且求生者在相机
-                    //   背后(照镜子的主要用途)时，镜像落点仍在相机前方，照样画得出(方案"真实投影再平移"做不到)。
-                    //   高度(y)不参与反射，oy 恒=真实高度 msk.y；朝向不左右翻转(ESP 用途反而更好认)。
+                    // 骨骼默认画(不受"显示骨骼"开关影响)。
+                    // 【2026-10-19 重做】此前"方案B"把骨架当刚体整体平移到镜像落点(只反射根、其余骨骼
+                    //   保持真人世界偏移 delta=bone-root 原样搬过去)，数学上不是镜像：
+                    //   ① 朝向/手性不翻转 —— 真人侧身/背身时镜中姿态方向错；
+                    //   ② 平移后的点仍按各自深度投影 —— 镜像落点离相机近时(照镜子最常见)人体尺度被透视放大→变大变形。
+                    //   当年"逐根反射→忽大忽小"的归因是错的：镜面反射是等距变换、绝不改变骨架自身尺寸
+                    //   (主骨骼轮 1404-1412 同样逐骨骼各自深度投影却不变形)；真凶是旧镜线来源(本体+247/预览)
+                    //   每帧抖动。镜线已迁到稳定的 Python MaryMirrorUnit(246)，逐根反射现在安全。
+                    //   所以改回"对每根骨骼的水平两轴做真·镜面反射(高度不动)+ 正常投影"：反射后整副骨架落在
+                    //   镜面另一侧(照镜子时在相机前方、投得出)，大小/透视天然=真人站在镜像位置，方向自动翻成真镜像。
                     // swap_yz 只在主骨骼轮读自身时校准；若"显示骨骼"关着主轮没跑，这里先拿自身补一次。
                     if (NativeBones::g_swap_yz.load() < 0) {
                         uint64_t self_cal = 0;
                         if (PySelf::anchor(self_cal)) { NativeBones::Skeleton tmp; NativeBones::read_unit(self_cal, true, tmp); }
                     }
                     NativeBones::Skeleton msk;
-                    if (camera > 0.01f && NativeBones::read_unit(data[i].obj, false, msk) && msk.valid) {
+                    if (NativeBones::read_unit(data[i].obj, false, msk) && msk.valid) {
                         ImVec2 bp[NativeBones::NUM_TARGET];
                         bool bok[NativeBones::NUM_TARGET];
                         for (int t = 0; t < NativeBones::NUM_TARGET; t++) {
                             bok[t] = false;
                             if (!msk.ok[t]) continue;
-                            float ox = D.X + (msk.x[t] - orig_x);   // 根搬到镜像落点，骨骼保持相对偏移
+                            // 每根骨骼的水平坐标(X, Y)关于镜线做真·镜面反射，高度(oy)不反射。
+                            float ox, oz;
+                            calculate_line_reflection(mirror_line_x1, mirror_line_y1,
+                                                      mirror_line_x2, mirror_line_y2,
+                                                      msk.x[t], msk.z[t], &ox, &oz);
                             float oy = msk.y[t];                    // 高度不反射
-                            float oz = D.Y + (msk.z[t] - orig_y);
                             float cam = matrix[3]*ox + matrix[7]*oy + matrix[11]*oz + matrix[15];
                             if (cam <= 0.01f) continue;
                             float sx = px + (matrix[0]*ox + matrix[4]*oy + matrix[8]*oz + matrix[12]) / cam * px;
@@ -2074,7 +2180,7 @@ void Layout_tick_UI(bool *main_thread_flag) {
             ImGui::Checkbox("显示鬼魂", &inform_ghost);
             ImGui::SameLine();
             // 预知监管和模仿者模式互斥(模仿者局没有监管)
-            if (ImGui::Checkbox("预知监管", &show_draw_prophet) && show_draw_prophet) copycat_mode = false;
+            if (ImGui::Checkbox("预知监管", &show_draw_prophet) && show_draw_prophet) { copycat_mode = false; waterfight_mode = false; }
 
             ImGui::Checkbox("绘制道具", &show_draw_Prop);
             ImGui::SameLine();
@@ -2131,8 +2237,11 @@ void Layout_tick_UI(bool *main_thread_flag) {
 
         // 模仿者模式：开关 + 身份簿。开着时名字换成"N号 身份"、不画射线；读到的身份记在簿子里，
         // 开会阶段页被换出读不到时沿用(见 PySelf.h 身份簿)。关掉开关簿子清空
-        if (ImGui::CollapsingHeader("模仿者模式")) {
-            if (ImGui::Checkbox("模仿者", &copycat_mode) && copycat_mode) show_draw_prophet = false;
+        if (ImGui::CollapsingHeader("娱乐模式")) {
+            // 林中童话(打水仗 BR)：独立绘制玩家(动物阵营配色)+物资。开着自动关模仿者和预知监管
+            if (ImGui::Checkbox("林中童话", &waterfight_mode) && waterfight_mode) { copycat_mode = false; show_draw_prophet = false; }
+            if (waterfight_mode) ImGui::Text("%s", PyWaterFight::status_text());
+            if (ImGui::Checkbox("模仿者", &copycat_mode) && copycat_mode) { show_draw_prophet = false; waterfight_mode = false; }
             if (copycat_mode) {
                 PySelf::CopycatBook book = PySelf::copycat_book();
                 int known = 0, with_id = 0;

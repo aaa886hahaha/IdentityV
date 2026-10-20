@@ -98,6 +98,7 @@ static const int COPYCAT_DIRECTOR_CLONE = 1210;   // CopycatDirectorCloneUnit = 
 static const int COPYCAT_DIRECTOR_PUPPET = 1211;  // CopycatDirectorPuppetUnit = 导演傀儡(= 自身)
 static const int COPYCAT_GHOUL_TYPE = 1203;       // CopycatGhoulUnit = 食人鬼(会杀人的地图生物,没身份)
 static const int MAX_COPYCAT = 16;
+static const int MAX_CARRIED = 8;   // 同时被扛在气球上的求生者上限(实际最多 4)
 // 走"号码+身份"身份簿的玩家类型键。导演局其他玩家是 1210(不在 1088、identity_id 直读为 None,要走
 // combat_unit.components 遍历找身份组件,照若辰,见 read_identity);1211 是自身,靠 self 过滤掉。
 static const int COPYCAT_PLAYER_TYPES[] = {COPYCAT_PLAYER_TYPE, COPYCAT_DIRECTOR_CLONE, COPYCAT_DIRECTOR_PUPPET};
@@ -119,6 +120,10 @@ struct Snapshot {
     uint64_t hunter_body;              // [1] 里第一个类名不含 Puppet 的单位(跳过巡视者)，0 = 没有
     CopycatEntry copycat[MAX_COPYCAT]; // 模仿者模式的活人，见上
     int      copycat_count;
+    // 被监管扛在气球上的求生者(b_catch==True)的 model+0x20 场景对象。监管视角用来过滤掉糊在
+    // 自己身上的那个求生者框(2026-10-19)。实测 = 监管 carry_uid 指向的那个人，两者一致
+    uint64_t carried[MAX_CARRIED];
+    int      carried_count;
 };
 
 // 双缓冲发布：写线程填非活跃缓冲，填完再翻转，绘制线程永远读到完整的一份
@@ -137,11 +142,12 @@ static int64_t   g_i_model = -1, g_i_another = -1, g_i_utype = -1, g_i_uid = -1;
 // 分开存之后每个类只在第一次出现时扫一次。缓存从不被直接信任：resolve_index() 每次都按名字核对，
 // 核对不上就重扫，所以最坏情况就是退回共用缓存那种多扫几遍，不会读错属性。
 // 表满了(类比这个多)就退回共用的 g_i_*。model / is_civilian_puppet 同理，一起按类存。
-struct ClassIndexCache { uint64_t type; int64_t i_another; int64_t i_model; int64_t i_cpuppet; bool is_puppet; };
+struct ClassIndexCache { uint64_t type; int64_t i_another; int64_t i_model; int64_t i_cpuppet; int64_t i_catch; bool is_puppet; };
 static const int MAX_CLASSES = 8;
 static ClassIndexCache g_class_cache[MAX_CLASSES];
 static int     g_class_cache_count = 0;
 static int64_t g_i_unit_model = -1, g_i_cpuppet = -1;   // 表满时的共用缓存
+static int64_t g_i_catch = -1;                          // b_catch(被扛气球)的共用序号缓存
 // 模仿者模式只有两个类(CopycatPlayerUnit / GhostCopycatPlayerUnit)，各用一组序号缓存就够
 static int64_t g_cc_i_model = -1, g_cc_i_another = -1, g_cc_i_ident = -1, g_cc_i_index = -1, g_cc_i_uq = -1;
 static int64_t g_cc_i_combat = -1;                      // unit.combat_unit 的序号(导演局走组件读身份用)
@@ -282,7 +288,7 @@ static void collect_units(uint64_t ubt, int type, Snapshot &res)
             if (!slot && g_class_cache_count < MAX_CLASSES) {
                 slot = &g_class_cache[g_class_cache_count++];
                 slot->type = cls;
-                slot->i_another = slot->i_model = slot->i_cpuppet = -1;
+                slot->i_another = slot->i_model = slot->i_cpuppet = slot->i_catch = -1;
                 slot->is_puppet = class_name_has_puppet(cls);    // 类名一个类只读一次
             }
         }
@@ -309,6 +315,15 @@ static void collect_units(uint64_t ubt, int type, Snapshot &res)
         add_unique(res.body, res.body_count, MAX_BODIES, body);
         if (type == 1 && res.hunter_body == 0 && !(slot ? slot->is_puppet : class_name_has_puppet(cls)))
             res.hunter_body = body;
+
+        // 求生者被监管扛在气球上：b_catch==True(实测 = 监管 carry_uid 指向的那个人)。
+        // 收它的场景对象，监管视角据此过滤。只有 CivilianUnit([2]) 有这个属性，别的类 resolve 返回 -1
+        if (type == 2) {
+            int64_t &i_catch = slot ? slot->i_catch : g_i_catch;
+            i_catch = resolve_index(d, dk, i_catch, "b_catch");
+            if (i_catch >= 0 && getPtr64(value_slot(dk, i_catch)) == PyRoot::g_true)
+                add_unique(res.carried, res.carried_count, MAX_CARRIED, body);
+        }
     }
 }
 
@@ -755,6 +770,15 @@ static bool is_body(uintptr_t obj)
     if (!g_available) return false;
     const Snapshot &s = g_buf[g_active];
     for (int i = 0; i < s.body_count; i++) if (s.body[i] == (uint64_t)obj) return true;
+    return false;
+}
+
+// 被监管扛在气球上的求生者(b_catch)。监管视角过滤掉糊在自己身上的那个框用。0 个时恒 false
+static bool is_carried(uintptr_t obj)
+{
+    if (!g_available) return false;
+    const Snapshot &s = g_buf[g_active];
+    for (int i = 0; i < s.carried_count; i++) if (s.carried[i] == (uint64_t)obj) return true;
     return false;
 }
 
