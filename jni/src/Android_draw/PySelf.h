@@ -116,7 +116,12 @@ struct Snapshot {
     uint64_t stale[MAX_STALE];
     int      stale_count;
     uint64_t body[MAX_BODIES];      // 本体集合，见上
+    bool     body_mirror[MAX_BODIES]; // 与 body[] 对齐：该本体是不是约瑟夫镜世界的镜像投影(out_photo_uid 有值)
+    bool     body_in_photo[MAX_BODIES]; // 与 body[] 对齐：该(真实)本体当前在不在镜世界(它的 uid ∈ PhotoUnit._players)
     int      body_count;
+    // 约瑟夫镜世界：我当前操控的单位在不在镜世界里(anchor 的 in_photo_world 真 / out_photo_uid 有值)。
+    // 配合 body_mirror 决定"另一个世界"：body_mirror != in_mirror 的本体画成白色鬼魂、不画天赋。
+    bool     in_mirror;
     uint64_t hunter_body;              // [1] 里第一个类名不含 Puppet 的单位(跳过巡视者)，0 = 没有
     CopycatEntry copycat[MAX_COPYCAT]; // 模仿者模式的活人，见上
     int      copycat_count;
@@ -148,6 +153,21 @@ static ClassIndexCache g_class_cache[MAX_CLASSES];
 static int     g_class_cache_count = 0;
 static int64_t g_i_unit_model = -1, g_i_cpuppet = -1;   // 表满时的共用缓存
 static int64_t g_i_catch = -1;                          // b_catch(被扛气球)的共用序号缓存
+static int64_t g_i_outphoto = -1;                       // out_photo_uid(约瑟夫镜世界镜像判据)的共用序号缓存
+// ---- 约瑟夫镜世界激活信号(2026-10-22 坐实) ----
+// PhotoUnit 开局就持久存在,拍没拍照看它 _time：没拍照=None、拍照后=game_time(数字)。
+// _players=当前在相中世界里的玩家 uid；我的 uid 在里面=我进了镜世界。实现见下面 scan_photo_unit。
+// 声明放这里(collect_units 要用 g_photo_active 门控)
+static char              g_photo_diag[160] = "(未扫描)";
+static int64_t           g_photo_scan_ms = 0;
+static int64_t           g_pd_i_time = -1, g_pd_i_players = -1;
+static int               g_photo_key = -1;              // PhotoUnit 的 units_by_type 键(找到后缓存)
+static uint64_t          g_photo_um_cache = 0;          // um 变了(换局)作废缓存
+static std::atomic<bool> g_photo_active{false};         // PhotoUnit._time 有值 = 已拍照(镜世界激活)
+static std::atomic<bool> g_photo_present{false};        // 场上存在 PhotoUnit = 约瑟夫局
+static int64_t           g_photo_players[16];           // 当前在镜世界里的玩家 uid
+static int               g_photo_players_n = 0;
+static int64_t           g_i_body_uid = -1;             // 收本体时读 unit.uid 的序号缓存(判它在不在镜世界)
 // 模仿者模式只有两个类(CopycatPlayerUnit / GhostCopycatPlayerUnit)，各用一组序号缓存就够
 static int64_t g_cc_i_model = -1, g_cc_i_another = -1, g_cc_i_ident = -1, g_cc_i_index = -1, g_cc_i_uq = -1;
 static int64_t g_cc_i_combat = -1;                      // unit.combat_unit 的序号(导演局走组件读身份用)
@@ -261,6 +281,31 @@ static inline void add_unique(uint64_t *tbl, int &cnt, int cap, uint64_t sp)
     if (cnt < cap) tbl[cnt++] = sp;
 }
 
+// 约瑟夫镜世界("photo world")鬼魂判据。2026-10-22 约瑟夫局 probe2 实测(cmd_joseph.py)：
+// 约瑟夫局里 units_by_type 的每个真身都有一个镜像双胞胎(密码机 7->14、求生者 4->8)，成对存在整局：
+//   真身   out_photo_uid = None、in_photo_uid = 镜像uid
+//   镜像   out_photo_uid = 真身uid、in_photo_uid = None   <- 这个就是要过滤掉的"鬼魂"
+// 所以判据 = out_photo_uid 读出一个 >0 的 uid。约瑟夫本人(photographer)两个都是 None，不受影响；
+// 非约瑟夫局这俩属性恒 None(或不存在)，is_photo_ghost 恒 false，零副作用。
+static inline bool is_photo_ghost(uint64_t d, const Dict &dk)
+{
+    g_i_outphoto = resolve_index(d, dk, g_i_outphoto, "out_photo_uid");
+    if (g_i_outphoto < 0) return false;
+    int64_t v = 0;
+    return PyCore::read_int(getPtr64(value_slot(dk, g_i_outphoto)), v) && v > 0;
+}
+
+// 加本体 + 同步记录它是不是镜像(约瑟夫镜世界)。新加入时才写 body_mirror，去重命中不覆盖
+static inline void add_body(Snapshot &res, uint64_t sp, bool mirror, bool in_photo)
+{
+    for (int j = 0; j < res.body_count; j++) if (res.body[j] == sp) return;
+    if (res.body_count < MAX_BODIES) {
+        res.body_mirror[res.body_count] = mirror;
+        res.body_in_photo[res.body_count] = in_photo;
+        res.body[res.body_count++] = sp;
+    }
+}
+
 // 扫一类单位：
 //   another_model -> 废弃模型黑名单
 //   model         -> 本体集合(幻灯师分身 is_civilian_puppet==True 不收)
@@ -277,6 +322,7 @@ static void collect_units(uint64_t ubt, int type, Snapshot &res)
         if (!d) continue;
         Dict dk;
         if (!read_dict(d, dk)) continue;
+        const bool is_mirror = is_photo_ghost(d, dk);   // 约瑟夫镜世界：该单位是不是镜像(out_photo_uid 有值)
 
         // 按实例的类取序号缓存(见 g_class_cache)。类型指针读不到、或表满了就用共用缓存
         // 别叫 type：会遮住参数 type(单位类型键)，导致下面 type == 1 永远不成立、hunter_body 永远拿不到
@@ -312,8 +358,19 @@ static void collect_units(uint64_t ubt, int type, Snapshot &res)
         i_cpuppet = resolve_index(d, dk, i_cpuppet, "is_civilian_puppet");
         if (i_cpuppet >= 0 && getPtr64(value_slot(dk, i_cpuppet)) == PyRoot::g_true) continue;
 
-        add_unique(res.body, res.body_count, MAX_BODIES, body);
-        if (type == 1 && res.hunter_body == 0 && !(slot ? slot->is_puppet : class_name_has_puppet(cls)))
+        // 这个(真实)单位当前在不在镜世界：它的 uid 在 PhotoUnit._players 里。投影不需要(白框无后缀)
+        bool unit_in_photo = false;
+        if (!is_mirror && g_photo_players_n > 0) {
+            g_i_body_uid = resolve_index(d, dk, g_i_body_uid, "uid");
+            int64_t uid = 0;
+            if (g_i_body_uid >= 0 && read_int(getPtr64(value_slot(dk, g_i_body_uid)), uid))
+                for (int p = 0; p < g_photo_players_n; p++) if (g_photo_players[p] == uid) { unit_in_photo = true; break; }
+        }
+        // 约瑟夫镜世界门控：没拍照(photo 未激活)时镜像投影(out_photo_uid>0)整体不收 →
+        // 不在本体集合里 → 绘制侧方框/名字/距离/骨骼自然全不画。拍照后才收，按 body_mirror 画成白色。
+        if (!(is_mirror && !g_photo_active.load())) add_body(res, body, is_mirror, unit_in_photo);
+        // 监管本体(预知监管)只认真身约瑟夫，镜像监管(若有)不当本体
+        if (type == 1 && res.hunter_body == 0 && !is_mirror && !(slot ? slot->is_puppet : class_name_has_puppet(cls)))
             res.hunter_body = body;
 
         // 求生者被监管扛在气球上：b_catch==True(实测 = 监管 carry_uid 指向的那个人)。
@@ -607,6 +664,89 @@ static void book_mark_self(uint64_t anchor)
     }
 }
 
+// ---- 约瑟夫镜世界激活信号 + in_mirror(2026-10-22 坐实，取代旧的读 anchor in_photo_world) ----
+// 走叠加层自己的内核驱动读 Python 对象图(同 PySelf，是允许通道、不碰 /proc；probe2 死了不影响)。
+// PhotoUnit 一局内稳定 → 键找到后缓存，之后每轮只读这一个单位；没找到(非约瑟夫局)全扫节流 500ms。
+static inline bool is_photo_class(uint64_t inst)
+{
+    uint64_t cls = getPtr64(inst + 8);
+    if (!is_obj(cls)) return false;
+    uint64_t np = getPtr64(cls + 0x18);                          // PyTypeObject.tp_name
+    char buf[48] = {0};
+    return is_obj(np) && vm_readv(np, buf, sizeof(buf) - 1) && strstr(buf, "Photo");
+}
+
+static uint64_t find_photo_inst(uint64_t ubt)
+{
+    Dict k;
+    if (!read_dict(ubt, k)) return 0;
+    for (int64_t i = 0; i < k.n_entries; i++) {
+        uint64_t kp = getPtr64(key_slot(k, i));
+        if (!is_obj(kp) || getPtr64(kp + 8) != PyRoot::g_int_type) continue;
+        int64_t sz = 0; uint32_t dg = 0;
+        if (!vm_readv(kp + 16, &sz, 8) || !vm_readv(kp + 24, &dg, 4) || sz != 1) continue;
+        int64_t n = 0; uint64_t items = 0;
+        if (!read_list(getPtr64(value_slot(k, i)), n, items) || n == 0) continue;
+        for (int64_t j = 0; j < n; j++) {
+            uint64_t inst = getPtr64(items + j * 8);
+            if (is_photo_class(inst)) { g_photo_key = (int)dg; return inst; }
+        }
+    }
+    return 0;
+}
+
+static void scan_photo_unit(uint64_t ubt, uint64_t um)
+{
+    if (um != g_photo_um_cache) { g_photo_um_cache = um; g_photo_key = -1; }   // 换局作废
+    uint64_t inst = 0;
+    if (g_photo_key >= 0) {                                       // 缓存命中：只读这一个单位
+        int64_t n = 0; uint64_t items = 0;
+        if (read_list(get_type_list(ubt, g_photo_key), n, items) && n > 0 && is_photo_class(getPtr64(items)))
+            inst = getPtr64(items);
+        else g_photo_key = -1;                                    // 失效 → 下面全扫
+    }
+    if (!inst && now_ms() - g_photo_scan_ms >= 500) { g_photo_scan_ms = now_ms(); inst = find_photo_inst(ubt); }
+
+    bool active = false; g_photo_players_n = 0;
+    char tbuf[24] = "?"; int players = -1;
+    if (inst) {
+        uint64_t d = get_inst_dict(inst);
+        Dict dk;
+        if (d && read_dict(d, dk)) {
+            g_pd_i_time = resolve_index(d, dk, g_pd_i_time, "_time");
+            if (g_pd_i_time >= 0) {                               // _time 是数字=已拍照，None=没拍照
+                float t = 0;
+                if (PyCore::read_number(value_slot(dk, g_pd_i_time), t, -1e12, 1e12)) { active = true; snprintf(tbuf, sizeof(tbuf), "%.0f", t); }
+                else snprintf(tbuf, sizeof(tbuf), "none");
+            }
+            g_pd_i_players = resolve_index(d, dk, g_pd_i_players, "_players");
+            if (g_pd_i_players >= 0) {                            // _players = 当前在镜世界的玩家 uid
+                int64_t pn = 0; uint64_t pit = 0;
+                if (read_list(getPtr64(value_slot(dk, g_pd_i_players)), pn, pit)) {
+                    players = (int)pn;
+                    for (int64_t j = 0; j < pn && g_photo_players_n < 16; j++) {
+                        int64_t uid = 0;
+                        if (read_int(getPtr64(pit + j * 8), uid)) g_photo_players[g_photo_players_n++] = uid;
+                    }
+                }
+            }
+        }
+    }
+    g_photo_active = active;
+    g_photo_present = (inst != 0);               // 有 PhotoUnit = 约瑟夫局(与拍没拍照无关)
+    if (inst) snprintf(g_photo_diag, sizeof(g_photo_diag), "key=%d _time=%s _players=%d active=%d", g_photo_key, tbuf, players, (int)active);
+    else      snprintf(g_photo_diag, sizeof(g_photo_diag), "无 PhotoUnit(非约瑟夫局?)");
+}
+
+static inline const char *photo_diag_text() { return g_photo_diag; }
+// 我的 uid 在不在镜世界玩家列表里(只在 PySelf 线程调，与 scan 同线程、无竞态)
+static bool self_in_players(int64_t uid)
+{
+    if (!g_photo_active.load()) return false;
+    for (int i = 0; i < g_photo_players_n; i++) if (g_photo_players[i] == uid) return true;
+    return false;
+}
+
 static bool try_refresh()
 {
     if (g_module_dict == 0 && !resolve_module()) { g_in_lobby = false; return false; }
@@ -625,6 +765,7 @@ static bool try_refresh()
     }
     bool in_lobby = false;
     g_in_lobby = is_obj(ubt) && check_lobby(ubt, in_lobby) && in_lobby;
+    if (is_obj(ubt)) scan_photo_unit(ubt, um);   // 约瑟夫镜世界激活信号(面板「镜世界:」)
 
     // 模仿者模式放在锚点之前：锚点失败时身份簿和坐标照样要更新(开会阶段锚点常读不到)
     static uint64_t pos_um = 0;
@@ -666,6 +807,11 @@ static bool try_refresh()
 
     if (res.anchor == 0) { snprintf(g_status, sizeof(g_status), "cam.unit.model 读不到"); return false; }
 
+    // ---- 约瑟夫镜世界：我现在在不在镜世界 ----
+    // 2026-10-22 坐实：= 我的 uid 在 PhotoUnit._players 里(进镜世界会把 uid append 进去，实测我进去后该列表 0→1)。
+    // 比旧的读 anchor in_photo_world/out_photo_uid 权威。非约瑟夫局 photo_active=false → 恒 false，零副作用。
+    res.in_mirror = self_in_players(res.uid);
+
     // ---- 二、废弃模型黑名单 + 本体集合 + 监管本体 ----
     if (is_obj(ubt))
         for (int i = 0; i < UNIT_TYPE_COUNT; i++) collect_units(ubt, UNIT_TYPES[i], res);
@@ -699,6 +845,8 @@ static void refresh_once()
         g_i_cam = g_i_cam_unit = g_i_unit_mgr = g_i_ubt = -1;
         g_i_model = g_i_another = g_i_utype = g_i_uid = -1;
         g_i_unit_model = g_i_cpuppet = -1;
+        g_i_outphoto = -1;
+        g_pd_i_time = g_pd_i_players = -1; g_photo_key = -1;
         g_cc_i_model = g_cc_i_another = g_cc_i_ident = g_cc_i_index = g_cc_i_uq = g_ccg_i_uq = -1;
         g_cc_i_combat = -1;
         for (int a = 0; a < 6; a++) g_cc_i_posattr[a] = -1;
@@ -770,6 +918,41 @@ static bool is_body(uintptr_t obj)
     if (!g_available) return false;
     const Snapshot &s = g_buf[g_active];
     for (int i = 0; i < s.body_count; i++) if (s.body[i] == (uint64_t)obj) return true;
+    return false;
+}
+
+// 约瑟夫镜世界：我当前在不在镜世界
+static inline bool self_in_mirror() { return g_available && g_buf[g_active].in_mirror; }
+
+// 这个本体是不是镜像(out_photo_uid 有值)。非本体 / 非约瑟夫局返回 false
+static bool body_is_mirror(uintptr_t obj)
+{
+    if (!g_available) return false;
+    const Snapshot &s = g_buf[g_active];
+    for (int i = 0; i < s.body_count; i++) if (s.body[i] == (uint64_t)obj) return s.body_mirror[i];
+    return false;
+}
+
+// 约瑟夫镜世界：这个(真实)本体当前在不在镜世界(名字后缀 镜像/现实 用)。非本体/投影返回 false
+static bool body_in_photo_world(uintptr_t obj)
+{
+    if (!g_available) return false;
+    const Snapshot &s = g_buf[g_active];
+    for (int i = 0; i < s.body_count; i++) if (s.body[i] == (uint64_t)obj) return s.body_in_photo[i];
+    return false;
+}
+
+// 当前是不是约瑟夫局(场上有 PhotoUnit)。约瑟夫局永远画框、永远不画骨骼用
+static inline bool is_joseph_match() { return g_photo_present.load(); }
+
+// 约瑟夫镜世界：这个本体是不是"另一个世界"的(相对我现在所在的世界)。
+// 是 -> 绘制侧画成白色鬼魂、不画天赋。非约瑟夫局(没有镜像、in_mirror=false)恒 false。
+static bool is_other_world(uintptr_t obj)
+{
+    if (!g_available) return false;
+    const Snapshot &s = g_buf[g_active];
+    for (int i = 0; i < s.body_count; i++)
+        if (s.body[i] == (uint64_t)obj) return s.body_mirror[i] != s.in_mirror;
     return false;
 }
 

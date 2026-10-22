@@ -106,6 +106,11 @@ static volatile int g_door_count[2] = {0, 0};
 // 镜面也在同一次刷新里填、共用 g_active 翻转
 static MirrorPlane g_mirror_buf[2] = {};
 
+// 约瑟夫镜世界的镜像密码机**场景对象**黑名单：它们不进 g_buf(没进度)，但场景对象仍在 data[] 里、
+// 会被 is_real_generator 画成"[密码机]"空标记。绘制侧用 is_mirror_generator() 跳过。跟 g_active 同步翻转
+static uint64_t g_mirror_gen[2][MAX_GENERATORS];
+static int      g_mirror_gen_n[2] = {0, 0};
+
 static uintptr_t g_libbase = 0;
 static uint64_t  g_module_dict = 0;                 // game_kernel 的 md_dict，进程内稳定
 static int64_t   g_i_unit_mgr = -1, g_i_ubt = -1, g_i_fix = -1, g_i_pos = -1, g_i_model = -1;
@@ -125,6 +130,18 @@ using PyCore::resolve_index; using PyCore::get_type_list; using PyCore::read_boo
 // 进度是 0~100 的百分比。**这道值域闸是挡住垃圾值的主力**，垃圾里出现过 0.16 这种看着合理的，
 // 只靠指针稳定挡不住。冷却是 0~600 秒级，两者不能混用，所以值域留在各模块自己手里
 static inline bool read_number(uint64_t slot, float &out) { return PyCore::read_number(slot, out, -0.5, 100.5); }
+
+// 约瑟夫镜世界("photo world")：镜像密码机/大门的 out_photo_uid 指向真身(真身的是 None)。
+// 用户要求：只隐藏镜像那份，保留真实世界的进度/门。2026-10-22 约瑟夫局 probe2 实测(cmd_joseph.py)：
+// units_by_type[3] 7 真(in_photo_uid 有值) + 7 镜像(out_photo_uid 有值)。非约瑟夫局这属性恒 None,恒 false。
+static int64_t g_i_outphoto = -1;   // out_photo_uid 的共用序号缓存(密码机/大门两类都用；resolve 会自愈)
+static inline bool is_photo_ghost(uint64_t d, const Dict &dk)
+{
+    g_i_outphoto = resolve_index(d, dk, g_i_outphoto, "out_photo_uid");
+    if (g_i_outphoto < 0) return false;
+    int64_t v = 0;
+    return PyCore::read_int(getPtr64(value_slot(dk, g_i_outphoto)), v) && v > 0;
+}
 
 static bool resolve_module()
 {
@@ -154,6 +171,7 @@ static void collect_doors(uint64_t ubt, int write_idx)
         uint64_t d = getPtr64(inst - 0x18);
         Dict dk;
         if (!read_dict(d, dk)) continue;
+        if (is_photo_ghost(d, dk)) continue;   // 约瑟夫镜世界的镜像大门：跳过(只画真实世界的门)
 
         g_i_hack    = resolve_index(d, dk, g_i_hack,    "hack_process");
         g_i_door_model = resolve_index(d, dk, g_i_door_model, "model");
@@ -250,6 +268,7 @@ static bool try_refresh()
 
     // 大门、镜面先收：放在密码机那几个 return false 之前，免得"没有密码机列表"把它们也带下水
     int write_idx = 1 - g_active;
+    g_mirror_gen_n[write_idx] = 0;                 // 约瑟夫镜世界镜像密码机黑名单，本轮重建
     collect_doors(ubt, write_idx);
     collect_mirror(ubt, write_idx);
 
@@ -280,6 +299,18 @@ static bool try_refresh()
         uint64_t d = getPtr64(inst - 0x18);
         Dict dk;
         if (!read_dict(d, dk)) continue;
+        if (is_photo_ghost(d, dk)) {   // 约瑟夫镜世界的镜像密码机：不进进度缓冲，场景对象记进黑名单供绘制侧跳过
+            g_i_model = resolve_index(d, dk, g_i_model, "model");
+            if (g_i_model >= 0) {
+                uint64_t mo = getPtr64(value_slot(dk, g_i_model));
+                if (is_obj(mo)) {
+                    uint64_t sp = getPtr64(mo + 0x20);
+                    if (is_obj(sp) && g_mirror_gen_n[write_idx] < MAX_GENERATORS)
+                        g_mirror_gen[write_idx][g_mirror_gen_n[write_idx]++] = sp;
+                }
+            }
+            continue;
+        }
 
         g_i_fix   = resolve_index(d, dk, g_i_fix,   "fix_process");
         g_i_model = resolve_index(d, dk, g_i_model, "model");
@@ -335,6 +366,7 @@ static void refresh_once()
         g_module_dict = 0;
         g_i_unit_mgr = g_i_ubt = g_i_fix = g_i_pos = g_i_model = -1;
         g_i_hack = g_i_door_model = g_i_can_open = g_i_has_open = g_i_is_opening = -1;
+        g_i_outphoto = -1;
         g_fail_streak = 0;
     }
 }
@@ -392,6 +424,15 @@ static inline bool is_decoded(float progress) { return progress >= 99.95f; }
 // 枚举本局全部密码机(含 0%、含已破译)，给左侧汇总面板用。
 // 绘制侧自行按 is_decoded() 过滤掉修完的，使其从面板消失。
 static inline int gen_total() { return g_available ? g_count[g_active] : 0; }
+
+// 约瑟夫镜世界：这个场景对象是不是镜像密码机(要在绘制侧跳过，不画"[密码机]"空标记)
+static bool is_mirror_generator(uintptr_t obj)
+{
+    if (!g_available) return false;
+    int b = g_active, n = g_mirror_gen_n[b];
+    for (int i = 0; i < n; i++) if (g_mirror_gen[b][i] == (uint64_t)obj) return true;
+    return false;
+}
 static bool get_gen(int i, float &progress)
 {
     if (!g_available) return false;

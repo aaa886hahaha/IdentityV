@@ -8,6 +8,7 @@
 #include <thread>
 #include <unordered_map>
 #include <mutex>
+#include <atomic>
 #include "spinlock.h"
 
 #include "imgui.h"
@@ -38,6 +39,10 @@ namespace Touch {
     static int orientation = 0;
 
     static bool initialized = false;
+
+    // 2026-10-22：运行时观察真人 slot 实际发过哪些字段(能力位 EVIOCGBIT 会谎报支持，必须看真人实发)。
+    // TypeA 线程置位、InjectTap 读；注入只发真人发过的字段，让字段集与真人一致(本机真人不发 major → 不写)。
+    static std::atomic<bool> inject_saw_major{false}, inject_saw_pressure{false}, inject_saw_tool_finger{false};
 
     static bool readOnly = false;
 
@@ -193,6 +198,8 @@ namespace Touch {
             for (size_t j = 0; j < count; j++) {
                 input_event &ie = inputEvent[j];
                 if (ie.type == EV_ABS) {
+                    if (ie.code == ABS_MT_TOUCH_MAJOR) { inject_saw_major = true; continue; }
+                    if (ie.code == ABS_MT_PRESSURE)    { inject_saw_pressure = true; continue; }
                     if (ie.code == ABS_MT_SLOT) {
                         latest = ie.value;
                         continue;
@@ -217,6 +224,7 @@ namespace Touch {
                         continue;
                     }
                 }
+                if (ie.type == EV_KEY && ie.code == BTN_TOOL_FINGER) { inject_saw_tool_finger = true; continue; }
                 if (ie.code == SYN_REPORT) {
                     if (ImGui::GetCurrentContext() != nullptr) {
                         ImGuiIO &io = ImGui::GetIO();
@@ -564,7 +572,7 @@ namespace Touch {
     static std::mutex inject_mutex;
     static int inject_slots = 0;             // 0 = 还没探测
     static int inject_trk_max = 65535;
-    static bool inject_has_btn_touch = false, inject_has_major = false, inject_has_pressure = false;
+    static bool inject_has_btn_touch = false, inject_has_tool_finger = false, inject_has_major = false, inject_has_pressure = false;
     static int inject_pressure = 0;
     static int inject_trk_seq = 0;
 
@@ -575,8 +583,10 @@ namespace Touch {
         if (inject_slots > 32) inject_slots = 32;
         if (ioctl(fd, EVIOCGABS(ABS_MT_TRACKING_ID), &a) == 0 && a.maximum > 16) inject_trk_max = a.maximum;
         uint8_t keybits[KEY_MAX / 8 + 1]{};
-        if (ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(keybits)), keybits) >= 0)
-            inject_has_btn_touch = keybits[BTN_TOUCH / 8] & (1 << (BTN_TOUCH % 8));
+        if (ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(keybits)), keybits) >= 0) {
+            inject_has_btn_touch   = keybits[BTN_TOUCH / 8] & (1 << (BTN_TOUCH % 8));
+            inject_has_tool_finger = keybits[BTN_TOOL_FINGER / 8] & (1 << (BTN_TOOL_FINGER % 8));
+        }
         uint8_t absbits[ABS_MAX / 8 + 1]{};
         if (ioctl(fd, EVIOCGBIT(EV_ABS, sizeof(absbits)), absbits) >= 0) {
             inject_has_major = absbits[ABS_MT_TOUCH_MAJOR / 8] & (1 << (ABS_MT_TOUCH_MAJOR % 8));
@@ -640,9 +650,13 @@ namespace Touch {
         put_ev(ev, k, EV_ABS, ABS_MT_TRACKING_ID, trk);
         put_ev(ev, k, EV_ABS, ABS_MT_POSITION_X, (int) p.x);
         put_ev(ev, k, EV_ABS, ABS_MT_POSITION_Y, (int) p.y);
-        if (inject_has_major) put_ev(ev, k, EV_ABS, ABS_MT_TOUCH_MAJOR, 6);
-        if (inject_has_pressure) put_ev(ev, k, EV_ABS, ABS_MT_PRESSURE, inject_pressure);
-        if (inject_has_btn_touch && others == 0) put_ev(ev, k, EV_KEY, BTN_TOUCH, 1);
+        // 只发真人实际发过的字段(inject_saw_*)；能力位 inject_has_* 单独不够，会谎报。本机真人不发 major/pressure → 不写。
+        if (inject_has_major && inject_saw_major) put_ev(ev, k, EV_ABS, ABS_MT_TOUCH_MAJOR, 6);
+        if (inject_has_pressure && inject_saw_pressure) put_ev(ev, k, EV_ABS, ABS_MT_PRESSURE, inject_pressure);
+        if (inject_has_btn_touch && others == 0) {
+            put_ev(ev, k, EV_KEY, BTN_TOUCH, 1);
+            if (inject_has_tool_finger && inject_saw_tool_finger) put_ev(ev, k, EV_KEY, BTN_TOOL_FINGER, 1);  // 真人按下会配套发，补齐
+        }
         put_ev(ev, k, EV_SYN, SYN_REPORT, 0);
         if (write(fd, ev, sizeof(input_event) * k) != (ssize_t) (sizeof(input_event) * k))
             return INJECT_DOWN_FAILED;
@@ -656,7 +670,10 @@ namespace Touch {
         k = 0;
         put_ev(ev, k, EV_ABS, ABS_MT_SLOT, slot);
         put_ev(ev, k, EV_ABS, ABS_MT_TRACKING_ID, -1);
-        if (inject_has_btn_touch && others == 0) put_ev(ev, k, EV_KEY, BTN_TOUCH, 0);
+        if (inject_has_btn_touch && others == 0) {
+            put_ev(ev, k, EV_KEY, BTN_TOUCH, 0);
+            if (inject_has_tool_finger && inject_saw_tool_finger) put_ev(ev, k, EV_KEY, BTN_TOOL_FINGER, 0);
+        }
         put_ev(ev, k, EV_SYN, SYN_REPORT, 0);
         if (write(fd, ev, sizeof(input_event) * k) != (ssize_t) (sizeof(input_event) * k))
             return INJECT_UP_FAILED;

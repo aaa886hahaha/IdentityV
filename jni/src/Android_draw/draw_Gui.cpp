@@ -440,6 +440,10 @@ bool ShouldSkipEntity(const DataStruct& obj) {
     // 精确、跟视角无关、不用维护名单。详见 PySelf.h 文件头。
     if (PySelf::is_stale_model(obj.obj)) return true;
 
+    // 约瑟夫镜世界：镜像投影要专门显示成白色方框，它们的 +0x70(visible) 在对面世界常为 0，
+    // 会被下面 IsGhostEntity 当幽灵在 inform_ghost 关时丢掉。这里显式放行(它们一定是本体集合里的玩家单位)。
+    if (PySelf::body_is_mirror(obj.obj)) return false;
+
     bool is_ghost_obj = IsGhostEntity(obj);
 
     // 注意 +0x70 就是 NeoX 模型对象的 visible, 是**渲染剔除的结果**:
@@ -1295,6 +1299,7 @@ void Draw_Main(ImDrawList *Draw){
         for (int i = 0; i < data_count; i++){
             if (data[i].camp != 2) continue;
             if (PySelf::body_set_ready() && !PySelf::is_body(data[i].obj)) continue;
+            if (PySelf::body_is_mirror(data[i].obj)) continue;   // 约瑟夫镜世界：镜像投影不进天赋HUD(否则 4 真 4 镜像重复)
             PyGenius::Info gi;
             if (!PyGenius::lookup(data[i].obj, 0.f, 0.f, gi)) continue;
             PyGenius::GeniusLine seg;
@@ -1475,7 +1480,7 @@ void Draw_Main(ImDrawList *Draw){
     }
 
     // ---- 原生骨骼(抄若辰 sob_3A6074/39F0CC 偏移链,驱动读,零注入;见 NativeBones.h) ----
-    if (show_draw_Bones && PySelf::available()) {
+    if (show_draw_Bones && PySelf::available() && !PySelf::is_joseph_match()) {   // 约瑟夫局永远不画骨骼(用户要求,无视开关)
         uint64_t self_m = 0; PySelf::anchor(self_m);
         uint64_t hunter_m = 0; bool has_hunter = PySelf::hunter_body(hunter_m);
         uint64_t Ms[32];
@@ -1508,8 +1513,11 @@ void Draw_Main(ImDrawList *Draw){
                 float sy = py - (matrix[1]*ox + matrix[5]*oy + matrix[9]*oz + matrix[13]) / cam * py;
                 bp[t] = ImVec2(sx, sy); bok[t] = true;
             }
-            // 监管红、求生者绿(监管本体 = PySelf::hunter_body)
-            ImU32 bcol = (has_hunter && Ms[u] == hunter_m) ? ImColor(255, 60, 60, 230) : ImColor(40, 255, 90, 230);
+            // 监管红、求生者绿(监管本体 = PySelf::hunter_body)。约瑟夫镜世界里"另一个世界"的人画白色
+            ImU32 bcol;
+            if (PySelf::is_other_world(Ms[u]))      bcol = (ImU32)BotBoneColor;
+            else if (has_hunter && Ms[u] == hunter_m) bcol = (ImU32)ImColor(255, 60, 60, 230);
+            else                                      bcol = (ImU32)ImColor(40, 255, 90, 230);
             for (int e = 0; e < NativeBones::NUM_EDGE; e++) {
                 int a = NativeBones::EDGES[e][0], b = NativeBones::EDGES[e][1];
                 if (a == 0 || b == 0) continue;                   // 头(slot0)单独画,见下
@@ -1699,7 +1707,8 @@ void Draw_Main(ImDrawList *Draw){
 
     	    else if (strstr(data[i].class_name, "sender") != NULL){
     	        // 判据见上面 is_real_generator() 的注释。若发现密码机被破译完成后从叠加层消失，改那里。
-    	        if (show_draw_secret_mechine && is_real_generator(data[i].obj)){
+    	        // 约瑟夫镜世界的镜像密码机(PyProgress 黑名单)不画，否则满屏重复的"[密码机]"空标记
+    	        if (show_draw_secret_mechine && is_real_generator(data[i].obj) && !PyProgress::is_mirror_generator(data[i].obj)){
     	            // 进度来自 Python 侧的 GeneratorUnit，靠 model 指针身份配对(见 PyProgress.h)。
     	            // 配不上时(model 为空/链路失效)退化成原来的 "[密码机] X.X 米"。
     	            float progress = 0.f;
@@ -1798,23 +1807,39 @@ void Draw_Main(ImDrawList *Draw){
                     // 身份进局约 2 秒后才赋值，之前只有号码、画白色；不是模仿者玩家本体的对象照旧画角色名
                     int cc_identity = 0, cc_seat = 0;
                     bool cc = copycat_mode && PySelf::copycat_identity(data[i].obj, cc_identity, cc_seat);
+                    // 约瑟夫镜世界(按身份固定，不再按我所在世界翻转)：
+                    //   echo=镜像投影(白框，静止死物)；真人=绿/红框 + 名字后缀标它自己在哪个世界
+                    bool joseph = PySelf::is_joseph_match();
+                    bool echo   = PySelf::body_is_mirror(data[i].obj);
                     ImColor name_color = ImColor(255,200,0,255);
                     if (cc){
                         char cc_text[48];
                         copycat_label(cc_identity, cc_seat, cc_text, sizeof(cc_text));
                         s += cc_text;
                         name_color = copycat_color(cc_identity);
-                    } else 
+                    } else
                     {
                         s+=data[i].str;
                     }
+                    // 约瑟夫局：真人名字后缀标它在哪个世界(在镜世界=镜像/否则=现实)；投影(echo)不加后缀
+                    if (joseph && !echo)
+                        s += PySelf::body_in_photo_world(data[i].obj) ? " 镜像" : " 现实";
+                    if (echo) name_color = BotBoneColor;   // 镜像投影：名字白
                     auto textSize = ImGui::CalcTextSize(s.c_str(), 0, 25);
                     Draw->AddText({X1 + W/2-(textSize.x/2),Y1-45}, name_color, s.c_str());
-                    if (show_draw_Rect){
+                    // 约瑟夫局：方框永远画(无视"绘制方框"开关)。镜像投影白 / 真实监管红 / 真实求生者绿。
+                    // 非约瑟夫局(场上无 PhotoUnit，不会有投影)走原来的开关逻辑。
+                    if (joseph){
+                        ImColor bc = echo ? BotBoneColor
+                                   : (cc ? name_color
+                                   : (data[i].camp==1 ? BoneColor : color_green));
+                        ImGui::GetForegroundDrawList()->AddRect({X1, Y1},{X2, Y2}, bc,3, 0,1.8f);
+                    }
+                    else if (show_draw_Rect){
         			    if (cc)
         			        ImGui::GetForegroundDrawList()->AddRect({X1, Y1},{X2, Y2}, name_color,3, 0,1.8f);
         			    else if (IsGhostEntity(data[i]))
-        			        ImGui::GetForegroundDrawList()->AddRect({X1, Y1},{X2, Y2}, BotBoneColor,3, 0,1.8);			        	        
+        			        ImGui::GetForegroundDrawList()->AddRect({X1, Y1},{X2, Y2}, BotBoneColor,3, 0,1.8);
         			    else if (data[i].camp==1)
         			        ImGui::GetForegroundDrawList()->AddRect({X1, Y1},{X2, Y2}, BoneColor,3, 0,1.8f);
         			    else if (data[i].camp==2)
@@ -1822,7 +1847,7 @@ void Draw_Main(ImDrawList *Draw){
         			}
                     float next_y = Y2 + 10;            // 距离、天赋、辅助特质依次往下排
                     const float line_h = ImGui::GetFontSize() + 2.0f;
-                    if (show_draw_Distance){
+                    if (show_draw_Distance || echo){   // 镜像投影默认画距离(白框+名字+距离固定集)
                         std::string dist_str;
                         dist_str += std::to_string((int) dist);
                         dist_str += " 米";
@@ -1832,7 +1857,8 @@ void Draw_Main(ImDrawList *Draw){
                     }
 
                     // 天赋简称：求生者大心脏排最后、监管挽留排最后，格式化在 PyGenius.h 里
-                    if (show_draw_Genius){
+                    // 约瑟夫镜世界：另一个世界的人(定格死物/对面世界)不画天赋，避免重复刷一堆
+                    if (show_draw_Genius && !echo){   // 镜像投影不画天赋(真人照常)
                         PyGenius::Info gi;
                         if (PyGenius::lookup(data[i].obj, D.X, D.Y, gi)){
                             PyGenius::GeniusLine seg;
@@ -1878,7 +1904,7 @@ void Draw_Main(ImDrawList *Draw){
                         }
                     }
 
-                    if (show_draw_Line && !copycat_mode){       // 模仿者模式不画射线(用户要求)
+                    if (show_draw_Line && !copycat_mode && !echo){   // 模仿者模式、约瑟夫镜像投影不画射线(用户要求)
                         ImGui::GetForegroundDrawList()->AddLine({px, 160},{X1 + W/2, Y1}, ImColor(255, 255, 255),2);
                     }
                 }
@@ -2173,6 +2199,7 @@ void Layout_tick_UI(bool *main_thread_flag) {
             ImGui::Text("阶段:%s", PyScene::status_text());
             // 自身锚点：链路一旦失效这里会写明原因，绘制自动退回相机深度启发式
             ImGui::Text("自身:%s", PySelf::status_text());
+            ImGui::Text("镜世界:%s", PySelf::photo_diag_text());   // 约瑟夫 PhotoUnit 激活状态(_time/_players)
         }
 
         ImGui::SetNextItemOpen(true, ImGuiCond_Once);
