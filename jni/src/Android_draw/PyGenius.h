@@ -191,7 +191,7 @@ static GeniusMemory *get_mem(int64_t uid)
 }
 static volatile bool g_available = false;
 static volatile int  g_fail_streak = 0;
-static char g_status[96] = "未启动";
+static char g_status[96] = "";   // 空 = 未启动，见 status_text()
 
 // ---- 公共 CPython 工具：实现在 PyCore.h，三个模块共用一份(见那里的文件头) ----
 using PyCore::is_obj; using PyCore::str_equals; using PyCore::Dict; using PyCore::read_dict;
@@ -881,10 +881,10 @@ static bool try_refresh()
             int w = 1 - g_active;
             g_count[w] = 0;
             g_active = w;
-            snprintf(g_status, sizeof(g_status), "局外 花名册%d人 实时天赋%d条", g_roster_n, g_civ_n);
+            snprintf(g_status, sizeof(g_status), T("局外 花名册%d人 实时天赋%d条", "out of match: roster %d, live talents %d"), g_roster_n, g_civ_n);
             return true;
         }
-        snprintf(g_status, sizeof(g_status), "unit_mgr 无效(未在对局中?)");
+        snprintf(g_status, sizeof(g_status), "%s", T("unit_mgr 无效(未在对局中?)", "unit_mgr invalid (not in match?)"));
         return false;
     }
 
@@ -897,7 +897,7 @@ static bool try_refresh()
     uint64_t ud = getPtr64(um - 0x18);
     g_i_ubt = find_key(ud, "units_by_type", g_i_ubt);
     uint64_t ubt = (g_i_ubt >= 0) ? get_attr(ud, g_i_ubt) : 0;
-    if (!is_obj(ubt)) { snprintf(g_status, sizeof(g_status), "units_by_type 无效"); return false; }
+    if (!is_obj(ubt)) { snprintf(g_status, sizeof(g_status), "%s", T("units_by_type 无效", "units_by_type invalid")); return false; }
 
     int write_idx = 1 - g_active, count = 0;
     // 监管和求生者的属性序号缓存是共用的；两个类的插入顺序不同，
@@ -914,16 +914,16 @@ static bool try_refresh()
         if (g_room_wait) {
             g_count[write_idx] = 0;
             g_active = write_idx;
-            snprintf(g_status, sizeof(g_status), "准备阶段 %s 求生者天赋%d条",
-                     g_prep_as_hunter ? "我是监管" : "我是求生者(不显示)", g_civ_n);
+            snprintf(g_status, sizeof(g_status), T("准备阶段 %s 求生者天赋%d条", "prep: %s, survivor talents %d"),
+                     g_prep_as_hunter ? T("我是监管", "I'm hunter") : T("我是求生者(不显示)", "I'm survivor (hidden)"), g_civ_n);
             return true;
         }
-        snprintf(g_status, sizeof(g_status), "一个单位也没读出");
+        snprintf(g_status, sizeof(g_status), "%s", T("一个单位也没读出", "no unit read"));
         return false;
     }
     g_count[write_idx] = count;
     g_active = write_idx;
-    snprintf(g_status, sizeof(g_status), "正常 %d 人", count);
+    snprintf(g_status, sizeof(g_status), T("正常 %d 人", "OK %d players"), count);
     return true;
 }
 
@@ -967,7 +967,7 @@ static void start(uintptr_t libbase)
 {
     if (g_libbase != 0) return;
     g_libbase   = libbase;
-    snprintf(g_status, sizeof(g_status), "启动中");
+    snprintf(g_status, sizeof(g_status), "%s", T("启动中", "starting"));
     std::thread(thread_main).detach();
     printf("[天赋] 已启动 libbase=0x%lx\n", (unsigned long)libbase);
     fflush(stdout);
@@ -976,7 +976,7 @@ static void start(uintptr_t libbase)
 // ---------------- 给绘制侧用的只读接口 ----------------
 
 static inline bool available() { return g_available; }
-static inline const char *status_text() { return g_status; }
+static inline const char *status_text() { return g_status[0] ? g_status : T("未启动", "not started"); }
 
 // ---- 花名册：局内给单位配大天赋的兜底(见 collect_type)，局外不再直接拿来显示 ----
 // (大厅里它仍是上一局的数据，2026-09-24 实测；准备阶段显示改走下面的 civ_*)
@@ -1038,18 +1038,18 @@ static inline int desperate_state(const Info &g)
 // _cd_delta 不在冷却中时恒为 0，所以 0 直接当"就绪"用，不需要额外的标志位。
 static void trait_line_text(const Info &g, const char *name, char *buf, size_t cap);
 
-// 辅助特质名。1~8 连号，全表已确认
+// 辅助特质名。1~8 连号，全表已确认。英文取国际服 TID_NAME_*(离线解包，见解包存档 SKILL §7.8)
 static const char *trait_name(int id)
 {
     switch (id) {
-        case 1: return "聆听";
-        case 2: return "失常";
-        case 3: return "兴奋";
-        case 4: return "巡视者";
-        case 5: return "传送";
-        case 6: return "窥视者";
-        case 7: return "闪现";
-        case 8: return "移形";
+        case 1: return T("聆听", "Listen");
+        case 2: return T("失常", "Abnormal");
+        case 3: return T("兴奋", "Excitement");
+        case 4: return T("巡视者", "Patroller");
+        case 5: return T("传送", "Teleport");
+        case 6: return T("窥视者", "Peeper");
+        case 7: return T("闪现", "Blink");
+        case 8: return T("移形", "Warp");
         default: return "";
     }
 }
@@ -1081,7 +1081,12 @@ static inline bool flywheel_ready(const Info &g) { return g.has_flywheel && g.fl
 //   完整：全部大天赋；一个大天赋都没带就写"无"
 // 飞轮段：就绪 "飞轮"(飞轮就绪=true，画红) / 冷却中 "飞轮13s" / 没读到冷却 "飞轮"。
 // skill_dict 里有飞轮技能本身就证明带了飞轮，所以天赋表读不全(未知/部分)时也照样显示它。
+// 英文用英文社区通用缩写(KJR/FW/TT/BT、CS/TC/Ins/Det)，每个词后带一个空格，三段直接拼起来也分得开。
 struct GeniusLine { char pre[48]; char flywheel[24]; char post[48]; bool flywheel_ready; };
+static inline void seg_add(char *buf, size_t cap, const char *cn, const char *en)
+{
+    strncat(buf, T(cn, en), cap - strlen(buf) - 1);
+}
 static void genius_segments(const Info &g, GeniusLine &o)
 {
     memset(&o, 0, sizeof(o));
@@ -1089,22 +1094,23 @@ static void genius_segments(const Info &g, GeniusLine &o)
     bool carries_flywheel = is_survivor && ((g.genius_bits & BIT_ID_8) || g.has_flywheel);
     if (g.genius_state == GENIUS_UNKNOWN && !carries_flywheel) return;
     if (is_survivor) {
-        if (g.genius_bits & BIT_ID_32) strncat(o.pre, "双弹", sizeof(o.pre) - strlen(o.pre) - 1);
+        if (g.genius_bits & BIT_ID_32) seg_add(o.pre, sizeof(o.pre), "双弹", "KJR ");
         if (carries_flywheel) {
-            if (flywheel_ready(g)) { snprintf(o.flywheel, sizeof(o.flywheel), "飞轮"); o.flywheel_ready = true; }
-            else if (g.has_flywheel) snprintf(o.flywheel, sizeof(o.flywheel), "飞轮%.0fs", extrapolate(g.flywheel_remain, g.flywheel_read_ms, g.flywheel_rate));
-            else               snprintf(o.flywheel, sizeof(o.flywheel), "飞轮");
+            const char *fw = T("飞轮", "FW");
+            if (flywheel_ready(g)) { snprintf(o.flywheel, sizeof(o.flywheel), "%s%s", fw, g_english ? " " : ""); o.flywheel_ready = true; }
+            else if (g.has_flywheel) snprintf(o.flywheel, sizeof(o.flywheel), g_english ? "%s%.0fs " : "%s%.0fs", fw, extrapolate(g.flywheel_remain, g.flywheel_read_ms, g.flywheel_rate));
+            else               snprintf(o.flywheel, sizeof(o.flywheel), "%s%s", fw, g_english ? " " : "");
         }
-        if (g.genius_bits & BIT_ID_24) strncat(o.post, "搏命", sizeof(o.post) - strlen(o.post) - 1);
-        if (g.genius_bits & BIT_ID_16) strncat(o.post, "大心脏", sizeof(o.post) - strlen(o.post) - 1);
+        if (g.genius_bits & BIT_ID_24) seg_add(o.post, sizeof(o.post), "搏命", "TT ");
+        if (g.genius_bits & BIT_ID_16) seg_add(o.post, sizeof(o.post), "大心脏", "BT ");
     } else {
-        if (g.genius_bits & BIT_ID_8)   strncat(o.pre, "封窗", sizeof(o.pre) - strlen(o.pre) - 1);
-        if (g.genius_bits & BIT_ID_16) strncat(o.pre, "底牌", sizeof(o.pre) - strlen(o.pre) - 1);
-        if (g.genius_bits & BIT_ID_32) strncat(o.pre, "张狂", sizeof(o.pre) - strlen(o.pre) - 1);
-        if (g.genius_bits & BIT_ID_24) strncat(o.pre, "挽留", sizeof(o.pre) - strlen(o.pre) - 1);
+        if (g.genius_bits & BIT_ID_8)  seg_add(o.pre, sizeof(o.pre), "封窗", "CS ");
+        if (g.genius_bits & BIT_ID_16) seg_add(o.pre, sizeof(o.pre), "底牌", "TC ");
+        if (g.genius_bits & BIT_ID_32) seg_add(o.pre, sizeof(o.pre), "张狂", "Ins ");
+        if (g.genius_bits & BIT_ID_24) seg_add(o.pre, sizeof(o.pre), "挽留", "Det ");
     }
     if (g.genius_state != GENIUS_COMPLETE) strncat(o.post, "?", sizeof(o.post) - strlen(o.post) - 1);
-    else if (!o.pre[0] && !o.flywheel[0] && !o.post[0]) snprintf(o.pre, sizeof(o.pre), "无");
+    else if (!o.pre[0] && !o.flywheel[0] && !o.post[0]) snprintf(o.pre, sizeof(o.pre), "%s", T("无", "None"));
 }
 
 static void trait_line_text(const Info &g, const char *name, char *buf, size_t cap)
@@ -1117,7 +1123,7 @@ static void trait_line_text(const Info &g, const char *name, char *buf, size_t c
         else snprintf(buf, cap, "%s %d/%d %.1fs", name, g.charge_cur, g.charge_max, cd_remain_now(g));
         return;
     }
-    if (cd_ready(g)) snprintf(buf, cap, "%s 就绪", name);
+    if (cd_ready(g)) snprintf(buf, cap, "%s %s", name, T("就绪", "ready"));
     else           snprintf(buf, cap, "%s %.1fs", name, cd_remain_now(g));
 }
 

@@ -67,7 +67,7 @@ static int64_t   g_i_box_pos = -1, g_i_box_type = -1, g_i_drop_pos = -1;
 static volatile bool g_available = false;      // 玩家读取状态(主)
 static volatile bool g_loot_avail = false;
 static volatile int  g_fail_streak = 0;
-static char g_status[96] = "未启动";
+static char g_status[96] = "";   // 空 = 未启动，见 status_text()
 
 using PyCore::is_obj; using PyCore::Dict; using PyCore::read_dict;
 using PyCore::value_slot; using PyCore::find_key; using PyCore::get_attr;
@@ -97,22 +97,22 @@ static uint64_t get_ubt()
     if (g_module_dict == 0 && !resolve_module()) return 0;
     g_i_unit_mgr = find_key(g_module_dict, "unit_mgr", g_i_unit_mgr);
     uint64_t um = (g_i_unit_mgr >= 0) ? get_attr(g_module_dict, g_i_unit_mgr) : 0;
-    if (!is_obj(um)) { snprintf(g_status, sizeof(g_status), "unit_mgr 无效(未在对局中?)"); return 0; }
+    if (!is_obj(um)) { snprintf(g_status, sizeof(g_status), "%s", T("unit_mgr 无效(未在对局中?)", "unit_mgr invalid (not in match?)")); return 0; }
     uint64_t ud = getPtr64(um - 0x18);
     g_i_ubt = find_key(ud, "units_by_type", g_i_ubt);
     uint64_t ubt = (g_i_ubt >= 0) ? get_attr(ud, g_i_ubt) : 0;
-    if (!is_obj(ubt)) { snprintf(g_status, sizeof(g_status), "units_by_type 无效"); return 0; }
+    if (!is_obj(ubt)) { snprintf(g_status, sizeof(g_status), "%s", T("units_by_type 无效", "units_by_type invalid")); return 0; }
     return ubt;
 }
 
 static bool refresh_players(uint64_t ubt)
 {
     uint64_t lst = get_type_list(ubt, PLAYER_UNIT_TYPE);
-    if (!is_obj(lst)) { snprintf(g_status, sizeof(g_status), "不是林中童话局(无[1601])"); return false; }
+    if (!is_obj(lst)) { snprintf(g_status, sizeof(g_status), "%s", T("不是林中童话局(无[1601])", "not an Enchanted Forest match (no [1601])")); return false; }
     int64_t n = 0;
     vm_readv(lst + 0x10, &n, 8);
     uint64_t items = getPtr64(lst + 0x18);
-    if (n <= 0 || n > 64 || !is_obj(items)) { snprintf(g_status, sizeof(g_status), "玩家列表异常"); return false; }
+    if (n <= 0 || n > 64 || !is_obj(items)) { snprintf(g_status, sizeof(g_status), "%s", T("玩家列表异常", "player list malformed")); return false; }
     if (n > MAX_PLAYERS) n = MAX_PLAYERS;
 
     int write_idx = 1 - g_pactive;
@@ -150,7 +150,7 @@ static bool refresh_players(uint64_t ubt)
     }
     g_pcount[write_idx] = pc;
     g_pactive = write_idx;
-    snprintf(g_status, sizeof(g_status), "正常 玩家%d 物资%d", pc, g_loot_avail ? g_lcount[g_lactive] : 0);
+    snprintf(g_status, sizeof(g_status), T("正常 玩家%d 物资%d", "OK players %d loot %d"), pc, g_loot_avail ? g_lcount[g_lactive] : 0);
     return true;
 }
 
@@ -235,7 +235,7 @@ static void start(uintptr_t libbase)
 {
     if (g_libbase != 0) return;
     g_libbase = libbase;
-    snprintf(g_status, sizeof(g_status), "启动中");
+    snprintf(g_status, sizeof(g_status), "%s", T("启动中", "starting"));
     std::thread(thread_main).detach();
     printf("[林中童话] 已启动 libbase=0x%lx\n", (unsigned long)libbase);
     fflush(stdout);
@@ -243,7 +243,7 @@ static void start(uintptr_t libbase)
 
 // ---------------- 给绘制侧用的只读接口 ----------------
 static inline bool available() { return g_available; }
-static inline const char *status_text() { return g_status; }
+static inline const char *status_text() { return g_status[0] ? g_status : T("未启动", "not started"); }
 
 static inline int player_count() { return g_available ? g_pcount[g_pactive] : 0; }
 static bool get_player(int i, Player &out)

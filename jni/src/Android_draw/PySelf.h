@@ -158,7 +158,7 @@ static int64_t g_i_outphoto = -1;                       // out_photo_uid(约瑟�
 // PhotoUnit 开局就持久存在,拍没拍照看它 _time：没拍照=None、拍照后=game_time(数字)。
 // _players=当前在相中世界里的玩家 uid；我的 uid 在里面=我进了镜世界。实现见下面 scan_photo_unit。
 // 声明放这里(collect_units 要用 g_photo_active 门控)
-static char              g_photo_diag[160] = "(未扫描)";
+static char              g_photo_diag[160] = "";   // 空 = 未扫描，见 photo_diag_text()
 static int64_t           g_photo_scan_ms = 0;
 static int64_t           g_pd_i_time = -1, g_pd_i_players = -1;
 static int               g_photo_key = -1;              // PhotoUnit 的 units_by_type 键(找到后缓存)
@@ -227,7 +227,7 @@ static volatile bool g_available = false;
 // 所以这个标志不挂在 快照/g_available 上，在锚点之前单独算、单独发布。读不全一律算"不是局外"
 static volatile bool g_in_lobby = false;
 static volatile int  g_fail_streak = 0;
-static char g_status[128] = "未启动";
+static char g_status[128] = "";   // 空 = 未启动，见 status_text()
 
 // ---- 公共 CPython 工具：实现在 PyCore.h，三个模块共用一份(见那里的文件头) ----
 using PyCore::is_obj; using PyCore::str_equals; using PyCore::Dict; using PyCore::read_dict;
@@ -735,10 +735,10 @@ static void scan_photo_unit(uint64_t ubt, uint64_t um)
     g_photo_active = active;
     g_photo_present = (inst != 0);               // 有 PhotoUnit = 约瑟夫局(与拍没拍照无关)
     if (inst) snprintf(g_photo_diag, sizeof(g_photo_diag), "key=%d _time=%s _players=%d active=%d", g_photo_key, tbuf, players, (int)active);
-    else      snprintf(g_photo_diag, sizeof(g_photo_diag), "无 PhotoUnit(非约瑟夫局?)");
+    else      snprintf(g_photo_diag, sizeof(g_photo_diag), "%s", T("无 PhotoUnit(非约瑟夫局?)", "no PhotoUnit (not a Photographer match?)"));
 }
 
-static inline const char *photo_diag_text() { return g_photo_diag; }
+static inline const char *photo_diag_text() { return g_photo_diag[0] ? g_photo_diag : T("(未扫描)", "(not scanned)"); }
 // 我的 uid 在不在镜世界玩家列表里(只在 PySelf 线程调，与 scan 同线程、无竞态)
 static bool self_in_players(int64_t uid)
 {
@@ -780,22 +780,22 @@ static bool try_refresh()
     // ---- 一、当前操控单位：g_cam_ctrl.unit ----
     g_i_cam = find_key(g_module_dict, "g_cam_ctrl", g_i_cam);
     uint64_t cam = (g_i_cam >= 0) ? get_attr(g_module_dict, g_i_cam) : 0;
-    if (!is_obj(cam)) { snprintf(g_status, sizeof(g_status), "g_cam_ctrl 无效(未在对局中?)"); return false; }
+    if (!is_obj(cam)) { snprintf(g_status, sizeof(g_status), "%s", T("g_cam_ctrl 无效(未在对局中?)", "g_cam_ctrl invalid (not in match?)")); return false; }
 
     uint64_t camd = get_inst_dict(cam);
-    if (!camd) { snprintf(g_status, sizeof(g_status), "g_cam_ctrl 不是 managed-dict 布局"); return false; }
+    if (!camd) { snprintf(g_status, sizeof(g_status), "%s", T("g_cam_ctrl 不是 managed-dict 布局", "g_cam_ctrl is not managed-dict layout")); return false; }
     Dict camk;
-    if (!read_dict(camd, camk)) { snprintf(g_status, sizeof(g_status), "g_cam_ctrl 字典异常"); return false; }
+    if (!read_dict(camd, camk)) { snprintf(g_status, sizeof(g_status), "%s", T("g_cam_ctrl 字典异常", "g_cam_ctrl dict malformed")); return false; }
 
     g_i_cam_unit = resolve_index(camd, camk, g_i_cam_unit, "unit");
-    if (g_i_cam_unit < 0) { snprintf(g_status, sizeof(g_status), "g_cam_ctrl 里没有 unit"); return false; }
+    if (g_i_cam_unit < 0) { snprintf(g_status, sizeof(g_status), "%s", T("g_cam_ctrl 里没有 unit", "no unit in g_cam_ctrl")); return false; }
     uint64_t me = getPtr64(value_slot(camk, g_i_cam_unit));
-    if (!is_obj(me)) { snprintf(g_status, sizeof(g_status), "cam.unit 为空"); return false; }
+    if (!is_obj(me)) { snprintf(g_status, sizeof(g_status), "%s", T("cam.unit 为空", "cam.unit is null")); return false; }
 
     uint64_t me_d = get_inst_dict(me);
-    if (!me_d) { snprintf(g_status, sizeof(g_status), "cam.unit 没有实例字典"); return false; }
+    if (!me_d) { snprintf(g_status, sizeof(g_status), "%s", T("cam.unit 没有实例字典", "cam.unit has no instance dict")); return false; }
     Dict me_k;
-    if (!read_dict(me_d, me_k)) { snprintf(g_status, sizeof(g_status), "cam.unit 字典异常"); return false; }
+    if (!read_dict(me_d, me_k)) { snprintf(g_status, sizeof(g_status), "%s", T("cam.unit 字典异常", "cam.unit dict malformed")); return false; }
 
     g_i_model = resolve_index(me_d, me_k, g_i_model, "model");
     g_i_utype = resolve_index(me_d, me_k, g_i_utype, "unit_type");
@@ -805,7 +805,7 @@ static bool try_refresh()
     if (g_i_utype >= 0) { int64_t v = 0; if (read_int(getPtr64(value_slot(me_k, g_i_utype)), v)) res.camp = (int)v; }
     if (g_i_uid   >= 0) { int64_t v = 0; if (read_int(getPtr64(value_slot(me_k, g_i_uid)),   v)) res.uid  = v; }
 
-    if (res.anchor == 0) { snprintf(g_status, sizeof(g_status), "cam.unit.model 读不到"); return false; }
+    if (res.anchor == 0) { snprintf(g_status, sizeof(g_status), "%s", T("cam.unit.model 读不到", "cam.unit.model unreadable")); return false; }
 
     // ---- 约瑟夫镜世界：我现在在不在镜世界 ----
     // 2026-10-22 坐实：= 我的 uid 在 PhotoUnit._players 里(进镜世界会把 uid append 进去，实测我进去后该列表 0→1)。
@@ -823,10 +823,10 @@ static bool try_refresh()
     g_active = write_idx;                                   // 填完再翻转
     int pos_ok = 0;
     for (int i = 0; i < MAX_COPYCAT; i++) if (g_pos[g_pos_active][i].ok) pos_ok++;
-    snprintf(g_status, sizeof(g_status), "正常 %s uid=%lld 本体%d 废弃%d 身份%d 坐标%d%s",
-             res.camp == 1 ? "监管" : (res.camp == 2 ? "求生" : (is_copycat_player_type(res.camp) ? "模仿者局" : "从属")),
+    snprintf(g_status, sizeof(g_status), T("正常 %s uid=%lld 本体%d 废弃%d 身份%d 坐标%d%s", "OK %s uid=%lld bodies %d stale %d identities %d pos %d%s"),
+             res.camp == 1 ? T("监管", "hunter") : (res.camp == 2 ? T("求生", "survivor") : (is_copycat_player_type(res.camp) ? T("模仿者局", "copycat") : T("从属", "minion"))),
              (long long)res.uid, res.body_count, res.stale_count, res.copycat_count,
-             pos_ok, (res.copycat_count > 0 && g_pos_type.load() == 0) ? "(未校准)" : "");
+             pos_ok, (res.copycat_count > 0 && g_pos_type.load() == 0) ? T("(未校准)", "(uncalibrated)") : "");
     return true;
 }
 
@@ -870,7 +870,7 @@ static void start(uintptr_t libbase)
 {
     if (g_libbase != 0) return;
     g_libbase   = libbase;
-    snprintf(g_status, sizeof(g_status), "启动中");
+    snprintf(g_status, sizeof(g_status), "%s", T("启动中", "starting"));
     std::thread(thread_main).detach();
     printf("[自身] 已启动 libbase=0x%lx\n", (unsigned long)libbase);
     fflush(stdout);
@@ -879,7 +879,7 @@ static void start(uintptr_t libbase)
 // ---------------- 给绘制侧用的只读接口 ----------------
 
 static inline bool available() { return g_available; }
-static inline const char *status_text() { return g_status; }
+static inline const char *status_text() { return g_status[0] ? g_status : T("未启动", "not started"); }
 
 // 当前操控单位的场景对象。返回 false 时绘制侧要退回相机深度启发式
 static bool anchor(uint64_t &obj)
@@ -1038,7 +1038,8 @@ static int copycat_extra(ExtraUnit *out, int cap)
     memcpy(out, g_extra[a], sizeof(ExtraUnit) * n);
     return n;
 }
-static inline const char *copycat_extra_label(uint8_t l) { return l < EXTRA_TYPE_COUNT ? EXTRA_LABELS[l] : "?"; }
+static const char *const EXTRA_LABELS_EN[1] = { "Ghoul" };   // 游戏里叫"食尸鬼"，英文 Ghoul(TID_COPYCAT_TASK_NAME_19)
+static inline const char *copycat_extra_label(uint8_t l) { return l < EXTRA_TYPE_COUNT ? (g_english ? EXTRA_LABELS_EN[l] : EXTRA_LABELS[l]) : "?"; }
 
 // 阵营按号段：1xx 侦探团 / 2xx 模仿者 / 3xx 中立(没有独立的阵营字段，若辰那些 camp* 属性在这个模式下全不存在)
 static inline int copycat_camp(int identity) { return identity / 100; }
@@ -1051,11 +1052,17 @@ static const char *copycat_identity_name(int identity)
                                         "拳击手", "灵媒", "学徒", "密探", "掮客", "药剂师", "巡林员", "执灯人", "评论家" };
     static const char *const bad[] = { "神偷", "千面人", "阴谋家", "烟火师", "怪盗", "催眠师", "地下医生", "处刑人", "指挥家" };
     static const char *const neutral[] = { "流浪汉", "送货员", "愚人", "棋手", "清洁工", "顾问", "降灵师", "导演" };
+    // 英文：国际服 TID_COPYCAT_{DETECTIVE,COPYCAT,MYSTERIOUS}_NAME_<n>，序号与上面三张表一一对应(中文逐条核对过)
+    static const char *const good_en[] = { "Detective", "Guard", "Sheriff", "Hunter", "Spice Maker", "Locksmith", "Banker", "Friar", "Orator",
+                                           "Boxer", "Medium", "Apprentice", "Secret Agent", "Broker", "Pharmacist", "Ranger", "Patrol", "Critic" };
+    static const char *const bad_en[] = { "Master Burglar", "Mimic", "Conspirator", "Pyrotechnist", "Phantom Thief", "Hypnotist",
+                                          "Underground Doctor", "Executioner", "Conductor" };
+    static const char *const neutral_en[] = { "Vagrant", "Courier", "Fool", "Chess Player", "Janitor", "Consultant", "Occultist", "Director" };
     int k = identity % 100 - 1;
     switch (identity / 100) {
-        case 1: if (k >= 0 && k < (int)(sizeof(good) / sizeof(good[0]))) return good[k]; break;
-        case 2: if (k >= 0 && k < (int)(sizeof(bad) / sizeof(bad[0]))) return bad[k]; break;
-        case 3: if (k >= 0 && k < (int)(sizeof(neutral) / sizeof(neutral[0]))) return neutral[k]; break;
+        case 1: if (k >= 0 && k < (int)(sizeof(good) / sizeof(good[0]))) return g_english ? good_en[k] : good[k]; break;
+        case 2: if (k >= 0 && k < (int)(sizeof(bad) / sizeof(bad[0]))) return g_english ? bad_en[k] : bad[k]; break;
+        case 3: if (k >= 0 && k < (int)(sizeof(neutral) / sizeof(neutral[0]))) return g_english ? neutral_en[k] : neutral[k]; break;
     }
     return nullptr;
 }

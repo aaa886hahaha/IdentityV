@@ -120,7 +120,7 @@ static int64_t   g_i_hack = -1, g_i_door_model = -1, g_i_can_open = -1, g_i_has_
 static int64_t   g_i_m_pos = -1, g_i_m_dir = -1;    // MaryMirrorUnit 的 position/direction 序号缓存
 static volatile bool g_available = false;
 static volatile int  g_fail_streak = 0;
-static char g_status[96] = "未启动";
+static char g_status[96] = "";   // 空 = 未启动，见 status_text()
 
 // ---- 公共 CPython 工具：实现在 PyCore.h，三个模块共用一份(见那里的文件头) ----
 using PyCore::is_obj; using PyCore::str_equals; using PyCore::Dict; using PyCore::read_dict;
@@ -259,12 +259,12 @@ static bool try_refresh()
 
     g_i_unit_mgr = find_key(g_module_dict, "unit_mgr", g_i_unit_mgr);
     uint64_t um = (g_i_unit_mgr >= 0) ? get_attr(g_module_dict, g_i_unit_mgr) : 0;
-    if (!is_obj(um)) { snprintf(g_status, sizeof(g_status), "unit_mgr 无效(未在对局中?)"); return false; }
+    if (!is_obj(um)) { snprintf(g_status, sizeof(g_status), "%s", T("unit_mgr 无效(未在对局中?)", "unit_mgr invalid (not in match?)")); return false; }
 
     uint64_t ud = getPtr64(um - 0x18);            // managed-dict 预头
     g_i_ubt = find_key(ud, "units_by_type", g_i_ubt);
     uint64_t ubt = (g_i_ubt >= 0) ? get_attr(ud, g_i_ubt) : 0;
-    if (!is_obj(ubt)) { snprintf(g_status, sizeof(g_status), "units_by_type 无效"); return false; }
+    if (!is_obj(ubt)) { snprintf(g_status, sizeof(g_status), "%s", T("units_by_type 无效", "units_by_type invalid")); return false; }
 
     // 大门、镜面先收：放在密码机那几个 return false 之前，免得"没有密码机列表"把它们也带下水
     int write_idx = 1 - g_active;
@@ -274,7 +274,7 @@ static bool try_refresh()
 
     // 在 int->list 的表里找键 3
     Dict k;
-    if (!read_dict(ubt, k)) { snprintf(g_status, sizeof(g_status), "units_by_type 结构异常"); return false; }
+    if (!read_dict(ubt, k)) { snprintf(g_status, sizeof(g_status), "%s", T("units_by_type 结构异常", "units_by_type malformed")); return false; }
     uint64_t lst = 0;
     for (int64_t i = 0; i < k.n_entries; i++) {
         uint64_t kp = getPtr64(key_slot(k, i));
@@ -284,12 +284,12 @@ static bool try_refresh()
         vm_readv(kp + 24, &dg, 4);
         if (sz == 1 && (int)dg == GENERATOR_UNIT_TYPE) { lst = getPtr64(value_slot(k, i)); break; }
     }
-    if (!is_obj(lst)) { snprintf(g_status, sizeof(g_status), "没有密码机列表"); return false; }
+    if (!is_obj(lst)) { snprintf(g_status, sizeof(g_status), "%s", T("没有密码机列表", "no cipher list")); return false; }
 
     int64_t n = 0;
     vm_readv(lst + 0x10, &n, 8);                 // ob_size
     uint64_t items = getPtr64(lst + 0x18);       // ob_item
-    if (n <= 0 || n > 64 || !is_obj(items)) { snprintf(g_status, sizeof(g_status), "密码机列表异常"); return false; }
+    if (n <= 0 || n > 64 || !is_obj(items)) { snprintf(g_status, sizeof(g_status), "%s", T("密码机列表异常", "cipher list malformed")); return false; }
     if (n > MAX_GENERATORS) n = MAX_GENERATORS;
 
     int count = 0;                                  // 写缓冲下标在上面收大门时已经取好
@@ -341,10 +341,10 @@ static bool try_refresh()
         count++;
     }
 
-    if (count == 0) { snprintf(g_status, sizeof(g_status), "一台也没读出"); return false; }
+    if (count == 0) { snprintf(g_status, sizeof(g_status), "%s", T("一台也没读出", "none read")); return false; }
     g_count[write_idx] = count;
     g_active = write_idx;                                   // 填完再翻转，绘制线程永远看到完整的一份
-    snprintf(g_status, sizeof(g_status), "正常 %d 台 门%d", count, g_door_count[write_idx]);
+    snprintf(g_status, sizeof(g_status), T("正常 %d 台 门%d", "OK %d ciphers, gates %d"), count, g_door_count[write_idx]);
     return true;
 }
 
@@ -386,7 +386,7 @@ static void start(uintptr_t libbase)
 {
     if (g_libbase != 0) return;
     g_libbase   = libbase;
-    snprintf(g_status, sizeof(g_status), "启动中");
+    snprintf(g_status, sizeof(g_status), "%s", T("启动中", "starting"));
     std::thread(thread_main).detach();
     printf("[密码机进度] 已启动 libbase=0x%lx\n", (unsigned long)libbase);
     fflush(stdout);
@@ -395,7 +395,7 @@ static void start(uintptr_t libbase)
 // ---------------- 给绘制侧用的只读接口 ----------------
 
 static inline bool available() { return g_available; }
-static inline const char *status_text() { return g_status; }
+static inline const char *status_text() { return g_status[0] ? g_status : T("未启动", "not started"); }
 
 // 把场景对象配到对应的 GeneratorUnit。
 // 首选指针身份(model+0x20 就是场景对象本身)；model 为空时才退回坐标近邻。

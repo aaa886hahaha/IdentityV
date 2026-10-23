@@ -21,7 +21,7 @@ namespace PyScene {
 
 static uintptr_t         g_libbase = 0;
 static std::atomic<int>  g_phase{PyCore::PHASE_UNKNOWN};   // 见 PyProgress.h 同名变量注释(原子保证发布)
-static char              g_status[96] = "未启动";
+static char              g_status[96] = "";   // 空 = 未启动，见 status_text()
 
 static void refresh_once()
 {
@@ -35,7 +35,8 @@ static void refresh_once()
     PyCore::Phase ph = PyCore::detect_phase(reason);
     g_phase = (int)ph;
     static const char *NAME[] = {"未知", "大厅", "准备", "局内"};
-    snprintf(g_status, sizeof(g_status), "%s (%s)", NAME[(int)ph & 3], reason);
+    static const char *NAME_EN[] = {"unknown", "lobby", "prep", "in match"};
+    snprintf(g_status, sizeof(g_status), "%s (%s)", (g_english ? NAME_EN : NAME)[(int)ph & 3], reason);
 }
 
 static const int REFRESH_INTERVAL_MS = 500;
@@ -52,7 +53,7 @@ static void start(uintptr_t libbase)
 {
     if (g_libbase != 0) return;
     g_libbase = libbase;
-    snprintf(g_status, sizeof(g_status), "启动中");
+    snprintf(g_status, sizeof(g_status), "%s", T("启动中", "starting"));
     std::thread(thread_main).detach();
     printf("[阶段] 已启动 libbase=0x%lx\n", (unsigned long)libbase);
     fflush(stdout);
@@ -63,6 +64,6 @@ static inline PyCore::Phase phase()       { return (PyCore::Phase)g_phase.load()
 static inline bool          in_battle()   { return g_phase.load() == PyCore::PHASE_BATTLE; }
 static inline bool          in_prepare()  { return g_phase.load() == PyCore::PHASE_PREPARE; }
 static inline bool          in_lobby()    { return g_phase.load() == PyCore::PHASE_LOBBY; }
-static inline const char   *status_text() { return g_status; }
+static inline const char   *status_text() { return g_status[0] ? g_status : T("未启动", "not started"); }
 
 } // namespace PyScene

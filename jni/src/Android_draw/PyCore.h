@@ -283,14 +283,14 @@ inline uint64_t get_type_list(uint64_t ubt, int type)
 inline uint64_t game_kernel_dict(const char *&why)
 {
     uint64_t sm = getPtr64(PyRoot::g_modules_slot);
-    if (!is_obj(sm))                          { why = "sys.modules 取不到"; return 0; }
-    if (getPtr64(sm + 8) != PyRoot::g_dict_type) { why = "sys.modules 不是dict(偏移已失效)"; return 0; }
+    if (!is_obj(sm))                          { why = T("sys.modules 取不到", "sys.modules unreadable"); return 0; }
+    if (getPtr64(sm + 8) != PyRoot::g_dict_type) { why = T("sys.modules 不是dict(偏移已失效)", "sys.modules is not a dict (offset stale)"); return 0; }
     int64_t i = find_key(sm, "game_kernel", -1);
-    if (i < 0)                                { why = "找不到 game_kernel 模块"; return 0; }
+    if (i < 0)                                { why = T("找不到 game_kernel 模块", "game_kernel module not found"); return 0; }
     uint64_t mod = get_attr(sm, i);
-    if (!is_obj(mod))                         { why = "game_kernel 模块对象无效"; return 0; }
+    if (!is_obj(mod))                         { why = T("game_kernel 模块对象无效", "game_kernel module object invalid"); return 0; }
     uint64_t md = getPtr64(mod + 0x10);
-    if (!is_obj(md))                          { why = "md_dict 无效"; return 0; }
+    if (!is_obj(md))                          { why = T("md_dict 无效", "md_dict invalid"); return 0; }
     return md;
 }
 
@@ -321,18 +321,18 @@ inline Phase detect_phase(const char *&reason)
     if (!md) { reason = why; return PHASE_UNKNOWN; }
 
     int64_t iu = find_key(md, "g_ui_mgr", hint_uimgr);
-    if (iu < 0) { reason = "没有 g_ui_mgr"; return PHASE_UNKNOWN; }
+    if (iu < 0) { reason = T("没有 g_ui_mgr", "no g_ui_mgr"); return PHASE_UNKNOWN; }
     hint_uimgr = iu;
     uint64_t ud = get_inst_dict(get_attr(md, iu));
-    if (!ud) { reason = "g_ui_mgr 实例 dict 无效"; return PHASE_UNKNOWN; }
+    if (!ud) { reason = T("g_ui_mgr 实例 dict 无效", "g_ui_mgr instance dict invalid"); return PHASE_UNKNOWN; }
 
     int64_t id = find_key(ud, "ui_dict", hint_uidict);
-    if (id < 0) { reason = "没有 ui_dict"; return PHASE_UNKNOWN; }
+    if (id < 0) { reason = T("没有 ui_dict", "no ui_dict"); return PHASE_UNKNOWN; }
     hint_uidict = id;
     uint64_t uidict = get_attr(ud, id);
 
     Dict k;
-    if (!read_dict(uidict, k)) { reason = "ui_dict 读取失败"; return PHASE_UNKNOWN; }
+    if (!read_dict(uidict, k)) { reason = T("ui_dict 读取失败", "ui_dict read failed"); return PHASE_UNKNOWN; }
     bool has_room = false, has_hall = false;
     for (int64_t i = 0; i < k.n_entries; i++) {
         uint64_t kp = getPtr64(key_slot(k, i));
@@ -343,8 +343,50 @@ inline Phase detect_phase(const char *&reason)
     }
     if (has_room) { reason = "UIRoomWait"; return PHASE_PREPARE; }
     if (has_hall) { reason = "UIHall"; return PHASE_LOBBY; }
-    reason = "无已知 UI key";
+    reason = T("无已知 UI key", "no known UI key");
     return PHASE_UNKNOWN;
+}
+
+// ---- 主交互按钮：游戏自己算的"现在这个按钮会做什么、对谁做"(2026-10-23 静态分析，未上机) ----
+// UIBattleButton 是 UIBattleBase 的父类(混入)，所以属性直接挂在 ui_dict['UIBattle'] 实例上：
+//   cbtn_alpha_st  CIV_HAND_ALPHA_STATE。2026-10-23 国际服上机日志实测：**3 = PUT_PANEL(放板)、4 = SPAN_PANEL(翻板，放下后立刻变 4)、
+//                  10 = 空闲**。其余(SP_FLAG 1 / CREEP 2 / SPAN 5 / CAVE 6 / SAVE_TGT 7 …)是按 consts/const 定义顺序推的，未实测
+//   cbtn_tgt_uid   目标单位 uid(放板时 = 板子的 uid)
+// 依据：ui/UIBattlePart/UIBattleButton.tick_btn_alpha 每帧写这两个属性；core/key_handlers/pc_hotkey 按键时直接读它们。
+// 是否能放板由 BattlePlayerUnit.find_putdown_panel_uid 决定(三维距离 ≤ wood_put_dis 25 + 加成、板立着、无遮挡、单向板朝向…)，
+// 读这个结果就不用自己复刻那一串条件。线程：自动盖板线程独占调用(thread_local 缓存)。
+struct InterButton {
+    int64_t alpha_st = -1;      // -1 = 没读到
+    int64_t tgt_uid  = -1;      // -1 = 没读到 / 不是 int(None 等)
+};
+inline bool read_inter_button(InterButton &out, const char *&why)
+{
+    static thread_local int64_t h_uimgr = -1, h_uidict = -1, h_battle = -1, h_st = -1, h_uid = -1;
+    out = InterButton();
+    uint64_t md = game_kernel_dict(why);
+    if (!md) return false;
+    int64_t iu = find_key(md, "g_ui_mgr", h_uimgr);
+    if (iu < 0) { why = T("没有 g_ui_mgr", "no g_ui_mgr"); return false; }
+    h_uimgr = iu;
+    uint64_t ud = get_inst_dict(get_attr(md, iu));
+    if (!ud) { why = T("g_ui_mgr 实例 dict 无效", "g_ui_mgr instance dict invalid"); return false; }
+    int64_t id = find_key(ud, "ui_dict", h_uidict);
+    if (id < 0) { why = T("没有 ui_dict", "no ui_dict"); return false; }
+    h_uidict = id;
+    uint64_t uidict = get_attr(ud, id);
+    int64_t ib = find_key(uidict, "UIBattle", h_battle);
+    if (ib < 0) { why = T("没有 UIBattle(不在局内)", "no UIBattle (not in match)"); return false; }
+    h_battle = ib;
+    uint64_t bd = get_inst_dict(get_attr(uidict, ib));
+    if (!bd) { why = T("UIBattle 实例 dict 无效", "UIBattle instance dict invalid"); return false; }
+    int64_t is = find_key(bd, "cbtn_alpha_st", h_st);
+    if (is < 0) { why = T("UIBattle 上没有 cbtn_alpha_st", "no cbtn_alpha_st on UIBattle"); return false; }
+    h_st = is;
+    if (!read_int(get_attr(bd, is), out.alpha_st)) { out.alpha_st = -1; why = T("cbtn_alpha_st 不是 int", "cbtn_alpha_st is not int"); return false; }
+    int64_t it = find_key(bd, "cbtn_tgt_uid", h_uid);
+    if (it >= 0) { h_uid = it; if (!read_int(get_attr(bd, it), out.tgt_uid)) out.tgt_uid = -1; }
+    why = "";
+    return true;
 }
 
 } // namespace PyCore

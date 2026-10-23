@@ -172,6 +172,7 @@ static bool voice = true;
 static bool inform_ghost = true; // 显示鬼魂
 static bool show_sohook = false;  // 骨骼与进度覆盖层
 static bool show_genius_tree = false;  // 监管天赋树(径向图，独立可拖动窗口)
+static float panel_alpha = 0.94f;      // 菜单/天赋树窗口背景不透明度(同金铲铲 ui.alpha)。0.94 = ImGui 默认 WindowBg
 
 // ===== 固定信息：屏幕坐标 HUD 汇总，不依赖矩阵。每块独立开关 + 独立 X/Y/大小(size=文字像素高) =====
 //   调试阶段用菜单里的滑动条摆位置/大小，调好后把下面的初值固化即可。
@@ -182,6 +183,109 @@ static bool  fi_hunter_on = true;                                        // 监�
 static float fi_hunter_x  = 0.0f,    fi_hunter_y = 173.0f, fi_hunter_size = 30.0f;
 static bool  fi_civ_on    = true;                                        // 求生者天赋(右上横排，只在我是监管时显示)
 static float fi_civ_x     = 1894.0f, fi_civ_y    = 328.0f, fi_civ_size    = 28.0f, fi_civ_gap = 80.0f;
+
+// ===== 配置保存/读取：/data/IdentityV_config.txt，一行一个 key=value(# 开头是注释，可手改) =====
+// 读取时未知键忽略、缺的键保持当前值，所以加了新选项旧文件照样能读。
+// 窗口位置/大小：每帧记下当前值用于保存；读取后下一帧用 SetNextWindowPos/Size 套上。
+#include <cerrno>
+#include <cstring>
+static const char *CONFIG_PATH = "/data/IdentityV_config.txt";
+static float cfg_main_x = -1.f, cfg_main_y = -1.f;                          // 主菜单位置
+static float cfg_tree_x = -1.f, cfg_tree_y = -1.f, cfg_tree_w = -1.f, cfg_tree_h = -1.f;   // 天赋树窗口
+static bool  cfg_apply_main = false, cfg_apply_tree = false;               // 读取后待套用
+static char  cfg_msg[160] = "";
+static double cfg_msg_time = -100.0;
+
+enum CfgType { CFG_BOOL, CFG_INT, CFG_FLOAT };
+struct CfgItem { const char *key; CfgType type; void *ptr; };
+static const CfgItem CFG_ITEMS[] = {
+    {"english", CFG_BOOL, &g_english},                {"panel_alpha", CFG_FLOAT, &panel_alpha},
+    // 绘制设置
+    {"show_rect", CFG_BOOL, &show_draw_Rect},          {"show_bones", CFG_BOOL, &show_draw_Bones},
+    {"show_line", CFG_BOOL, &show_draw_Line},          {"show_camera", CFG_BOOL, &show_draw_Camera},
+    {"show_door", CFG_BOOL, &show_draw_Door},          {"show_box", CFG_BOOL, &show_draw_Box},
+    {"show_name", CFG_BOOL, &show_draw_Name},          {"show_distance", CFG_BOOL, &show_draw_Distance},
+    {"show_cellar", CFG_BOOL, &show_draw_Cellar},      {"show_chair", CFG_BOOL, &show_draw_Chair},
+    {"show_prop", CFG_BOOL, &show_draw_Prop},          {"show_genius", CFG_BOOL, &show_draw_Genius},
+    {"show_prophet", CFG_BOOL, &show_draw_prophet},    {"redqueen_mode", CFG_BOOL, &redqueenmod},
+    {"show_cipher", CFG_BOOL, &show_draw_secret_mechine}, {"show_role", CFG_BOOL, &show_draw_Role},
+    {"debug", CFG_BOOL, &Debugging},                   {"show_ghost", CFG_BOOL, &inform_ghost},
+    {"show_genius_tree", CFG_BOOL, &show_genius_tree},
+    // 娱乐模式
+    {"copycat_mode", CFG_BOOL, &copycat_mode},         {"waterfight_mode", CFG_BOOL, &waterfight_mode},
+    // 固定信息
+    {"fi_gen_on", CFG_BOOL, &fi_gen_on},     {"fi_gen_x", CFG_FLOAT, &fi_gen_x},     {"fi_gen_y", CFG_FLOAT, &fi_gen_y},     {"fi_gen_size", CFG_FLOAT, &fi_gen_size},
+    {"fi_hunter_on", CFG_BOOL, &fi_hunter_on}, {"fi_hunter_x", CFG_FLOAT, &fi_hunter_x}, {"fi_hunter_y", CFG_FLOAT, &fi_hunter_y}, {"fi_hunter_size", CFG_FLOAT, &fi_hunter_size},
+    {"fi_civ_on", CFG_BOOL, &fi_civ_on},     {"fi_civ_x", CFG_FLOAT, &fi_civ_x},     {"fi_civ_y", CFG_FLOAT, &fi_civ_y},     {"fi_civ_size", CFG_FLOAT, &fi_civ_size},
+    {"fi_civ_gap", CFG_FLOAT, &fi_civ_gap},
+    // 自动盖板
+    {"pallet_enabled", CFG_BOOL, &AutoPallet::enabled},           {"pallet_show_range", CFG_BOOL, &AutoPallet::show_range},
+    {"pallet_show_touch", CFG_BOOL, &AutoPallet::show_touch_point}, {"pallet_touch_x", CFG_FLOAT, &AutoPallet::touch_x},
+    {"pallet_touch_y", CFG_FLOAT, &AutoPallet::touch_y},          {"pallet_hold_ms", CFG_INT, &AutoPallet::hold_ms},
+    {"pallet_jitter_px", CFG_INT, &AutoPallet::jitter_px},        {"pallet_jitter_ms", CFG_INT, &AutoPallet::jitter_ms},
+    {"pallet_predict", CFG_BOOL, &AutoPallet::predict_fast},      {"pallet_predict_mps", CFG_FLOAT, &AutoPallet::fast_mps},
+    {"pallet_lead_ms", CFG_INT, &AutoPallet::lead_ms},
+    {"pallet_width", CFG_FLOAT, &AutoPallet::width},              {"pallet_random", CFG_BOOL, &AutoPallet::random_width},
+    {"pallet_width_lo", CFG_FLOAT, &AutoPallet::width_lo},        {"pallet_width_hi", CFG_FLOAT, &AutoPallet::width_hi},    // 窗口
+    {"win_main_x", CFG_FLOAT, &cfg_main_x}, {"win_main_y", CFG_FLOAT, &cfg_main_y},
+    {"win_tree_x", CFG_FLOAT, &cfg_tree_x}, {"win_tree_y", CFG_FLOAT, &cfg_tree_y},
+    {"win_tree_w", CFG_FLOAT, &cfg_tree_w}, {"win_tree_h", CFG_FLOAT, &cfg_tree_h},
+};
+
+static void cfg_set_msg(const char *s) { snprintf(cfg_msg, sizeof(cfg_msg), "%s", s); cfg_msg_time = ImGui::GetTime(); }
+
+static void config_save()
+{
+    FILE *f = fopen(CONFIG_PATH, "w");
+    char m[160];
+    if (!f) { snprintf(m, sizeof(m), T("保存失败: %s", "Save failed: %s"), strerror(errno)); cfg_set_msg(m); return; }
+    fprintf(f, "# IdentityV overlay config. key=value, one per line. Unknown keys are ignored.\n");
+    for (const CfgItem &it : CFG_ITEMS) {
+        switch (it.type) {
+            case CFG_BOOL:  fprintf(f, "%s=%d\n", it.key, *(bool *)it.ptr ? 1 : 0); break;
+            case CFG_INT:   fprintf(f, "%s=%d\n", it.key, *(int *)it.ptr); break;
+            case CFG_FLOAT: fprintf(f, "%s=%.3f\n", it.key, *(float *)it.ptr); break;
+        }
+    }
+    bool ok = fflush(f) == 0;
+    ok = (fclose(f) == 0) && ok;
+    if (ok) snprintf(m, sizeof(m), T("已保存 %d 项 → %s", "Saved %d items -> %s"), (int)(sizeof(CFG_ITEMS) / sizeof(CFG_ITEMS[0])), CONFIG_PATH);
+    else    snprintf(m, sizeof(m), T("保存失败: %s", "Save failed: %s"), strerror(errno));
+    cfg_set_msg(m);
+}
+
+static void config_load()
+{
+    FILE *f = fopen(CONFIG_PATH, "r");
+    char m[160];
+    if (!f) { snprintf(m, sizeof(m), T("读取失败: %s", "Load failed: %s"), strerror(errno)); cfg_set_msg(m); return; }
+    char line[256];
+    int n = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (line[0] == '#') continue;
+        char *eq = strchr(line, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        const char *val = eq + 1;
+        for (const CfgItem &it : CFG_ITEMS) {
+            if (strcmp(it.key, line) != 0) continue;
+            switch (it.type) {
+                case CFG_BOOL:  *(bool *)it.ptr = atoi(val) != 0; break;
+                case CFG_INT:   *(int *)it.ptr = atoi(val); break;
+                case CFG_FLOAT: *(float *)it.ptr = (float)atof(val); break;
+            }
+            n++;
+            break;
+        }
+    }
+    fclose(f);
+    if (panel_alpha < 0.10f) panel_alpha = 0.10f;
+    if (panel_alpha > 1.0f)  panel_alpha = 1.0f;
+    cfg_apply_main = cfg_main_x >= 0.f && cfg_main_y >= 0.f;
+    cfg_apply_tree = cfg_tree_w > 0.f && cfg_tree_h > 0.f;
+    snprintf(m, sizeof(m), T("已读取 %d 项 ← %s", "Loaded %d items <- %s"), n, CONFIG_PATH);
+    cfg_set_msg(m);
+}
 
 float z_x, z_y, z_z, d_x, d_y, d_z, camera, r_x, r_y, r_w;
 float X1,Y1,X2,Y2,W,H,MIDDLE,TOP,BOTTOM;
@@ -205,6 +309,25 @@ static const char *const BUTCHER_GENIUS_NAME[41] = {
     "惯性","摧枯拉朽","嘲弄","临界点","狂欢","巨钳","拘禁狂","挽留",
     "狩鹿","掌控欲","耐受力","表现欲","后遗症","清道夫","追猎","张狂",
     "嬉弄","幽闭恐惧","冲动","成瘾症","余威","饥荒","惊弓之鸟","念旧癖"
+};
+// 英文全名：国际服热更后的 TID_BUTCHER_NAME_*_LV1(离线解包，中文逐条唯一对上，见解包存档 SKILL §7.8)。
+// ⚠ apk 原包里 id 20/37/39 是旧天赋(猫鼠游戏/警觉/无人生还)，必须用 Documents/res 热更那份
+[[maybe_unused]] static const char *const BUTCHER_GENIUS_NAME_EN[41] = {   // 目前只用缩写；要显示全名时用它
+    "",
+    "Deteriorate","Obsession","Wither","Panic","Destructiveness","Berserker","Rage","Confined Space",
+    "Constrain","Desperate Fight","Hunter's Instinct","Announcement","Hospitable","Impact","Wanted Order","Trump Card",
+    "Inertia","Overwhelm","Mock","Tipping Point","Carnival","Giant Claw","Sadist","Detention",
+    "Deer Hunt","Control Freak","Tolerance","Exhibitionist","After Effects","Street Sweeper","Hunt","Insolence",
+    "Mischievous","Claustrophobia","Impulsive","Addiction","Lingering Might","Famine","Skittish","Nostalgic"
+};
+// 天赋树节点圆圈里放不下全名：中文取前 2 字，英文用这张缩写表(两两不重复)
+static const char *const BUTCHER_GENIUS_ABBR_EN[41] = {
+    "",
+    "Detr","Obs","Wthr","Pnc","Dstr","Bsk","Rage","CS",
+    "Cstr","DF","HI","Ann","Hosp","Imp","WO","TC",
+    "Inrt","Ovw","Mock","TP","Carn","GC","Sad","Det",
+    "DH","CF","Tol","Exh","AE","SS","Hunt","Ins",
+    "Msch","Clau","Impl","Add","LM","Fam","Skt","Nost"
 };
 static const unsigned char BUTCHER_GENIUS_MAXLV[41] = {
     0,
@@ -306,7 +429,9 @@ ModuleBssInfo get_module_bssgjf(int pid, const char *module_name) {
     if (fp!= NULL) {
         while (fgets(line, sizeof(line), fp)) {
         sscanf(line, "%lx-%lx", &addr, &taddr);
-            if (strstr(line, module_name) &&strstr(line, "r-xp")!= NULL &&(taddr-addr)== 114982912) {
+            // 国际服引擎 r-xp 大小不是国服的 114982912(实测 161984512,且会随版本变),
+            // 改按包名 com.netease.idv + 巨型段(>80MB)锁定引擎,随后取其后的 [anon:.bss] 段。
+            if (strstr(line, "com.netease.idv") && strstr(line, "r-xp") != NULL && (taddr-addr) > 0x5000000) {
                 is = true;
             }
             if (is) {
@@ -329,6 +454,30 @@ ModuleBssInfo get_module_bssgjf(int pid, const char *module_name) {
     }
     return info;
 }
+// 本地化 Text 助手：ImGui::Text/TextColored 带 printf format 属性，直接喂非字面量格式串会触发
+// -Wformat-security。这里先按 g_english 选中/英格式串,vsnprintf 到缓冲,再以字面量 "%s" 输出。
+#include <cstdarg>
+static void ImTextT(const char* cn, const char* en, ...) {
+    char buf[256];
+    va_list ap; va_start(ap, en);
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wformat-nonliteral"
+    vsnprintf(buf, sizeof(buf), g_english ? en : cn, ap);
+#pragma clang diagnostic pop
+    va_end(ap);
+    ImGui::TextUnformatted(buf);
+}
+static void ImTextColoredT(const ImVec4& col, const char* cn, const char* en, ...) {
+    char buf[256];
+    va_list ap; va_start(ap, en);
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wformat-nonliteral"
+    vsnprintf(buf, sizeof(buf), g_english ? en : cn, ap);
+#pragma clang diagnostic pop
+    va_end(ap);
+    ImGui::TextColored(col, "%s", buf);
+}
+
 int get_name_pid1(const char *packageName) {
     int id = -1;
     DIR *dir;
@@ -490,7 +639,11 @@ void read_thread(long int PD1,long int PD2,long int PD3)
             long a, t;
             if (sscanf(line, "%lx-%lx", &a, &t) != 2) continue;
             if (libbase == 0 && strstr(line, "r-xp")){
-                if (is_official && strstr(line, "."))    libbase = a;
+                // 国际服(Google Play)引擎打包在 split_config.arm64_v8a.apk 里直接 mmap,
+                // 没有独立 libclient.so。按包名 com.netease.idv + 巨型段(>80MB)锁定引擎 r-xp,
+                // 避开 webview(157MB,路径是 com.google.android.webview)和 split 里的小 so。
+                // 该 r-xp 段起点就是 ELF 头(首个 LOAD 为 R E vaddr0,与国服同),libbase 直接取段起点。
+                if (is_official && strstr(line, "com.netease.idv") && (t - a) > 0x5000000) libbase = a;
                 if (!is_official && strstr(line, libso)) libbase = a;
             }
         }
@@ -882,9 +1035,9 @@ static void DrawGeniusTree(ImDrawList *dl, ImVec2 center, float scale, const PyG
         ImU32 ring = term ? IM_COL32(255,240,120,255) : IM_COL32(255,230,170,255);
         dl->AddCircleFilled(p, rad, fill, 24);
         dl->AddCircle(p, rad, ring, 24, term ? scale*0.05f+2.0f : 2.0f);
-        // 名称前 2 字(全中文，每字 3 字节 → 取前 6 字节不切断)，亮底黑字
+        // 名称前 2 字(全中文，每字 3 字节 → 取前 6 字节不切断)/英文缩写，亮底黑字
         char head[7] = {0};
-        const char *nm = BUTCHER_GENIUS_NAME[id];
+        const char *nm = g_english ? BUTCHER_GENIUS_ABBR_EN[id] : BUTCHER_GENIUS_NAME[id];
         int blen = 0; while (nm[blen] && blen < 6) blen++;
         memcpy(head, nm, blen);
         ImVec2 ts = font->CalcTextSizeA(name_sz, 99999.0f, 0.0f, head);
@@ -933,10 +1086,10 @@ static ImColor copycat_color(int identity)
 static void copycat_label(int identity, int seat, char *out, size_t cap)
 {
     const char *nm = PySelf::copycat_identity_name(identity);
-    int len = seat > 0 ? snprintf(out, cap, "%d号 ", seat) : 0;
+    int len = seat > 0 ? snprintf(out, cap, g_english ? "#%d " : "%d号 ", seat) : 0;
     if (len < 0 || (size_t)len >= cap) len = 0;
     if (nm) snprintf(out + len, cap - len, "%s", nm);
-    else if (identity) snprintf(out + len, cap - len, "身份%d", identity);
+    else if (identity) snprintf(out + len, cap - len, g_english ? "id%d" : "身份%d", identity);
     else snprintf(out + len, cap - len, "?");
 }
 
@@ -959,7 +1112,9 @@ static ImColor waterfight_color(int team)
 static const char *waterfight_name(int identity)
 {
     static const char *N[11] = {"?","马鹿","野猫","狐狸","獾","雪兔","金雕","松鼠","草蛇","蝙蝠","野猪"};
-    return (identity >= 1 && identity <= 10) ? N[identity] : "?";
+    // 英文：国际服文本里只查到 Fox/Squirrel/Bat/Wild Boar，其余按常用英文名
+    static const char *E[11] = {"?","Red Deer","Wildcat","Fox","Badger","Snow Hare","Golden Eagle","Squirrel","Grass Snake","Bat","Wild Boar"};
+    return (identity >= 1 && identity <= 10) ? (g_english ? E[identity] : N[identity]) : "?";
 }
 
 void Draw_Main(ImDrawList *Draw){
@@ -1125,7 +1280,7 @@ void Draw_Main(ImDrawList *Draw){
             ImGui::GetForegroundDrawList()->AddRect({bx1, by1}, {bx1 + bw, by1 + bh}, c, 3, 0, 1.8f);
             if (has_self) {                                             // 下：距离
                 char dt[24];
-                snprintf(dt, sizeof(dt), "%d 米", (int)d);
+                snprintf(dt, sizeof(dt), T("%d 米", "%d m"), (int)d);
                 auto ds = ImGui::CalcTextSize(dt, 0, 25);
                 Draw->AddText({bx1 + bw/2 - ds.x/2, by1 + bh + 10}, ImColor(255,200,0,255), dt);
             }
@@ -1164,7 +1319,7 @@ void Draw_Main(ImDrawList *Draw){
     if (show_draw_prophet && !PySelf::copycat_active()){
         if (PyScene::in_lobby()){
             // 大厅：不报上一局残留的监管名，改显示运行状态(绿字)
-            const char *ok = "当前运行正常";
+            const char *ok = T("当前运行正常", "Running normally");
             auto ts = ImGui::CalcTextSize(ok, 0, 25);
             Draw->AddText({px-(ts.x/2),130}, color_green, ok);
         } else {
@@ -1189,8 +1344,8 @@ void Draw_Main(ImDrawList *Draw){
             PyGenius::GeniusLine seg;
             PyGenius::genius_segments(tmp, seg);
             // GeniusLine 是 前/飞轮/后 三段(飞轮单独一段，局内要单独上色)，三段都要拼，漏了中间那段飞轮就没了
-            int w = seat ? snprintf(line + len, sizeof(line) - len, "%s%d号[%s%s%s]", len ? "  " : "", seat, seg.pre, seg.flywheel, seg.post)
-                         : snprintf(line + len, sizeof(line) - len, "%s?号[%s%s%s]", len ? "  " : "", seg.pre, seg.flywheel, seg.post);
+            int w = seat ? snprintf(line + len, sizeof(line) - len, T("%s%d号[%s%s%s]", "%s#%d[%s%s%s]"), len ? "  " : "", seat, seg.pre, seg.flywheel, seg.post)
+                         : snprintf(line + len, sizeof(line) - len, T("%s?号[%s%s%s]", "%s#?[%s%s%s]"), len ? "  " : "", seg.pre, seg.flywheel, seg.post);
             if (w < 0) break;
             len += w;
             if (len >= (int)sizeof(line)) { len = (int)sizeof(line) - 1; break; }   // 截断了，别让下一轮越界
@@ -1209,7 +1364,7 @@ void Draw_Main(ImDrawList *Draw){
             Draw->AddCircle(tp, (float)AutoPallet::jitter_px, ImColor(255, 255, 0, 255), 24, 2.0f);
         Draw->AddLine({tp.x - 12, tp.y}, {tp.x + 12, tp.y}, ImColor(0, 255, 255, 255), 2.0f);
         Draw->AddLine({tp.x, tp.y - 12}, {tp.x, tp.y + 12}, ImColor(0, 255, 255, 255), 2.0f);
-        Draw->AddText({tp.x + 46, tp.y - 12}, ImColor(0, 255, 255, 255), "盖板触摸点");
+        Draw->AddText({tp.x + 46, tp.y - 12}, ImColor(0, 255, 255, 255), T("盖板触摸点", "Pallet tap point"));
     }
 
     // ===== 固定信息(屏幕坐标 HUD 汇总，增量叠加，不改上面任何现有逻辑) =====
@@ -1243,7 +1398,7 @@ void Draw_Main(ImDrawList *Draw){
                 float fill = bar_w * (d.progress / 100.0f);
                 if (fill > 0.f) Draw->AddRectFilled({x, y}, {x + fill, y + bar_h}, c);
                 Draw->AddRect({x, y}, {x + bar_w, y + bar_h}, ImColor(255,255,255,255));
-                char lbl[24]; snprintf(lbl, sizeof(lbl), "门 %.0f%%", d.progress);
+                char lbl[24]; snprintf(lbl, sizeof(lbl), T("门 %.0f%%", "Gate %.0f%%"), d.progress);
                 fi_text(Draw, x + bar_w + gap, y + (bar_h - sz)/2.0f, sz, c, lbl);
                 y += line_h;
             }
@@ -1440,7 +1595,7 @@ void Draw_Main(ImDrawList *Draw){
                 ImGui::GetForegroundDrawList()->AddRect({bx1, by1}, {bx1 + bw, by1 + bh}, c, 3, 0, 1.8f);
             if (show_draw_Distance) {
                 char dt[24];
-                snprintf(dt, sizeof(dt), "%d 米", (int)d);
+                snprintf(dt, sizeof(dt), T("%d 米", "%d m"), (int)d);
                 auto ds = ImGui::CalcTextSize(dt, 0, 25);
                 Draw->AddText({bx1 + bw/2 - ds.x/2, by1 + bh + 10}, ImColor(255,200,0,255), dt);
             }
@@ -1472,7 +1627,7 @@ void Draw_Main(ImDrawList *Draw){
                 ImGui::GetForegroundDrawList()->AddRect({bx1, by1}, {bx1 + bw, by1 + bh}, c, 3, 0, 1.8f);
             if (show_draw_Distance) {
                 char dt[24];
-                snprintf(dt, sizeof(dt), "%d 米", (int)d);
+                snprintf(dt, sizeof(dt), T("%d 米", "%d m"), (int)d);
                 auto ds = ImGui::CalcTextSize(dt, 0, 25);
                 Draw->AddText({bx1 + bw/2 - ds.x/2, by1 + bh + 10}, ImColor(255,200,0,255), dt);
             }
@@ -1633,15 +1788,15 @@ void Draw_Main(ImDrawList *Draw){
                 std::string test;
                 sprintf(objtext, "%lx", data[i].obj);
                 test += " [";
-                test += std::to_string((int) dist);    
-                test += " 米]  0x";
-                test += objtext;    
-                test += " [类名] ";
+                test += std::to_string((int) dist);
+                test += T(" 米]  0x", " m]  0x");
+                test += objtext;
+                test += T(" [类名] ", " [class] ");
                 test += data[i].class_name;
                 auto textSize = ImGui::CalcTextSize(test.c_str(), 0, 25);
                 Draw->AddText({r_x-(textSize.x/2),r_y}, ImColor(255,200,0,255), test.c_str());
             }
-        
+
             if (strstr(data[i].class_name, "camera") != NULL && dist < 38){
                 // 约瑟夫的相机每局都会默认加载十几个，跟这局有没有约瑟夫无关。
                 // 实测那些默认加载的 +0x240 全是 0（7/7），本局真实存在的物件是 2。
@@ -1651,7 +1806,7 @@ void Draw_Main(ImDrawList *Draw){
 		        }
                 std::string s;
 			    if (show_draw_Camera){                          
-                    s += "[摄影机]";
+                    s += T("[摄影机]", "[Camera]");
                 }
                 auto textSize = ImGui::CalcTextSize(s.c_str(), 0, 25);
                 Draw->AddText({r_x-(textSize.x/2),r_y}, ImColor(255,200,0,255), s.c_str());
@@ -1664,7 +1819,7 @@ void Draw_Main(ImDrawList *Draw){
     		    if (strstr(data[i].class_name, "dm65_scene_prop_30") != NULL){
     			    std::string s;
     		        if (show_draw_Door){
-                        s += "[大门]";
+                        s += T("[大门]", "[Exit Gate]");
                     }
                     auto textSize = ImGui::CalcTextSize(s.c_str(), 0, 25);
                     Draw->AddText({r_x-(textSize.x/2),r_y}, ImColor(255,200,0,255), s.c_str());
@@ -1676,7 +1831,7 @@ void Draw_Main(ImDrawList *Draw){
     		            if (getDword(data[i].obj + 0x148)==0){
     		                continue;//跳过使用过的箱子
     		            }
-                        s += "[道具箱]";
+                        s += T("[道具箱]", "[Chest]");
                     }    
                     auto textSize = ImGui::CalcTextSize(s.c_str(), 0, 25);
                     Draw->AddText({r_x-(textSize.x/2),r_y}, color_red, s.c_str());
@@ -1688,7 +1843,7 @@ void Draw_Main(ImDrawList *Draw){
     		            if (getDword(data[i].obj + 0xa8)==256){
     		                continue;//跳过使用过的椅子
     		            }
-                        s += "[狂欢之椅]";
+                        s += T("[狂欢之椅]", "[Rocket Chair]");
                     }
                     auto textSize = ImGui::CalcTextSize(s.c_str(), 0, 25);
                     Draw->AddText({r_x-(textSize.x/2),r_y}, color_red, s.c_str());
@@ -1697,9 +1852,9 @@ void Draw_Main(ImDrawList *Draw){
     		    else if (strstr(data[i].class_name, "dm65_scene_prop_76") != NULL){
     			    std::string s;
     		        if (show_draw_Cellar){                                                  
-                            s += "[地窖] ";
-                            s += std::to_string((int) dist);    
-                            s += " 米 ";
+                            s += T("[地窖] ", "[Dungeon] ");
+                            s += std::to_string((int) dist);
+                            s += T(" 米 ", " m ");
                     }
                     auto textSize = ImGui::CalcTextSize(s.c_str(), 0, 25);
                     Draw->AddText({r_x-(textSize.x/2),r_y}, color_purple, s.c_str());
@@ -1716,10 +1871,10 @@ void Draw_Main(ImDrawList *Draw){
     	            if (!(has_progress && PyProgress::is_decoded(progress))){      // 破译完的机器本身和进度都不画
     	                std::ostringstream oss;
     	                oss << std::fixed << std::setprecision(1) << dist;
-    	                std::string dist_text = " " + oss.str() + " 米";
+    	                std::string dist_text = " " + oss.str() + T(" 米", " m");
     	                char head[24];
     	                if (has_progress) snprintf(head, sizeof(head), "[%.1f%%]", progress);
-    	                else        snprintf(head, sizeof(head), "[密码机]");
+    	                else        snprintf(head, sizeof(head), "%s", T("[密码机]", "[Cipher]"));
 
     	                // 两段分开上色：头用进度色，距离沿用原来 61~63 米变绿的规则
     	                auto hs = ImGui::CalcTextSize(head, 0, 25);
@@ -1757,8 +1912,9 @@ void Draw_Main(ImDrawList *Draw){
                     const char* propName = getprop(data[i].class_name);
                     if (propName) {
                         std::string s = propName;
+                        if (g_english) s += " ";      // 中文名后直接接数字，英文要隔开
                         s += std::to_string((int) dist);
-                        s += " 米";
+                        s += T(" 米", " m");
                         auto textSize = ImGui::CalcTextSize(s.c_str(), 0, 25);
                         Draw->AddText({r_x-(textSize.x/2),r_y}, ImColor(255,200,0,255), s.c_str());
                     }
@@ -1770,10 +1926,10 @@ void Draw_Main(ImDrawList *Draw){
                 if (show_draw_Role&&strstr(data[i].class_name, "chr") != NULL){
                     std::string test;
                     test += " [";
-                    test += std::to_string((int) dist);    
-                    test += " 米]  0x";
-                    test += objtext;    
-                    test += " [类名] ";
+                    test += std::to_string((int) dist);
+                    test += T(" 米]  0x", " m]  0x");
+                    test += objtext;
+                    test += T(" [类名] ", " [class] ");
                     test += data[i].class_name;
                     auto textSize = ImGui::CalcTextSize(test.c_str(), 0, 25);
                     Draw->AddText({r_x-(textSize.x/2),r_y}, ImColor(255,200,0,255), test.c_str());
@@ -1823,7 +1979,7 @@ void Draw_Main(ImDrawList *Draw){
                     }
                     // 约瑟夫局：真人名字后缀标它在哪个世界(在镜世界=镜像/否则=现实)；投影(echo)不加后缀
                     if (joseph && !echo)
-                        s += PySelf::body_in_photo_world(data[i].obj) ? " 镜像" : " 现实";
+                        s += PySelf::body_in_photo_world(data[i].obj) ? T(" 镜像", " Mirror") : T(" 现实", " Real");
                     if (echo) name_color = BotBoneColor;   // 镜像投影：名字白
                     auto textSize = ImGui::CalcTextSize(s.c_str(), 0, 25);
                     Draw->AddText({X1 + W/2-(textSize.x/2),Y1-45}, name_color, s.c_str());
@@ -1850,7 +2006,7 @@ void Draw_Main(ImDrawList *Draw){
                     if (show_draw_Distance || echo){   // 镜像投影默认画距离(白框+名字+距离固定集)
                         std::string dist_str;
                         dist_str += std::to_string((int) dist);
-                        dist_str += " 米";
+                        dist_str += T(" 米", " m");
                         auto textSize = ImGui::CalcTextSize(dist_str.c_str(), 0, 25);
                         Draw->AddText({X1 + W/2-(textSize.x/2),next_y}, ImColor(255,200,0,255), dist_str.c_str());
                         next_y += line_h;
@@ -1946,7 +2102,7 @@ void Draw_Main(ImDrawList *Draw){
                     if (show_draw_Distance){
                         std::string mirror_dist_str;
                         mirror_dist_str += std::to_string((int) dist);
-                        mirror_dist_str += " 米";
+                        mirror_dist_str += T(" 米", " m");
                         auto textSize = ImGui::CalcTextSize(mirror_dist_str.c_str(), 0, 25);
                         Draw->AddText({X1 + W/2-(textSize.x/2),Y2+10}, BotBoneColor, mirror_dist_str.c_str());
                     }
@@ -2145,7 +2301,10 @@ void Layout_tick_UI(bool *main_thread_flag) {
     Draw_Main(ImGui::GetForegroundDrawList());
 
     if (show_window) {
+        ImGui::SetNextWindowBgAlpha(panel_alpha);
+        if (cfg_apply_main) { ImGui::SetNextWindowPos({cfg_main_x, cfg_main_y}, ImGuiCond_Always); cfg_apply_main = false; }
         ImGui::Begin("New_Edition", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
+        cfg_main_x = ImGui::GetWindowPos().x; cfg_main_y = ImGui::GetWindowPos().y;   // 保存配置时用
 
         if (::permeate_record_ini) {
             ImGui::SetWindowPos({LastCoordinate.Pos_x, LastCoordinate.Pos_y});
@@ -2156,8 +2315,8 @@ void Layout_tick_UI(bool *main_thread_flag) {
         // 运行状态 + 结束进程放一个带边框的框里，不用展开折叠框就能退出
         ImGui::BeginChild("##status_box", ImVec2(0, 0),
                           ImGuiChildFlags_Border | ImGuiChildFlags_AutoResizeX | ImGuiChildFlags_AutoResizeY);
-        ImGui::Text("渲染模式 : %s, gui版本 : %s", graphics->RenderName, IMGUI_VERSION);
-        ImGui::TextColored(ImVec4(1.0f, 0.0f, 1.0f, 1.0f), "帧率 %.1f FPS", ImGui::GetIO().Framerate);
+        ImTextT("渲染模式 : %s, gui版本 : %s", "Render: %s  gui: %s", graphics->RenderName, IMGUI_VERSION);
+        ImTextColoredT(ImVec4(1.0f, 0.0f, 1.0f, 1.0f), "帧率 %.1f FPS", "%.1f FPS", ImGui::GetIO().Framerate);
 
         // 读 smaps_rollup 要遍历页表，没必要每帧读，1 秒刷新一次
         static MemUsage mem;
@@ -2166,126 +2325,145 @@ void Layout_tick_UI(bool *main_thread_flag) {
             mem = read_memory_usage();
             mem_time = ImGui::GetTime();
         }
-        ImGui::Text("内存占用: %.1f MB", mem.total_kb() / 1024.0f);
+        ImTextT("内存占用: %.1f MB", "Memory: %.1f MB", mem.total_kb() / 1024.0f);
         if (mem.gpu_ok)
-            ImGui::Text("  进程 %.1f + 换出 %.1f + 显存 %.1f + 画面缓冲 %.1f",
-                        mem.pss_kb / 1024.0f, mem.swap_kb / 1024.0f, mem.gpu_kb / 1024.0f, mem.buffer_kb / 1024.0f);
+            ImTextT("  进程 %.1f + 换出 %.1f + 显存 %.1f + 画面缓冲 %.1f",
+                    "  proc %.1f + swap %.1f + vram %.1f + surface %.1f",
+                    mem.pss_kb / 1024.0f, mem.swap_kb / 1024.0f, mem.gpu_kb / 1024.0f, mem.buffer_kb / 1024.0f);
         else
-            ImGui::Text("  进程 %.1f + 换出 %.1f + 画面缓冲 %.1f (显存未计)",
-                        mem.pss_kb / 1024.0f, mem.swap_kb / 1024.0f, mem.buffer_kb / 1024.0f);
+            ImTextT("  进程 %.1f + 换出 %.1f + 画面缓冲 %.1f (显存未计)",
+                    "  proc %.1f + swap %.1f + surface %.1f (vram n/a)",
+                    mem.pss_kb / 1024.0f, mem.swap_kb / 1024.0f, mem.buffer_kb / 1024.0f);
 
-        ImGui::Text("数据状态:");
+        ImTextT("数据状态:", "Data status:");
         if (read_state == 2)
-            ImGui::TextColored(ImVec4(0.0f, 205.0f, 0.0f, 100.0f), "已获取到游戏数据");
+            ImTextColoredT(ImVec4(0.0f, 205.0f, 0.0f, 100.0f), "已获取到游戏数据", "Game data acquired");
         else if (read_state == 1)
-            ImGui::TextColored(ImVec4(255.0f, 0.0f, 0.0f, 100.0f), "正在获取游戏数据");
-        if (ImGui::Button("结束进程"))
+            ImTextColoredT(ImVec4(255.0f, 0.0f, 0.0f, 100.0f), "正在获取游戏数据", "Acquiring game data");
+        if (ImGui::Button(T("结束进程", "Exit")))
             exit(0);
+        // 语言切换：点击在 中文/英文 间切换(g_english 定义在 Name.h)。
+        // 按钮文字显示「点击后会切到的语言」：当前中文时显示 English,当前英文时显示 中文。
+        // pick() 实时读 g_english,缓存存的是映射项指针,所以切换即时生效、无需清缓存。
+        ImGui::SameLine();
+        if (ImGui::Button(g_english ? "中文" : "English"))
+            g_english = !g_english;
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 8);
+        ImGui::SliderFloat(T("透明度###panel_alpha", "Opacity###panel_alpha"), &panel_alpha, 0.10f, 1.0f, "%.2f");
+        if (ImGui::Button(T("保存配置###cfg_save", "Save Config###cfg_save"))) config_save();
+        ImGui::SameLine();
+        if (ImGui::Button(T("读取配置###cfg_load", "Load Config###cfg_load"))) config_load();
+        if (cfg_msg[0] && ImGui::GetTime() - cfg_msg_time < 4.0)   // 结果提示停留 4 秒
+            ImGui::TextColored(strstr(cfg_msg, "失败") || strstr(cfg_msg, "failed") ? ImVec4(1, 0.35f, 0.35f, 1) : ImVec4(0.4f, 1, 0.4f, 1), "%s", cfg_msg);
         ImGui::EndChild();
 
-        if (ImGui::CollapsingHeader("基础信息")) {
-            ImGui::Text("游戏进程:%d", pid);
-            ImGui::Text("模块入口:%lx", libbase);
-            ImGui::Text("游戏包名:%s", extractedString);
-            ImGui::Text("矩阵地址:%lx", Matrix);
-            ImGui::Text("数组地址:%lx", Arrayaddr);
-            ImGui::Text("矩阵偏移:%lx", MatrixOffset);
-            ImGui::Text("模块页数:%d", c);
-            ImGui::Text("数组偏移:%lx", ArrayaddrOffset);
-            ImGui::Text("监管者:%s", prophet_text);
-            ImGui::Text("Py根:%s", PyRoot::status_text());
-            ImGui::Text("密码机进度:%s (已破译%d)", PyProgress::status_text(), PyProgress::decoded_count());
-            ImGui::Text("天赋:%s", PyGenius::status_text());
-            ImGui::Text("阶段:%s", PyScene::status_text());
+        if (ImGui::CollapsingHeader(T("基础信息###base", "Basic Info###base"))) {
+            ImTextT("游戏进程:%d", "PID:%d", pid);
+            ImTextT("模块入口:%lx", "Module base:%lx", libbase);
+            ImTextT("游戏包名:%s", "Package:%s", extractedString);
+            ImTextT("矩阵地址:%lx", "Matrix:%lx", Matrix);
+            ImTextT("数组地址:%lx", "Array:%lx", Arrayaddr);
+            ImTextT("矩阵偏移:%lx", "Matrix off:%lx", MatrixOffset);
+            ImTextT("模块页数:%d", "Pages:%d", c);
+            ImTextT("数组偏移:%lx", "Array off:%lx", ArrayaddrOffset);
+            ImTextT("监管者:%s", "Hunter:%s", prophet_text);
+            ImTextT("Py根:%s", "PyRoot:%s", PyRoot::status_text());
+            ImTextT("密码机进度:%s (已破译%d)", "Ciphers:%s (decoded %d)", PyProgress::status_text(), PyProgress::decoded_count());
+            ImTextT("天赋:%s", "Talents:%s", PyGenius::status_text());
+            ImTextT("阶段:%s", "Phase:%s", PyScene::status_text());
             // 自身锚点：链路一旦失效这里会写明原因，绘制自动退回相机深度启发式
-            ImGui::Text("自身:%s", PySelf::status_text());
-            ImGui::Text("镜世界:%s", PySelf::photo_diag_text());   // 约瑟夫 PhotoUnit 激活状态(_time/_players)
+            ImTextT("自身:%s", "Self:%s", PySelf::status_text());
+            ImTextT("镜世界:%s", "Mirror:%s", PySelf::photo_diag_text());   // 约瑟夫 PhotoUnit 激活状态(_time/_players)
         }
 
         ImGui::SetNextItemOpen(true, ImGuiCond_Once);
-        if (ImGui::CollapsingHeader("绘制设置")) {
-            ImGui::Checkbox("显示鬼魂", &inform_ghost);
+        if (ImGui::CollapsingHeader(T("绘制设置###draw", "Drawing###draw"))) {
+            ImGui::Checkbox(T("显示鬼魂", "Show Ghosts"), &inform_ghost);
             ImGui::SameLine();
             // 预知监管和模仿者模式互斥(模仿者局没有监管)
-            if (ImGui::Checkbox("预知监管", &show_draw_prophet) && show_draw_prophet) { copycat_mode = false; waterfight_mode = false; }
+            if (ImGui::Checkbox(T("预知监管", "Hunter Prophet"), &show_draw_prophet) && show_draw_prophet) { copycat_mode = false; waterfight_mode = false; }
 
-            ImGui::Checkbox("绘制道具", &show_draw_Prop);
+            ImGui::Checkbox(T("绘制道具", "Draw Items"), &show_draw_Prop);
             ImGui::SameLine();
-            ImGui::Checkbox("夫人模式", &redqueenmod);
+            ImGui::Checkbox(T("夫人模式", "Queen Mode"), &redqueenmod);
 
-            ImGui::Checkbox("绘制调试", &Debugging);
+            ImGui::Checkbox(T("绘制调试", "Draw Debug"), &Debugging);
             ImGui::SameLine();
-            ImGui::Checkbox("显示密码机", &show_draw_secret_mechine);   // 局内进度/进度条 跟着它
+            ImGui::Checkbox(T("显示密码机", "Show Ciphers"), &show_draw_secret_mechine);   // 局内进度/进度条 跟着它
 
             // 「显示天赋」「显示大门」已移到「固定信息」折叠框(用户要求)
 
             // 发布版本: 注入功能已停用
             // ImGui::Checkbox("骨骼与进度", &show_sohook);
-            ImGui::Checkbox("显示骨骼", &show_draw_Bones);   // 原生骨骼,抄若辰链驱动读
+            ImGui::Checkbox(T("显示骨骼", "Show Bones"), &show_draw_Bones);   // 原生骨骼,抄若辰链驱动读
             ImGui::SameLine();
-            ImGui::Checkbox("显示方框", &show_draw_Rect);
+            ImGui::Checkbox(T("显示方框", "Show Box"), &show_draw_Rect);
 
-            ImGui::Checkbox("监管天赋树", &show_genius_tree);   // 径向图，独立可拖动窗口(单独一行)
+            ImGui::Checkbox(T("监管天赋树", "Hunter Talent Tree"), &show_genius_tree);   // 径向图，独立可拖动窗口(单独一行)
         }
 
         // 固定信息(屏幕 HUD 汇总)：每块独立开关 + 独立 X/Y/大小。调好位置后把初值固化即可
-        if (ImGui::CollapsingHeader("固定信息")) {
+        if (ImGui::CollapsingHeader(T("固定信息###fixed", "Fixed HUD###fixed"))) {
             float mw = (float)displayInfo.width, mh = (float)displayInfo.height;
 
             // 局内绘制的天赋行 / 大门：各自独立 bool，跟下面的固定信息面板互不共用
-            ImGui::Checkbox("显示天赋", &show_draw_Genius);   // 天赋行 + 监管辅助特质行(局内画框那套)
+            ImGui::Checkbox(T("显示天赋", "Show Talents"), &show_draw_Genius);   // 天赋行 + 监管辅助特质行(局内画框那套)
             ImGui::SameLine();
-            ImGui::Checkbox("显示大门", &show_draw_Door);
+            ImGui::Checkbox(T("显示大门", "Show Gates"), &show_draw_Door);
             ImGui::Separator();
 
-            ImGui::Checkbox("密码机/门面板##fi_gen", &fi_gen_on);
+            ImGui::Checkbox(T("密码机/门面板##fi_gen", "Cipher/Gate panel##fi_gen"), &fi_gen_on);
             if (fi_gen_on) {
-                ImGui::SliderFloat("机 X##fi_gen", &fi_gen_x, 0.0f, mw, "%.0f");
-                ImGui::SliderFloat("机 Y##fi_gen", &fi_gen_y, 0.0f, mh, "%.0f");
-                ImGui::SliderFloat("机 大小##fi_gen", &fi_gen_size, 10.0f, 60.0f, "%.0f");
+                ImGui::SliderFloat(T("机 X##fi_gen", "Gen X##fi_gen"), &fi_gen_x, 0.0f, mw, "%.0f");
+                ImGui::SliderFloat(T("机 Y##fi_gen", "Gen Y##fi_gen"), &fi_gen_y, 0.0f, mh, "%.0f");
+                ImGui::SliderFloat(T("机 大小##fi_gen", "Gen size##fi_gen"), &fi_gen_size, 10.0f, 60.0f, "%.0f");
             }
 
-            ImGui::Checkbox("监管特质/天赋##fi_hunter", &fi_hunter_on);
+            ImGui::Checkbox(T("监管特质/天赋##fi_hunter", "Hunter trait/talent##fi_hunter"), &fi_hunter_on);
             if (fi_hunter_on) {
-                ImGui::SliderFloat("监 X(0=居中)##fi_hunter", &fi_hunter_x, 0.0f, mw, "%.0f");
-                ImGui::SliderFloat("监 Y##fi_hunter", &fi_hunter_y, 0.0f, mh, "%.0f");
-                ImGui::SliderFloat("监 大小##fi_hunter", &fi_hunter_size, 10.0f, 60.0f, "%.0f");
+                ImGui::SliderFloat(T("监 X(0=居中)##fi_hunter", "Htr X(0=center)##fi_hunter"), &fi_hunter_x, 0.0f, mw, "%.0f");
+                ImGui::SliderFloat(T("监 Y##fi_hunter", "Htr Y##fi_hunter"), &fi_hunter_y, 0.0f, mh, "%.0f");
+                ImGui::SliderFloat(T("监 大小##fi_hunter", "Htr size##fi_hunter"), &fi_hunter_size, 10.0f, 60.0f, "%.0f");
             }
 
-            ImGui::Checkbox("求生者天赋##fi_civ", &fi_civ_on);
+            ImGui::Checkbox(T("求生者天赋##fi_civ", "Survivor talents##fi_civ"), &fi_civ_on);
             if (fi_civ_on) {
-                ImGui::SliderFloat("求 X##fi_civ", &fi_civ_x, 0.0f, mw, "%.0f");
-                ImGui::SliderFloat("求 Y##fi_civ", &fi_civ_y, 0.0f, mh, "%.0f");
-                ImGui::SliderFloat("求 大小##fi_civ", &fi_civ_size, 10.0f, 60.0f, "%.0f");
-                ImGui::SliderFloat("求 间距##fi_civ", &fi_civ_gap, 0.0f, 300.0f, "%.0f");
+                ImGui::SliderFloat(T("求 X##fi_civ", "Svr X##fi_civ"), &fi_civ_x, 0.0f, mw, "%.0f");
+                ImGui::SliderFloat(T("求 Y##fi_civ", "Svr Y##fi_civ"), &fi_civ_y, 0.0f, mh, "%.0f");
+                ImGui::SliderFloat(T("求 大小##fi_civ", "Svr size##fi_civ"), &fi_civ_size, 10.0f, 60.0f, "%.0f");
+                ImGui::SliderFloat(T("求 间距##fi_civ", "Svr gap##fi_civ"), &fi_civ_gap, 0.0f, 300.0f, "%.0f");
             }
         }
 
 
         // 模仿者模式：开关 + 身份簿。开着时名字换成"N号 身份"、不画射线；读到的身份记在簿子里，
         // 开会阶段页被换出读不到时沿用(见 PySelf.h 身份簿)。关掉开关簿子清空
-        if (ImGui::CollapsingHeader("娱乐模式")) {
+        if (ImGui::CollapsingHeader(T("娱乐模式###fun", "Fun Modes###fun"))) {
             // 林中童话(打水仗 BR)：独立绘制玩家(动物阵营配色)+物资。开着自动关模仿者和预知监管
-            if (ImGui::Checkbox("林中童话", &waterfight_mode) && waterfight_mode) { copycat_mode = false; show_draw_prophet = false; }
+            if (ImGui::Checkbox(T("林中童话", "Forest's Fable"), &waterfight_mode) && waterfight_mode) { copycat_mode = false; show_draw_prophet = false; }
             if (waterfight_mode) ImGui::Text("%s", PyWaterFight::status_text());
-            if (ImGui::Checkbox("模仿者", &copycat_mode) && copycat_mode) { show_draw_prophet = false; waterfight_mode = false; }
+            if (ImGui::Checkbox(T("模仿者", "Copycat"), &copycat_mode) && copycat_mode) { show_draw_prophet = false; waterfight_mode = false; }
             if (copycat_mode) {
                 PySelf::CopycatBook book = PySelf::copycat_book();
                 int known = 0, with_id = 0;
                 for (int k = 0; k < PySelf::MAX_COPYCAT; k++)
                     if (book.seat[k].known) { known++; if (book.seat[k].identity) with_id++; }
-                ImGui::Text("已记录 %d 人，身份已知 %d 人", known, with_id);
+                ImTextT("已记录 %d 人，身份已知 %d 人", "Recorded %d, identity known %d", known, with_id);
                 for (int k = 0; k < PySelf::MAX_COPYCAT; k++) {
                     const PySelf::CopycatSeat &st = book.seat[k];
                     if (!st.known) continue;
                     const char *nm = PySelf::copycat_identity_name(st.identity);
                     char row[64];
-                    int len = snprintf(row, sizeof(row), "%2d号 ", k + 1);
+                    int len = g_english ? snprintf(row, sizeof(row), "#%-2d ", k + 1)
+                                        : snprintf(row, sizeof(row), "%2d号 ", k + 1);
                     if (nm) len += snprintf(row + len, sizeof(row) - len, "%s", nm);
-                    else if (st.identity) len += snprintf(row + len, sizeof(row) - len, "身份%d", st.identity);
+                    else if (st.identity) len += g_english ? snprintf(row + len, sizeof(row) - len, "id%d", st.identity)
+                                                           : snprintf(row + len, sizeof(row) - len, "身份%d", st.identity);
                     else len += snprintf(row + len, sizeof(row) - len, "?");
-                    if (book.self_seat == k + 1) len += snprintf(row + len, sizeof(row) - len, "  (我)");
-                    if (st.dead) snprintf(row + len, sizeof(row) - len, "  已死");
+                    if (book.self_seat == k + 1) len += g_english ? snprintf(row + len, sizeof(row) - len, "  (me)")
+                                                                  : snprintf(row + len, sizeof(row) - len, "  (我)");
+                    if (st.dead) { if (g_english) snprintf(row + len, sizeof(row) - len, "  dead");
+                                   else            snprintf(row + len, sizeof(row) - len, "  已死"); }
                     ImColor c = st.dead ? ImColor(140,140,140,255) : copycat_color(st.identity);
                     ImGui::TextColored(c.Value, "%s", row);
                 }
@@ -2293,26 +2471,42 @@ void Layout_tick_UI(bool *main_thread_flag) {
         }
 
         // 自动盖板(若辰同款判定)：监管走进板子判定区、自己站在板边、两人相距 ≤3 米时点一下交互键
-        if (ImGui::CollapsingHeader("自动盖板")) {
-            ImGui::Checkbox("开启##auto_pallet", &AutoPallet::enabled);   // 不能跟折叠框同名，同名 ID 冲突会点不动
+        if (ImGui::CollapsingHeader(T("自动盖板###pallet", "Auto Pallet###pallet"))) {
+            ImGui::Checkbox(T("开启##auto_pallet", "Enable##auto_pallet"), &AutoPallet::enabled);   // 不能跟折叠框同名，同名 ID 冲突会点不动
             ImGui::SameLine();
-            ImGui::Checkbox("显示判定范围", &AutoPallet::show_range);
-            ImGui::Checkbox("显示触摸点", &AutoPallet::show_touch_point);
+            ImGui::Checkbox(T("显示判定范围", "Show Range"), &AutoPallet::show_range);
+            ImGui::Checkbox(T("显示触摸点", "Show Touch Point"), &AutoPallet::show_touch_point);
             ImGui::SameLine();
-            if (ImGui::Button("测试点击")) AutoPallet::request_test_tap();
+            if (ImGui::Button(T("测试点击", "Test Tap"))) AutoPallet::request_test_tap();
 
-            static const char *modes[] = {"暴力(宽12)", "演戏(宽8)", "随机(8~12)"};
-            ImGui::Combo("模式", &AutoPallet::mode, modes, 3);
-            ImGui::SliderFloat("触摸点 X", &AutoPallet::touch_x, 0.0f, (float)displayInfo.width, "%.0f");
-            ImGui::SliderFloat("触摸点 Y", &AutoPallet::touch_y, 0.0f, (float)displayInfo.height, "%.0f");
-            ImGui::SliderInt("按住(ms)", &AutoPallet::hold_ms, 10, 120);
-            ImGui::SliderInt("位置随机(px)", &AutoPallet::jitter_px, 0, 60);   // 只作用于自动点击，测试点击不随机
-            ImGui::SliderInt("时长随机(±ms)", &AutoPallet::jitter_ms, 0, 30);
+            // 触发宽度(游戏单位，判定矩形的全宽)：固定 / 随机(每次点完在上下限之间重抽)，范围都是 5~15
+            ImGui::Checkbox(T("随机宽度##pallet_rand", "Random width##pallet_rand"), &AutoPallet::random_width);
+            if (!AutoPallet::random_width) {
+                ImGui::SliderFloat(T("触发宽度##pallet_w", "Trigger width##pallet_w"), &AutoPallet::width,
+                                   AutoPallet::WIDTH_MIN, AutoPallet::WIDTH_MAX, "%.1f");
+            } else {
+                ImGui::SliderFloat(T("下限##pallet_lo", "Min##pallet_lo"), &AutoPallet::width_lo,
+                                   AutoPallet::WIDTH_MIN, AutoPallet::WIDTH_MAX, "%.1f");
+                ImGui::SliderFloat(T("上限##pallet_hi", "Max##pallet_hi"), &AutoPallet::width_hi,
+                                   AutoPallet::WIDTH_MIN, AutoPallet::WIDTH_MAX, "%.1f");
+                if (AutoPallet::width_lo > AutoPallet::width_hi) AutoPallet::width_hi = AutoPallet::width_lo;   // 拖下限越过上限时上限跟着走
+            }
+            ImGui::SliderFloat(T("触摸点 X", "Touch X"), &AutoPallet::touch_x, 0.0f, (float)displayInfo.width, "%.0f");
+            ImGui::SliderFloat(T("触摸点 Y", "Touch Y"), &AutoPallet::touch_y, 0.0f, (float)displayInfo.height, "%.0f");
+            ImGui::SliderInt(T("按住(ms)", "Hold (ms)"), &AutoPallet::hold_ms, 10, 120);
+            ImGui::SliderInt(T("位置随机(px)", "Jitter (px)"), &AutoPallet::jitter_px, 0, 60);   // 只作用于自动点击，测试点击不随机
+            ImGui::SliderInt(T("时长随机(±ms)", "Hold jitter (ms)"), &AutoPallet::jitter_ms, 0, 30);
+            // 快速监管预判：实测速度 > 门槛时把监管位置往前推「提前量」再判(多数监管配表移速 4.54~4.71 m/s)
+            ImGui::Checkbox(T("快速监管预判##pallet_pred", "Predict fast hunters##pallet_pred"), &AutoPallet::predict_fast);
+            if (AutoPallet::predict_fast) {
+                ImGui::SliderFloat(T("预判速度门槛(m/s)##pallet_pv", "Predict speed (m/s)##pallet_pv"), &AutoPallet::fast_mps, 4.0f, 10.0f, "%.1f");
+                ImGui::SliderInt(T("提前量(ms)##pallet_lead", "Lead (ms)##pallet_lead"), &AutoPallet::lead_ms, 40, 800);
+            }
 
-            ImGui::Text("状态: %s", AutoPallet::status_text());
-            ImGui::Text("点击 成功%d 失败%d  确认放下%d", AutoPallet::g_tap_ok.load(), AutoPallet::g_tap_fail.load(),
-                        AutoPallet::g_confirmed.load());
-            ImGui::Text("上次: %s", AutoPallet::last_result());
+            ImTextT("状态: %s", "Status: %s", AutoPallet::status_text());
+            ImTextT("点击 成功%d 失败%d  确认放下%d", "Tap ok%d fail%d confirmed%d",
+                    AutoPallet::g_tap_ok.load(), AutoPallet::g_tap_fail.load(), AutoPallet::g_confirmed.load());
+            ImTextT("上次: %s", "Last: %s", AutoPallet::last_result());
         }
 
         // 发布版本: 注入功能已停用
@@ -2332,7 +2526,16 @@ void Layout_tick_UI(bool *main_thread_flag) {
     if (show_genius_tree && show_window) {
         float side = displayInfo.height * 0.8f;          // 默认占 80% 屏高(正方形)
         ImGui::SetNextWindowSize(ImVec2(side, side), ImGuiCond_FirstUseEver);
-        if (ImGui::Begin("监管天赋树", &show_genius_tree)) {
+        ImGui::SetNextWindowBgAlpha(panel_alpha);
+        if (cfg_apply_tree) {
+            ImGui::SetNextWindowPos({cfg_tree_x, cfg_tree_y}, ImGuiCond_Always);
+            ImGui::SetNextWindowSize({cfg_tree_w, cfg_tree_h}, ImGuiCond_Always);
+            cfg_apply_tree = false;
+        }
+        bool tree_open = ImGui::Begin(T("监管天赋树###gtree", "Hunter Talent Tree###gtree"), &show_genius_tree);
+        cfg_tree_x = ImGui::GetWindowPos().x;  cfg_tree_y = ImGui::GetWindowPos().y;    // 保存配置时用
+        cfg_tree_w = ImGui::GetWindowSize().x; cfg_tree_h = ImGui::GetWindowSize().y;
+        if (tree_open) {
             uint64_t hb = 0; PyGenius::Info gi;
             bool ok = PyScene::in_battle() && PySelf::hunter_body(hb)
                       && PyGenius::lookup((uintptr_t)hb, 0.f, 0.f, gi);
@@ -2343,7 +2546,7 @@ void Layout_tick_UI(bool *main_thread_flag) {
                     if (!lv) continue; cnt++; pts += lv;
                     if (GeniusTree::is_terminal(id)) term++;
                 }
-                ImGui::Text("已点 %d 项   终端 %d/4   合计 %d 点", cnt, term, pts);
+                ImTextT("已点 %d 项   终端 %d/4   合计 %d 点", "Unlocked %d   terminal %d/4   total %d pts", cnt, term, pts);
                 ImVec2 p0 = ImGui::GetCursorScreenPos();
                 ImVec2 avail = ImGui::GetContentRegionAvail();
                 if (avail.x > 40 && avail.y > 40) {
@@ -2353,7 +2556,7 @@ void Layout_tick_UI(bool *main_thread_flag) {
                     ImGui::Dummy(avail);
                 }
             } else {
-                ImGui::TextDisabled("未在局内 / 监管天赋读取中…");
+                ImGui::TextDisabled("%s", T("未在局内 / 监管天赋读取中…", "Not in match / reading hunter talents…"));
             }
         }
         ImGui::End();

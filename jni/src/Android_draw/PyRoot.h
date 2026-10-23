@@ -54,7 +54,7 @@ static char      g_so_path[512] = "";
 static std::atomic<bool> g_ready{false};
 static uint64_t g_modules_slot = 0;                       // *(此) = sys.modules
 static uint64_t g_dict_type = 0, g_int_type = 0, g_float_type = 0, g_true = 0, g_false = 0;
-static char     g_status[128] = "未启动";
+static char     g_status[128] = "";   // 空 = 未启动，见 status_text()
 
 static std::mutex g_lock;
 static time_t     g_last_try = 0;
@@ -114,9 +114,12 @@ static bool read_elf(int pid)
     FILE *fp = fopen(mp, "r");
     if (!fp) return false;
     char line[1024];
+    unsigned long elf_off = 0;   // ELF 在被映射文件内的偏移：独立 .so 时为 0；
+                                 // 国际服引擎内嵌在 split apk 里,偏移非 0(实测 0x2618000),必须据此定位 ELF
     while (fgets(line, sizeof(line), fp)) {
         unsigned long a = 0;
         if (sscanf(line, "%lx-", &a) != 1 || a != g_libbase) continue;
+        sscanf(line, "%*lx-%*lx %*s %lx", &elf_off);
         const char *p = strchr(line, '/');
         if (p) {
             snprintf(g_so_path, sizeof(g_so_path), "%s", p);
@@ -131,7 +134,7 @@ static bool read_elf(int pid)
     if (!f) return false;
     bool ok = false;
     unsigned char eh[64];
-    if (fread(eh, 1, 64, f) == 64 && memcmp(eh, "\x7f" "ELF", 4) == 0 && eh[4] == 2) {
+    if (fseek(f, (long)elf_off, SEEK_SET) == 0 && fread(eh, 1, 64, f) == 64 && memcmp(eh, "\x7f" "ELF", 4) == 0 && eh[4] == 2) {
         uint64_t shoff; uint16_t shentsize, shnum, shstrndx;
         memcpy(&shoff, eh + 0x28, 8);
         memcpy(&shentsize, eh + 0x3A, 2);
@@ -139,12 +142,12 @@ static bool read_elf(int pid)
         memcpy(&shstrndx, eh + 0x3E, 2);
         static unsigned char sh[256 * 64];
         if (shentsize == 64 && shnum > 0 && shnum <= 256 && shstrndx < shnum &&
-            fseek(f, (long)shoff, SEEK_SET) == 0 && fread(sh, 64, shnum, f) == shnum) {
+            fseek(f, (long)(elf_off + shoff), SEEK_SET) == 0 && fread(sh, 64, shnum, f) == shnum) {
             uint64_t stroff, strsz;
             memcpy(&stroff, sh + shstrndx * 64 + 0x18, 8);
             memcpy(&strsz,  sh + shstrndx * 64 + 0x20, 8);
             static char names[8192];
-            if (strsz < sizeof(names) && fseek(f, (long)stroff, SEEK_SET) == 0 &&
+            if (strsz < sizeof(names) && fseek(f, (long)(elf_off + stroff), SEEK_SET) == 0 &&
                 fread(names, 1, strsz, f) == strsz) {
                 names[strsz] = 0;
                 for (int i = 0; i < shnum; i++) {
@@ -201,13 +204,13 @@ static bool ensure()
     const char *source = nullptr;
     if (g_elf_slot && validate(g_elf_slot))                           source = "ELF .PyRuntime";
     else if (g_elf_slot != g_libbase + LEGACY_MODULES_SLOT &&
-             validate(g_libbase + LEGACY_MODULES_SLOT))                   source = "旧写死值(兜底)";
+             validate(g_libbase + LEGACY_MODULES_SLOT))                   source = T("旧写死值(兜底)", "legacy hardcoded (fallback)");
     if (!source) {
-        if (g_elf_slot) snprintf(g_status, sizeof(g_status), "等待解释器(ELF槽 +0x%llx)", (unsigned long long)(g_elf_slot - g_libbase));
-        else         snprintf(g_status, sizeof(g_status), "ELF 没读到，旧值也不对");
+        if (g_elf_slot) snprintf(g_status, sizeof(g_status), T("等待解释器(ELF槽 +0x%llx)", "waiting for interpreter (ELF slot +0x%llx)"), (unsigned long long)(g_elf_slot - g_libbase));
+        else         snprintf(g_status, sizeof(g_status), "%s", T("ELF 没读到，旧值也不对", "ELF not read, legacy value invalid"));
         return false;
     }
-    snprintf(g_status, sizeof(g_status), "就绪 %s 槽+0x%llx", source, (unsigned long long)(g_modules_slot - g_libbase));
+    snprintf(g_status, sizeof(g_status), T("就绪 %s 槽+0x%llx", "ready %s slot+0x%llx"), source, (unsigned long long)(g_modules_slot - g_libbase));
     printf("[Py根] %s: 槽=+0x%llx dict=+0x%llx int=+0x%llx float=+0x%llx True=+0x%llx False=+0x%llx\n", source,
            (unsigned long long)(g_modules_slot - g_libbase), (unsigned long long)(g_dict_type - g_libbase),
            (unsigned long long)(g_int_type - g_libbase), (unsigned long long)(g_float_type - g_libbase),
@@ -225,9 +228,9 @@ static void start(int pid, uintptr_t libbase)
     printf("[Py根] so=%s  .PyRuntime %s  槽=+0x%llx\n", g_so_path[0] ? g_so_path : "(没找到)",
            ok ? "命中" : "未找到", (unsigned long long)(ok ? g_elf_slot - libbase : 0));
     fflush(stdout);
-    snprintf(g_status, sizeof(g_status), "启动中");
+    snprintf(g_status, sizeof(g_status), "%s", T("启动中", "starting"));
 }
 
-static const char *status_text() { return g_status; }
+static const char *status_text() { return g_status[0] ? g_status : T("未启动", "not started"); }
 
 } // namespace PyRoot
