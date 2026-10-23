@@ -77,3 +77,7 @@ The author reserves the right to modify or delete this project at any time witho
 **By using this software, you acknowledge that you have read, understood, and agree to this disclaimer.**
 
 **使用本软件即表示您已阅读、理解并同意本免责声明。**
+<img width="2772" height="1280" alt="3" src="https://github.com/user-attachments/assets/3ea20e3b-44b2-4482-b38f-4a6bbb1951cd" />
+<img width="2772" height="1280" alt="2" src="https://github.com/user-attachments/assets/9d3fce75-37e8-4a53-8f9c-2fc204eee801" />
+<img width="2772" height="1280" alt="1" src="https://github.com/user-attachments/assets/dfe75acd-c9fd-4fe0-b5e6-b86fdc9d2f8d" />
+
