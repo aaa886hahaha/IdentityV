@@ -18,7 +18,9 @@
 //          (帝五忍鸽用的是 +0x730，是旧版本的偏移；若辰的候选表里 0x730 排第二)
 //   朝向   objcoor+0xb8 / +0xc0 当作水平方向向量(x, y)，长度 > 1e-5 才可用
 //   自身   PySelf::anchor()，必须是求生者(camp == 2)
-//   监管   PySelf::hunter_body()；动作号同样是 [[obj+0x750]+0x30]
+//   监管   PySelf::hunter_bodies()(联合狩猎 2 个)；动作号同样是 [[obj+0x750]+0x30]
+//          照游戏 is_butcher_can_hit：梦之女巫本体不算、换成她正在操控的信徒；约瑟夫镜世界只算跟我同一世界的；
+//          super_armor(霸体：兴奋/破轮轮形态/台球手球形态)不判
 //
 // 二、命中判定 sub_34517C(自身 S, 监管 H, 板子 P，全部只看水平面)
 //   state == 16
@@ -28,7 +30,8 @@
 //         |along| <= 8.25 + 0.38  且  |perp| <= 半宽 + 0.38
 //   小丑拉锯(类名含 butcher_sxwd 且动作号在 0x1802CE±3)：改成 |H-P| <= 80 单位(约 6.7 米)，不需要朝向
 //   多块同时命中时取离自己最近的那块
-//   若辰在监管是孽蜥时整套不触发(按翻译名"孽蜥"判)，我们去掉了，见 thread_main 里的 TODO
+//   若辰在监管是孽蜥时整套不触发(按翻译名"孽蜥"判)；我们只挡空中的：监管与自身高度差 > 约 1.26 米不判(见 hit_test)
+//   破轮轮形态(模型 xxx_wheel.gim)不放板
 //
 // 三、半宽(界面「触发宽度」，游戏单位，判定用 宽度/2)
 //   固定：宽度 = width(默认 12，若辰「暴力」档)
@@ -42,7 +45,7 @@
 //
 // 五、跟若辰的不同(有意的)
 //   - 若辰还会合并 Python 侧的板子列表(sub_38F028，3 秒内有效)；这里只用场景对象
-//   - 若辰对全部监管取最近的一个；这里只看 PySelf 的监管本体(2v8 只看第一个监管)
+//   - 若辰对全部监管取最近的一个；这里对每个监管都判，任一命中就算(联合狩猎两个监管)
 //   - 若辰在校准(QTE)进行中不点；我们没有自动校准，不需要
 //   - 板子位置/朝向是静态的，按对象缓存 2 秒，每轮只重读附近板子的状态
 //
@@ -107,6 +110,7 @@ static const int64_t CLEAR_LAST_BOARD_MS = 150;
 static const int   LOOP_US           = 10000;   // 10ms 一轮
 static const int   MAX_BOARDS        = 64;
 static const int   MAX_RECTS         = 8;
+static const float HEIGHT_MAX        = 15.0f;   // 监管与自身的高度差上限(约 1.26 米)，见 hit_test
 
 static inline float clamp_width(float w) { return w < WIDTH_MIN ? WIDTH_MIN : (w > WIDTH_MAX ? WIDTH_MAX : w); }
 
@@ -215,9 +219,12 @@ struct BoardInfo {
 };
 
 // 命中判定，sub_34517C 的等价实现。S=自身 H=监管 P=板子
+// 比若辰多一道高度差：游戏 is_unit_in_hit_range 用三维距离(x² = dist² − y² < 12²)，监管离地约 1 米以上就砸不中。
+// 为的是孽蜥起跳/滞空(脚本 skills/wildman/jump，孽蜥代号 wildman、模型 lizard)。拿自身脚底比(自己就站在板边)
 static bool hit_test(const float *S, const float *H, const BoardInfo &b, float half_wid, bool circle)
 {
     if (hdist(S, H) / dist_scale > HUNTER_SELF_MAX_M) return false;
+    if (fabsf(H[2] - S[2]) > HEIGHT_MAX) return false;
     if (hdist(S, b.pos) > SELF_BOARD_MAX) return false;
     if (circle) return hdist(H, b.pos) <= CLOWN_RADIUS;
     if (!b.dir_ok) return false;
@@ -228,7 +235,7 @@ static bool hit_test(const float *S, const float *H, const BoardInfo &b, float h
     return perp <= half_wid + MARGIN;
 }
 
-// ---- 监管速度估计(盖板线程独占) ----
+// ---- 监管速度估计(盖板线程独占，每个监管一份：联合狩猎两个监管共用一份会互相清空) ----
 // 每轮记一个水平位置样本，取最近 VEL_WINDOW_MS 内的样本做最小二乘，得到速度向量(单位/秒)。
 // 传送判据用"单次跳变距离 > TELEPORT_JUMP_M"，**不能用相邻样本换算的速度**：远端位置随网络包阶梯式更新
 // (几轮不动、然后一跳)，冲刺越快那一跳换算出的速度越高，旧版"> 30m/s 算传送"会把快速冲刺误清掉，正好越快越漏。
@@ -236,36 +243,47 @@ struct HunterSample { int64_t t; float x, y; };
 static const int   HIST_CAP = 32;
 static const int64_t VEL_WINDOW_MS = 80;
 static const float TELEPORT_JUMP_M = 5.0f;
-static HunterSample g_hist[HIST_CAP];
-static int      g_hist_n = 0;
-static uint64_t g_hist_obj = 0;
+struct Track { uint64_t obj; HunterSample hist[HIST_CAP]; int n; int64_t seen_ms; };
+static Track g_tracks[PySelf::MAX_HUNTERS];
 
-static void hunter_track(uint64_t obj, int64_t t, const float *H)
+// 按监管对象取它的历史；没有就占用最久没见到的那格(换局/换人自然顶掉)
+static Track &track_of(uint64_t obj, int64_t t)
 {
-    if (obj != g_hist_obj) { g_hist_obj = obj; g_hist_n = 0; }
-    if (g_hist_n > 0) {
-        const HunterSample &p = g_hist[g_hist_n - 1];
+    Track *old = &g_tracks[0];
+    for (Track &k : g_tracks) {
+        if (k.obj == obj) { k.seen_ms = t; return k; }
+        if (k.seen_ms < old->seen_ms) old = &k;
+    }
+    old->obj = obj; old->n = 0; old->seen_ms = t;
+    return *old;
+}
+
+static void hunter_track(Track &k, int64_t t, const float *H)
+{
+    if (k.n > 0) {
+        const HunterSample &p = k.hist[k.n - 1];
         float dt = (float)(t - p.t) / 1000.f;
         if (dt <= 0.f) return;
         float dx = H[0] - p.x, dy = H[1] - p.y;
-        if (dt > 0.25f || sqrtf(dx * dx + dy * dy) / dist_scale > TELEPORT_JUMP_M) g_hist_n = 0;   // 断档或传送
+        if (dt > 0.25f || sqrtf(dx * dx + dy * dy) / dist_scale > TELEPORT_JUMP_M) k.n = 0;   // 断档或传送
     }
-    if (g_hist_n == HIST_CAP) { memmove(g_hist, g_hist + 1, sizeof(HunterSample) * (HIST_CAP - 1)); g_hist_n--; }
-    g_hist[g_hist_n++] = {t, H[0], H[1]};
+    if (k.n == HIST_CAP) { memmove(k.hist, k.hist + 1, sizeof(HunterSample) * (HIST_CAP - 1)); k.n--; }
+    k.hist[k.n++] = {t, H[0], H[1]};
 }
 
 // 返回 false = 样本不够(少于 3 个或跨度不到 30ms，冲刺刚起步也要尽快出结果)。
 // decel = 后半段速度不到前半段 50%(在刹车)；两半各自不到 30ms 时阶梯式更新会让端点速度乱跳，不做判断
-static bool hunter_velocity(int64_t now, float &vx, float &vy, bool &decel)
+static bool hunter_velocity(const Track &k, int64_t now, float &vx, float &vy, bool &decel)
 {
-    int first = g_hist_n;
-    while (first > 0 && now - g_hist[first - 1].t <= VEL_WINDOW_MS) first--;
-    int n = g_hist_n - first;
-    if (n < 3 || g_hist[g_hist_n - 1].t - g_hist[first].t < 30) return false;
+    const HunterSample *h = k.hist;
+    int first = k.n;
+    while (first > 0 && now - h[first - 1].t <= VEL_WINDOW_MS) first--;
+    int n = k.n - first;
+    if (n < 3 || h[k.n - 1].t - h[first].t < 30) return false;
     double st = 0, sx = 0, sy = 0, stt = 0, stx = 0, sty = 0;
-    for (int i = first; i < g_hist_n; i++) {
-        double tt = (double)(g_hist[i].t - g_hist[first].t) / 1000.0;
-        st += tt; sx += g_hist[i].x; sy += g_hist[i].y; stt += tt * tt; stx += tt * g_hist[i].x; sty += tt * g_hist[i].y;
+    for (int i = first; i < k.n; i++) {
+        double tt = (double)(h[i].t - h[first].t) / 1000.0;
+        st += tt; sx += h[i].x; sy += h[i].y; stt += tt * tt; stx += tt * h[i].x; sty += tt * h[i].y;
     }
     double den = n * stt - st * st;
     if (den <= 1e-9) return false;
@@ -280,8 +298,8 @@ static bool hunter_velocity(int64_t now, float &vx, float &vy, bool &decel)
         return sqrtf(dx * dx + dy * dy) / dt;
     };
     decel = false;
-    if (g_hist[mid].t - g_hist[first].t >= 30 && g_hist[g_hist_n - 1].t - g_hist[mid].t >= 30) {
-        float early = seg_speed(g_hist[first], g_hist[mid]), late = seg_speed(g_hist[mid], g_hist[g_hist_n - 1]);
+    if (h[mid].t - h[first].t >= 30 && h[k.n - 1].t - h[mid].t >= 30) {
+        float early = seg_speed(h[first], h[mid]), late = seg_speed(h[mid], h[k.n - 1]);
         decel = early > 0.f && late < early * 0.5f;
     }
     return true;
@@ -375,45 +393,58 @@ static void thread_main()
             }
         }
 
-        uint64_t self = 0, hunter = 0;
+        uint64_t self = 0;
         if (!PySelf::anchor(self) || PySelf::camp() != 2) {
             snprintf(g_status, sizeof(g_status), "%s", T("自身不是求生者/未就绪", "self not survivor / not ready"));
             g_rect_active.store(w);
             usleep(20000);
             continue;
         }
-        float S[3], H[3];
+        float S[3];
         if (!read_pos(self, S)) {
             snprintf(g_status, sizeof(g_status), "%s", T("自身坐标读不到", "self position unreadable"));
             g_rect_active.store(w);
             continue;
         }
-        bool have_hunter = PySelf::hunter_body(hunter) && read_pos(hunter, H);
 
-        // 快速监管预判：速度过门槛、没在刹车，才把位置往前推(见 predict_fast 的说明)
-        bool  pred_on = false;
-        float pvx = 0.f, pvy = 0.f, hunter_mps = 0.f;
-        if (have_hunter) {
-            hunter_track(hunter, t, H);
+        // 监管：联合狩猎(2v8)有两个，逐个读坐标、测速，下面对每块板任一监管命中就算
+        // 霸体(super_armor)的照样读坐标测速(霸体结束时速度现成)，只是不参与命中：游戏 is_butcher_can_hit 直接不判
+        struct Hunter { float H[3]; float vx, vy, mps; bool pred_on, circle, armor; };
+        PySelf::HunterTarget tgs[PySelf::MAX_HUNTERS];
+        uint64_t bodies[PySelf::MAX_HUNTERS];
+        int nbody = PySelf::hunter_targets(tgs, PySelf::MAX_HUNTERS);
+        for (int i = 0; i < nbody; i++) bodies[i] = tgs[i].obj;
+        Hunter hs[PySelf::MAX_HUNTERS];
+        int nh = 0, nearest = -1;
+        bool wheel_form = false;
+        for (int i = 0; i < nbody; i++) {
+            Hunter &h = hs[nh];
+            if (!read_pos(bodies[i], h.H)) continue;
+            h.armor = tgs[i].armor;
+            // 破轮轮形态不放板：ButcherUnit._recover_broken_wheel 在 broken_wheel 为真时 _change_another_model，
+            // 当前 model 换成 xxx_wheel.gim(每款皮肤都有一个；polun_e_pzz_wheel_dingzi 是钉子不是本体)
+            std::string cn = class_name_of(bodies[i]);
+            if (cn.find("polun") != std::string::npos && cn.find("wheel") != std::string::npos
+                && cn.find("dingzi") == std::string::npos) { wheel_form = true; continue; }
+            // 快速监管预判：速度过门槛、没在刹车，才把位置往前推(见 predict_fast 的说明)
+            Track &k = track_of(bodies[i], t);
+            hunter_track(k, t, h.H);
+            h.vx = h.vy = h.mps = 0.f;
+            h.pred_on = false;
             bool decel = false;
-            if (hunter_velocity(t, pvx, pvy, decel)) {
-                hunter_mps = sqrtf(pvx * pvx + pvy * pvy) / dist_scale;
-                pred_on = predict_fast && !decel && hunter_mps > fast_mps;
+            if (hunter_velocity(k, t, h.vx, h.vy, decel)) {
+                h.mps = sqrtf(h.vx * h.vx + h.vy * h.vy) / dist_scale;
+                h.pred_on = predict_fast && !decel && h.mps > fast_mps;
             }
-        } else {
-            g_hist_n = 0;
+            // 小丑拉锯改圆形判定
+            int action = 0;
+            h.circle = cn.find("butcher_sxwd") != std::string::npos && read_state(bodies[i], action)
+                    && action > CLOWN_ACTION - 4 && action < CLOWN_ACTION + 4;
+            if (nearest < 0 || hdist(S, h.H) < hdist(S, hs[nearest].H)) nearest = nh;
+            nh++;
         }
-
-        // 监管种类：小丑拉锯改圆形判定
-        // TODO(孽蜥)：若辰对孽蜥整套不触发，我们去掉了。那条规则真正想挡的是"飞天(跳跃)中的孽蜥"，
-        //   不是地面上的孽蜥 —— 以后找到跳跃状态的判据(动作号/高度差等)再加回一条只过滤飞天的严格判断
-        bool circle = false;
-        int action = 0;
-        if (have_hunter) {
-            std::string cn = class_name_of(hunter);
-            if (cn.find("butcher_sxwd") != std::string::npos && read_state(hunter, action))
-                circle = action > CLOWN_ACTION - 4 && action < CLOWN_ACTION + 4;
-        }
+        bool any_circle = false, any_pred = false;
+        for (int i = 0; i < nh; i++) { any_circle |= hs[i].circle; any_pred |= hs[i].pred_on; }
 
         // 板子：静态信息按对象缓存 2 秒
         int ba = g_board_active.load();
@@ -425,6 +456,7 @@ static void thread_main()
         uint64_t best = 0;
         float best_d = 1e30f;
         bool  best_pred = false;                     // 命中来自预判(监管还没进区)
+        int   armor_h = -1;                          // 有霸体监管站在某块板的判定区里(不放，状态行提示)
         int near_n = 0, standing_n = 0;
         for (int i = 0; i < nb; i++) {
             uint64_t o = boards[i];
@@ -451,13 +483,19 @@ static void thread_main()
             bool standing = state_ok && state == BOARD_STANDING;
             if (standing) standing_n++;
 
-            bool hit = standing && have_hunter && hit_test(S, H, bi, g_half_wid, circle);
-            bool hit_pred = false;
-            if (!hit && standing && pred_on) {
+            bool hit = false, hit_pred = false;
+            for (int h = 0; standing && h < nh && !hit; h++) {
+                const Hunter &hu = hs[h];
+                if (hu.armor) {                                      // 霸体：不判，只记一下"在区里"给状态行
+                    if (armor_h < 0 && hit_test(S, hu.H, bi, g_half_wid, hu.circle)) armor_h = h;
+                    continue;
+                }
+                hit = hit_test(S, hu.H, bi, g_half_wid, hu.circle);
+                if (hit || hit_pred || !hu.pred_on) continue;
                 // 每 5ms 一个预测点，推到 lead_ms 为止(20ms 步长在高速下一步近半个判定区，会跳过边角)；高度沿用当前值
                 for (int dt = 5; dt <= lead_ms && !hit_pred; dt += 5) {
-                    float P[3] = {H[0] + pvx * dt / 1000.f, H[1] + pvy * dt / 1000.f, H[2]};
-                    hit_pred = hit_test(S, P, bi, g_half_wid, circle);
+                    float P[3] = {hu.H[0] + hu.vx * dt / 1000.f, hu.H[1] + hu.vy * dt / 1000.f, hu.H[2]};
+                    hit_pred = hit_test(S, P, bi, g_half_wid, hu.circle);
                 }
             }
             if (hit || hit_pred) {
@@ -470,7 +508,7 @@ static void thread_main()
                 r.cx = bi.pos[0]; r.cy = bi.pos[1]; r.cz = bi.pos[2];
                 r.ux = bi.dir[0]; r.uy = bi.dir[1];
                 r.a = HALF_LEN + MARGIN; r.b = g_half_wid + MARGIN;
-                r.r = circle ? CLOWN_RADIUS : 0.f;
+                r.r = any_circle ? CLOWN_RADIUS : 0.f;
                 r.candidate = false;
             }
         }
@@ -494,15 +532,19 @@ static void thread_main()
             snprintf(g_status, sizeof(g_status), "%s", T("仅显示范围(未开启自动)", "range only (auto off)"));
             continue;
         }
-        if (!have_hunter)      { snprintf(g_status, sizeof(g_status), "%s", T("没有监管", "no hunter")); continue; }
+        if (nh == 0) {
+            snprintf(g_status, sizeof(g_status), "%s", wheel_form ? T("破轮轮形态(不放板)", "Breaking Wheel in wheel form (no pallet)") : T("没有监管", "no hunter"));
+            continue;
+        }
         if (near_n == 0)       { snprintf(g_status, sizeof(g_status), T("附近没有板子(板子%d)", "no pallet nearby (pallets %d)"), nb); last_board = 0; continue; }
         if (standing_n == 0)   { snprintf(g_status, sizeof(g_status), "%s", T("附近没有立着的板子", "no standing pallet nearby")); }
 
         if (best == 0) {
             if (t - last_candidate_ms >= CLEAR_LAST_BOARD_MS) last_board = 0;
-            if (standing_n) snprintf(g_status, sizeof(g_status), T("监测中%s 监管距离%.1fm 速度%.1fm/s%s", "watching%s hunter %.1fm %.1fm/s%s"),
-                                     circle ? T("(小丑拉锯·圆形)", " (Smiley Face dash, circle)") : "", hdist(S, H) / dist_scale,
-                                     hunter_mps, pred_on ? T(" 预判中", " predicting") : "");
+            if (armor_h >= 0) snprintf(g_status, sizeof(g_status), "%s", T("霸体监管在判定区(不放板)", "super-armored hunter in range (no pallet)"));
+            else if (standing_n) snprintf(g_status, sizeof(g_status), T("监测中%s 监管%d 最近%.1fm 速度%.1fm/s%s", "watching%s hunters %d nearest %.1fm %.1fm/s%s"),
+                                     any_circle ? T("(小丑拉锯·圆形)", " (Smiley Face dash, circle)") : "", nh,
+                                     hdist(S, hs[nearest].H) / dist_scale, hs[nearest].mps, any_pred ? T(" 预判中", " predicting") : "");
             continue;
         }
         last_candidate_ms = t;
@@ -535,8 +577,8 @@ static void thread_main()
             g_tap_fail++;
         }
         snprintf(g_last_result, sizeof(g_last_result), T("auto %s (%.0f,%.0f) %dms 板子=0x%llx%s%s %.1fm/s", "auto %s (%.0f,%.0f) %dms pallet=0x%llx%s%s %.1fm/s"),
-                 Touch::InjectResultText(r), tx, ty, hold, (unsigned long long)best, circle ? T(" 圆形", " circle") : "",
-                 best_pred ? T(" 预判", " predicted") : "", hunter_mps);
+                 Touch::InjectResultText(r), tx, ty, hold, (unsigned long long)best, any_circle ? T(" 圆形", " circle") : "",
+                 best_pred ? T(" 预判", " predicted") : "", hs[nearest].mps);
         printf("[盖板] %s 半宽=%.1f 随机=%d\n", g_last_result, g_half_wid, (int)random_width);
         fflush(stdout);
         if (random_width) g_half_wid = pick_random_half_width(rng);

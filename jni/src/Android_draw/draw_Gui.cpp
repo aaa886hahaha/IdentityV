@@ -187,6 +187,8 @@ static float fi_civ_x     = 1894.0f, fi_civ_y    = 328.0f, fi_civ_size    = 28.0
 // ===== 配置保存/读取：/data/IdentityV_config.txt，一行一个 key=value(# 开头是注释，可手改) =====
 // 读取时未知键忽略、缺的键保持当前值，所以加了新选项旧文件照样能读。
 // 窗口位置/大小：每帧记下当前值用于保存；读取后下一帧用 SetNextWindowPos/Size 套上。
+// 启动后第一帧自动读一次(文件不存在就用默认值，不报错)；读之前先把各项的默认值拍一份快照，
+// 「恢复默认配置」从快照还原(只改内存，要写回文件再点保存)。
 #include <cerrno>
 #include <cstring>
 static const char *CONFIG_PATH = "/data/IdentityV_config.txt";
@@ -254,11 +256,36 @@ static void config_save()
     cfg_set_msg(m);
 }
 
-static void config_load()
+// 默认值快照：CfgItem 只有 bool/int/float 三种，4 字节装得下
+static const int CFG_COUNT = (int)(sizeof(CFG_ITEMS) / sizeof(CFG_ITEMS[0]));
+static uint32_t cfg_defaults[CFG_COUNT];
+
+static void config_snapshot_defaults()
+{
+    for (int i = 0; i < CFG_COUNT; i++) {
+        const CfgItem &it = CFG_ITEMS[i];
+        cfg_defaults[i] = 0;
+        memcpy(&cfg_defaults[i], it.ptr, it.type == CFG_BOOL ? sizeof(bool) : 4);
+    }
+}
+
+static void config_restore_defaults()
+{
+    for (int i = 0; i < CFG_COUNT; i++) {
+        const CfgItem &it = CFG_ITEMS[i];
+        memcpy(it.ptr, &cfg_defaults[i], it.type == CFG_BOOL ? sizeof(bool) : 4);
+    }
+    cfg_set_msg(T("已恢复默认(要写回文件请再点保存)", "Defaults restored (click Save to write the file)"));
+}
+
+static void config_load(bool startup = false)
 {
     FILE *f = fopen(CONFIG_PATH, "r");
     char m[160];
-    if (!f) { snprintf(m, sizeof(m), T("读取失败: %s", "Load failed: %s"), strerror(errno)); cfg_set_msg(m); return; }
+    if (!f) {
+        if (startup && errno == ENOENT) return;   // 首次运行还没有配置文件，静默用默认值
+        snprintf(m, sizeof(m), T("读取失败: %s", "Load failed: %s"), strerror(errno)); cfg_set_msg(m); return;
+    }
     char line[256];
     int n = 0;
     while (fgets(line, sizeof(line), f)) {
@@ -295,6 +322,14 @@ char objtext[256];
 char Team[1024];
 char Name[1024];
 char prophet_text[1024];
+
+// 预知文本里追加一个监管名(已经有了就不加)。联合狩猎两个监管时拼成 "[杰克] [小丑]"
+static void prophet_append(char *buf, size_t cap, const char *name)
+{
+    if (!name || !name[0] || strstr(buf, name)) return;
+    size_t len = strlen(buf);
+    snprintf(buf + len, cap - len, "%s%s", len ? " " : "", name);
+}
 
 float px,py;
 Vector3A D,Z;
@@ -819,8 +854,10 @@ void read_thread(long int PD1,long int PD2,long int PD3)
         	if (is_dup == 1){
     		    continue;
     		}
-        	if (should_filter(filter_class_name)) {
-        		continue;//过滤随从等无关对象
+        	// 过滤随从等无关对象。Python 层的角色本体(unit.model+0x20)不过黑名单：台球手球形态的模型是
+        	// chr/boss/billy/billy_weapon01.gim(皮肤 14801，BilliardComponent.billiard_change_model 换上)，会被 "weapon" 误杀(2026-10-25)
+        	if (should_filter(filter_class_name) && !PySelf::is_body(cur_obj)) {
+        		continue;
         	}
         	std::string s;
         	//预知监管者
@@ -828,17 +865,17 @@ void read_thread(long int PD1,long int PD2,long int PD3)
             //   这样另一形态(无常黑白)、约瑟夫相机、大厅残留都不会顶掉真监管。
             // 准备阶段/大厅：units_by_type 里还没有监管单位(实测)，退回下面按类名匹配的老逻辑。
             //   ⚠ 准备阶段不能用 +0x73(visible) 过滤：打求生者时真监管的模型在准备界面是不可见的(实测)
+            // 联合狩猎有两个监管(2026-10-25)：两个名字都拼进预知(去重)，见 prophet_append
             uint64_t real_hunter = 0;
             const bool has_real_hunter = PySelf::hunter_body(real_hunter);
             if (show_draw_prophet && has_real_hunter){
-                if (cur_obj == real_hunter) snprintf(prophet_local, sizeof(prophet_local), "%s", getboss_prophet(filter_class_name.c_str()));
+                if (PySelf::is_butcher_body(cur_obj)) prophet_append(prophet_local, sizeof(prophet_local), getboss_prophet(filter_class_name.c_str()));
             }
             else if (show_draw_prophet){//预知开始
                 if (strstr(filter_class_name.c_str(), "burke_console") == NULL&&strstr(filter_class_name.c_str(), "h55_joseph_camera") == NULL&&strstr(filter_class_name.c_str(), "redqueen_e_heijin_yizi") == NULL&&strstr(filter_class_name.c_str(), "_lod") == NULL){
                     if (strstr(filter_class_name.c_str(), "boss") != NULL){
-                        s += getboss_prophet(filter_class_name.c_str());
-                        snprintf(prophet_local, sizeof(prophet_local), "%s", s.c_str());
-                    }       
+                        prophet_append(prophet_local, sizeof(prophet_local), getboss_prophet(filter_class_name.c_str()));
+                    }
                 }
             }//预知结束
     		
@@ -1331,13 +1368,21 @@ void Draw_Main(ImDrawList *Draw){
     // 准备阶段：预知那行下面按座位号列出四个求生者的大天赋，**只在我是监管时显示**(用户要求)
     //   数据来自 g_avatar.final_genius_dict(实时；60 秒差分实测只有它跟着对面换天赋变)，座位号来自 uid2pos，见 PyGenius.h
     //   不再显示监管辅助特质(用户 2026-09-24 决定不要)；也不再看花名册 —— 大厅里那是上一局的旧数据
+    //   联合狩猎 8 个求生者：每行 4 个，超过就换第二行(2026-10-25)
     if (show_draw_prophet && PySelf::in_lobby() && PyGenius::prep_as_hunter() && PyGenius::civ_size() > 0) {
         char line[320];
-        int len = 0;
+        int len = 0, in_line = 0;
+        float line_y = 165;
         int n = PyGenius::civ_size();
         for (int i = 0; i < n && len < (int)sizeof(line) - 48; i++) {
             int seat = 0, pid = 0; uint32_t bits = 0;
             if (!PyGenius::civ_at(i, seat, pid, bits) || bits == 0) continue;
+            if (in_line == 4) {                                     // 这一行满 4 个，先画掉
+                auto ts1 = ImGui::CalcTextSize(line, 0, 25);
+                Draw->AddText({px - (ts1.x / 2), line_y}, ImColor(255, 200, 0, 255), line);
+                line_y += 32; len = 0; in_line = 0; line[0] = 0;
+            }
+            in_line++;
             PyGenius::Info tmp;
             memset(&tmp, 0, sizeof(tmp));
             tmp.camp = 2; tmp.genius_bits = bits; tmp.genius_state = PyGenius::GENIUS_COMPLETE;
@@ -1352,7 +1397,7 @@ void Draw_Main(ImDrawList *Draw){
         }
         if (len > 0) {
             auto ts2 = ImGui::CalcTextSize(line, 0, 25);
-            Draw->AddText({px - (ts2.x / 2), 165}, ImColor(255, 200, 0, 255), line);
+            Draw->AddText({px - (ts2.x / 2), line_y}, ImColor(255, 200, 0, 255), line);
         }
     }
 
@@ -1407,12 +1452,44 @@ void Draw_Main(ImDrawList *Draw){
 
     // B. 监管 辅助特质 + 大天赋(默认顶中)。只在局内、监管单位存在时有内容。
     //    大天赋游戏不公开对手监管的，lookup 读到才画、读不到就空着。
+    //    联合狩猎两个监管(2026-10-25 用户定)：每个监管一行「[名字] 特质 天赋」，下一个监管换行；
+    //    单监管保持原样(特质一行、天赋一行)。女巫只有本体，信徒不进这里
     if (fi_hunter_on && PyScene::in_battle() && PySelf::camp() == 2){   // 我是求生者才看监管天赋
-        uint64_t hb = 0;
-        if (PySelf::hunter_body(hb)){
+        uint64_t hbs[PySelf::MAX_HUNTERS];
+        int hn = PySelf::butcher_bodies(hbs, PySelf::MAX_HUNTERS);
+        float sz = fi_hunter_size, line_h = sz + 6.0f, y = fi_hunter_y;
+        for (int hi = 0; hi < hn; hi++){
+            uint64_t hb = hbs[hi];
             PyGenius::Info gi;
+            if (hn >= 2){
+                const char *name = "";
+                for (int i = 0; i < data_count; i++) if (data[i].obj == hb) { name = data[i].str; break; }
+                char tl[48] = "", gl[96] = "";
+                ImColor cc(255,255,255,255);
+                if (PyGenius::lookup((uintptr_t)hb, 0.f, 0.f, gi)){
+                    if (gi.support_trait != 0){
+                        PyGenius::trait_line_text(gi, PyGenius::trait_name(gi.support_trait), tl, sizeof(tl));
+                        if (PyGenius::cd_ready(gi)) cc = color_green;
+                    }
+                    PyGenius::GeniusLine seg;
+                    PyGenius::genius_segments(gi, seg);
+                    snprintf(gl, sizeof(gl), "%s%s%s", seg.pre, seg.flywheel, seg.post);
+                }
+                if (!name[0] && !tl[0] && !gl[0]) continue;
+                const char *parts[3] = {name, tl, gl};
+                ImColor cols[3] = {color_red, cc, ImColor(255,200,0,255)};
+                float gap = sz * 0.5f, w = 0.f;
+                for (int k = 0; k < 3; k++) if (parts[k][0]) w += fi_calc(sz, parts[k]).x + gap;
+                float x = fi_hunter_x > 0.f ? fi_hunter_x : px - (w - gap)/2.0f;
+                for (int k = 0; k < 3; k++){
+                    if (!parts[k][0]) continue;
+                    fi_text(Draw, x, y, sz, cols[k], parts[k]);
+                    x += fi_calc(sz, parts[k]).x + gap;
+                }
+                y += line_h;
+                continue;
+            }
             if (PyGenius::lookup((uintptr_t)hb, 0.f, 0.f, gi)){
-                float sz = fi_hunter_size, line_h = sz + 6.0f, y = fi_hunter_y;
                 if (gi.support_trait != 0){
                     char tl[48];
                     PyGenius::trait_line_text(gi, PyGenius::trait_name(gi.support_trait), tl, sizeof(tl));
@@ -1432,12 +1509,13 @@ void Draw_Main(ImDrawList *Draw){
                     ImVec2 ts = fi_calc(sz, gl);
                     float x = fi_hunter_x > 0.f ? fi_hunter_x : px - ts.x/2.0f;
                     fi_text(Draw, x, y, sz, ImColor(255,200,0,255), gl);
+                    y += line_h;
                 }
             }
         }
     }
 
-    // C. 求生者天赋(右上横排)。按绝处逢生三态着色(没带=白/带了没用=绿/已用=灰)。
+    // C. 求生者天赋(右上横排)。联合狩猎(场上 2 个监管)不画(用户 2026-10-25：8 个求生者排不下，不重要)。按绝处逢生三态着色(没带=白/带了没用=绿/已用=灰)。
     //    ★ 带锁存：求生者死亡/逃离后从 data[] 消失，若直接不画会让横排左移、对齐乱。
     //    所以按 obj 固定槽位，读到就更新，消失的槽位保留上次文本 —— 一局内槽位数只增不减。
     static uint64_t fic_obj[4] = {0, 0, 0, 0};
@@ -1450,7 +1528,7 @@ void Draw_Main(ImDrawList *Draw){
         if (on_now && !fic_prev_on) { fic_n = 0; for (int k = 0; k < 4; k++) { fic_obj[k] = 0; fic_txt[k][0] = 0; } }
         fic_prev_on = on_now;
     }
-    if (fi_civ_on && PyScene::in_battle() && PySelf::camp() == 1){   // 我是监管才看求生者天赋
+    if (fi_civ_on && PyScene::in_battle() && PySelf::camp() == 1 && PySelf::butcher_count() < 2){   // 我是监管才看求生者天赋
         for (int i = 0; i < data_count; i++){
             if (data[i].camp != 2) continue;
             if (PySelf::body_set_ready() && !PySelf::is_body(data[i].obj)) continue;
@@ -1637,7 +1715,6 @@ void Draw_Main(ImDrawList *Draw){
     // ---- 原生骨骼(抄若辰 sob_3A6074/39F0CC 偏移链,驱动读,零注入;见 NativeBones.h) ----
     if (show_draw_Bones && PySelf::available() && !PySelf::is_joseph_match()) {   // 约瑟夫局永远不画骨骼(用户要求,无视开关)
         uint64_t self_m = 0; PySelf::anchor(self_m);
-        uint64_t hunter_m = 0; bool has_hunter = PySelf::hunter_body(hunter_m);
         uint64_t Ms[32];
         int bn = PySelf::copy_bodies(Ms, 32);
         bool hunter_view = (PySelf::camp() == 1);   // 监管视角：被自己扛气球的求生者不画骨骼(同方框过滤)
@@ -1668,10 +1745,10 @@ void Draw_Main(ImDrawList *Draw){
                 float sy = py - (matrix[1]*ox + matrix[5]*oy + matrix[9]*oz + matrix[13]) / cam * py;
                 bp[t] = ImVec2(sx, sy); bok[t] = true;
             }
-            // 监管红、求生者绿(监管本体 = PySelf::hunter_body)。约瑟夫镜世界里"另一个世界"的人画白色
+            // 监管红、求生者绿(监管本体 = PySelf::butcher_bodies，联合狩猎两个)。约瑟夫镜世界里"另一个世界"的人画白色
             ImU32 bcol;
             if (PySelf::is_other_world(Ms[u]))      bcol = (ImU32)BotBoneColor;
-            else if (has_hunter && Ms[u] == hunter_m) bcol = (ImU32)ImColor(255, 60, 60, 230);
+            else if (PySelf::is_butcher_body(Ms[u]))  bcol = (ImU32)ImColor(255, 60, 60, 230);   // 联合狩猎两个监管都红
             else                                      bcol = (ImU32)ImColor(40, 255, 90, 230);
             for (int e = 0; e < NativeBones::NUM_EDGE; e++) {
                 int a = NativeBones::EDGES[e][0], b = NativeBones::EDGES[e][1];
@@ -1756,7 +1833,8 @@ void Draw_Main(ImDrawList *Draw){
 		// 本体是监管时，游戏自己就会显示监管者个体，这里不再重复画任何监管者。
 		// 只认 CPython 锚点给的阵营：兜底的相机深度启发式可能把求生者误判成监管，
 		// 那样会让求生者视角下的监管整个消失，代价远大于多画一个。
-		if (has_auth_self && self_camp == 1 && data[i].camp == 1) continue;
+		// 联合狩猎(2026-10-25)：队友监管照画，只跳过我自己和我这边的其它监管阵营对象
+		if (has_auth_self && self_camp == 1 && data[i].camp == 1 && !PySelf::is_teammate_butcher(data[i].obj)) continue;
 		// 本体是监管时，被自己扛在气球上的求生者会糊在自己身上(模型挂在气球挂点)，游戏自己也会显示，
 		// 这里不重复画。判据 b_catch(= 监管 carry_uid 指向的人)在 PySelf 里收集，只在监管视角过滤。
 		if (has_auth_self && self_camp == 1 && data[i].camp == 2 && PySelf::is_carried(data[i].obj)) continue;
@@ -2287,6 +2365,14 @@ void VolumeKeyHide() {
 }
 
 void Layout_tick_UI(bool *main_thread_flag) {
+    // 启动后第一帧：先记默认值，再读 /data 下的配置(要在 ImGui 上下文建好之后，cfg_set_msg 用到 GetTime)
+    static bool cfg_autoloaded = false;
+    if (!cfg_autoloaded) {
+        cfg_autoloaded = true;
+        config_snapshot_defaults();
+        config_load(true);
+    }
+
     static bool volume_thread_started = false;
     if (!volume_thread_started) {
         std::thread(VolumeKeyHide).detach();
@@ -2352,7 +2438,7 @@ void Layout_tick_UI(bool *main_thread_flag) {
         ImGui::SliderFloat(T("透明度###panel_alpha", "Opacity###panel_alpha"), &panel_alpha, 0.10f, 1.0f, "%.2f");
         if (ImGui::Button(T("保存配置###cfg_save", "Save Config###cfg_save"))) config_save();
         ImGui::SameLine();
-        if (ImGui::Button(T("读取配置###cfg_load", "Load Config###cfg_load"))) config_load();
+        if (ImGui::Button(T("恢复默认配置###cfg_reset", "Reset to Defaults###cfg_reset"))) config_restore_defaults();
         if (cfg_msg[0] && ImGui::GetTime() - cfg_msg_time < 4.0)   // 结果提示停留 4 秒
             ImGui::TextColored(strstr(cfg_msg, "失败") || strstr(cfg_msg, "failed") ? ImVec4(1, 0.35f, 0.35f, 1) : ImVec4(0.4f, 1, 0.4f, 1), "%s", cfg_msg);
         ImGui::EndChild();
@@ -2399,7 +2485,9 @@ void Layout_tick_UI(bool *main_thread_flag) {
             ImGui::SameLine();
             ImGui::Checkbox(T("显示方框", "Show Box"), &show_draw_Rect);
 
-            ImGui::Checkbox(T("监管天赋树", "Hunter Talent Tree"), &show_genius_tree);   // 径向图，独立可拖动窗口(单独一行)
+            ImGui::Checkbox(T("显示射线", "Show Lines"), &show_draw_Line);   // 默认开(变量初值 true)
+            ImGui::SameLine();
+            ImGui::Checkbox(T("监管天赋树", "Hunter Talent Tree"), &show_genius_tree);   // 径向图，独立可拖动窗口
         }
 
         // 固定信息(屏幕 HUD 汇总)：每块独立开关 + 独立 X/Y/大小。调好位置后把初值固化即可
@@ -2536,9 +2624,23 @@ void Layout_tick_UI(bool *main_thread_flag) {
         cfg_tree_x = ImGui::GetWindowPos().x;  cfg_tree_y = ImGui::GetWindowPos().y;    // 保存配置时用
         cfg_tree_w = ImGui::GetWindowSize().x; cfg_tree_h = ImGui::GetWindowSize().y;
         if (tree_open) {
-            uint64_t hb = 0; PyGenius::Info gi;
-            bool ok = PyScene::in_battle() && PySelf::hunter_body(hb)
-                      && PyGenius::lookup((uintptr_t)hb, 0.f, 0.f, gi);
+            // 联合狩猎两个监管：每个监管一页(标签名 = 监管名)，选中哪页画哪个(2026-10-25)
+            uint64_t hbs[PySelf::MAX_HUNTERS];
+            int hn = PyScene::in_battle() ? PySelf::butcher_bodies(hbs, PySelf::MAX_HUNTERS) : 0;
+            static int tree_page = 0;
+            if (hn >= 2 && ImGui::BeginTabBar("##gtree_tabs")) {
+                for (int hi = 0; hi < hn; hi++) {
+                    const char *name = "";
+                    for (int i = 0; i < data_count; i++) if (data[i].obj == hbs[hi]) { name = data[i].str; break; }
+                    char tab[64];
+                    snprintf(tab, sizeof(tab), "%s###gtree_tab%d", name[0] ? name : T("监管", "Hunter"), hi);
+                    if (ImGui::BeginTabItem(tab)) { tree_page = hi; ImGui::EndTabItem(); }
+                }
+                ImGui::EndTabBar();
+            }
+            if (tree_page >= hn) tree_page = 0;
+            uint64_t hb = hn > 0 ? hbs[tree_page] : 0; PyGenius::Info gi;
+            bool ok = hb != 0 && PyGenius::lookup((uintptr_t)hb, 0.f, 0.f, gi);
             if (ok) {
                 int cnt = 0, term = 0, pts = 0;
                 for (int id = 1; id <= 40; id++) {

@@ -99,6 +99,7 @@ static const int COPYCAT_DIRECTOR_PUPPET = 1211;  // CopycatDirectorPuppetUnit =
 static const int COPYCAT_GHOUL_TYPE = 1203;       // CopycatGhoulUnit = 食人鬼(会杀人的地图生物,没身份)
 static const int MAX_COPYCAT = 16;
 static const int MAX_CARRIED = 8;   // 同时被扛在气球上的求生者上限(实际最多 4)
+static const int MAX_HUNTERS = 4;   // 监管本体上限(联合狩猎 2 个)
 // 走"号码+身份"身份簿的玩家类型键。导演局其他玩家是 1210(不在 1088、identity_id 直读为 None,要走
 // combat_unit.components 遍历找身份组件,照若辰,见 read_identity);1211 是自身,靠 self 过滤掉。
 static const int COPYCAT_PLAYER_TYPES[] = {COPYCAT_PLAYER_TYPE, COPYCAT_DIRECTOR_CLONE, COPYCAT_DIRECTOR_PUPPET};
@@ -129,6 +130,21 @@ struct Snapshot {
     // 自己身上的那个求生者框(2026-10-19)。实测 = 监管 carry_uid 指向的那个人，两者一致
     uint64_t carried[MAX_CARRIED];
     int      carried_count;
+    // 自动盖板要判的目标(2026-10-24)：[1] 里全部监管本体(跳过巡视者/镜像，联合狩猎有两个)，
+    // 梦之女巫换成她正在操控的那个信徒(见 collect_units)。hunter_body 仍只是第一个(预知用)
+    uint64_t hunters[MAX_HUNTERS];
+    bool     hunter_in_photo[MAX_HUNTERS]; // 与 hunters[] 对齐：在不在约瑟夫镜世界(uid ∈ PhotoUnit._players)
+    bool     hunter_armor[MAX_HUNTERS];    // 与 hunters[] 对齐：super_armor(霸体，游戏 is_butcher_can_hit 直接不判)
+    int      hunter_count;
+    // 显示用的监管本体：[1] 里全部非巡视者非镜像(含女巫本体，不含信徒)。联合狩猎 2 个(2026-10-25)。
+    // 固定信息/骨骼颜色/预知按它画；hunter_body 是其中第一个
+    uint64_t butchers[MAX_HUNTERS];
+    int      butcher_count;
+    // butchers 里"我自己"的那个本体：= 锚点；我是女巫在操控信徒时锚点是信徒，靠她的操控 uid == 我的 uid 认出来。
+    // 联合狩猎里我当监管，除了它以外的 butchers 就是队友(is_teammate_butcher)。0 = 不是监管/没认出来
+    uint64_t self_butcher;
+    int64_t  yidhra_ops[MAX_HUNTERS];      // 梦之女巫当前操控的单位 uid(_current_yidhra_puppet_uid)
+    int      yidhra_op_count;
 };
 
 // 双缓冲发布：写线程填非活跃缓冲，填完再翻转，绘制线程永远读到完整的一份
@@ -168,6 +184,8 @@ static std::atomic<bool> g_photo_present{false};        // 场上存在 PhotoUni
 static int64_t           g_photo_players[16];           // 当前在镜世界里的玩家 uid
 static int               g_photo_players_n = 0;
 static int64_t           g_i_body_uid = -1;             // 收本体时读 unit.uid 的序号缓存(判它在不在镜世界)
+static int64_t g_i_yidhra = -1, g_i_puppet_uid = -1;    // 监管的 _current_yidhra_puppet_uid / 信徒的 uid
+static int64_t g_i_armor = -1, g_i_puppet_armor = -1;   // 监管 / 信徒的 super_armor(两个类字典不同，分开缓存)
 // 模仿者模式只有两个类(CopycatPlayerUnit / GhostCopycatPlayerUnit)，各用一组序号缓存就够
 static int64_t g_cc_i_model = -1, g_cc_i_another = -1, g_cc_i_ident = -1, g_cc_i_index = -1, g_cc_i_uq = -1;
 static int64_t g_cc_i_combat = -1;                      // unit.combat_unit 的序号(导演局走组件读身份用)
@@ -306,10 +324,29 @@ static inline void add_body(Snapshot &res, uint64_t sp, bool mirror, bool in_pho
     }
 }
 
+static inline void add_hunter(Snapshot &res, uint64_t sp, bool in_photo, bool armor)
+{
+    for (int j = 0; j < res.hunter_count; j++) if (res.hunters[j] == sp) return;
+    if (res.hunter_count < MAX_HUNTERS) {
+        res.hunter_in_photo[res.hunter_count] = in_photo;
+        res.hunter_armor[res.hunter_count] = armor;
+        res.hunters[res.hunter_count++] = sp;
+    }
+}
+
+// super_armor == True。客户端 iCommonPlayer.set_super_armor / broken_wheel_super_armor 直接写这个属性：
+// 兴奋、破轮轮形态、台球手球形态(BilliardComponent.billiard_change_model)都会置 True。属性不在/读不到按 False
+static inline bool read_armor(uint64_t d, const Dict &dk, int64_t &idx)
+{
+    idx = resolve_index(d, dk, idx, "super_armor");
+    return idx >= 0 && getPtr64(value_slot(dk, idx)) == PyRoot::g_true;
+}
+
 // 扫一类单位：
 //   another_model -> 废弃模型黑名单
 //   model         -> 本体集合(幻灯师分身 is_civilian_puppet==True 不收)
 //   [1] 里第一个类名不含 Puppet 的 -> 监管本体(预知监管用)
+//   [1] 全部监管 + 被操控的梦之信徒 -> 自动盖板目标(hunters)
 static void collect_units(uint64_t ubt, int type, Snapshot &res)
 {
     uint64_t lst = get_type_list(ubt, type);
@@ -370,8 +407,29 @@ static void collect_units(uint64_t ubt, int type, Snapshot &res)
         // 不在本体集合里 → 绘制侧方框/名字/距离/骨骼自然全不画。拍照后才收，按 body_mirror 画成白色。
         if (!(is_mirror && !g_photo_active.load())) add_body(res, body, is_mirror, unit_in_photo);
         // 监管本体(预知监管)只认真身约瑟夫，镜像监管(若有)不当本体
-        if (type == 1 && res.hunter_body == 0 && !is_mirror && !(slot ? slot->is_puppet : class_name_has_puppet(cls)))
-            res.hunter_body = body;
+        if (type == 1 && !is_mirror && !(slot ? slot->is_puppet : class_name_has_puppet(cls))) {
+            if (res.hunter_body == 0) res.hunter_body = body;
+            add_unique(res.butchers, res.butcher_count, MAX_HUNTERS, body);
+            if (body == res.anchor) res.self_butcher = body;
+            // 梦之女巫：_current_yidhra_puppet_uid 有值(操控自己时 = 自己的 uid)。游戏 is_butcher_can_hit 里
+            // not bt.is_yidhra() 让本体永远砸不中，所以本体不进盖板目标，只记下她正在操控谁
+            g_i_yidhra = resolve_index(d, dk, g_i_yidhra, "_current_yidhra_puppet_uid");
+            int64_t op = 0;
+            if (g_i_yidhra >= 0 && read_int(getPtr64(value_slot(dk, g_i_yidhra)), op)) {
+                if (res.yidhra_op_count < MAX_HUNTERS) res.yidhra_ops[res.yidhra_op_count++] = op;
+                if (res.uid != 0 && op == res.uid) res.self_butcher = body;   // 我是这个女巫(正在操控我的锚点)
+            } else {
+                add_hunter(res, body, unit_in_photo, read_armor(d, dk, g_i_armor));
+            }
+        }
+        // 梦之信徒：活着的游戏都能砸，但只收正在被操控的那个(追人的就是它)。[236] 在 [1] 之后扫，op 已就绪
+        if (type == 236 && !is_mirror && res.yidhra_op_count > 0) {
+            g_i_puppet_uid = resolve_index(d, dk, g_i_puppet_uid, "uid");
+            int64_t uid = 0;
+            if (g_i_puppet_uid >= 0 && read_int(getPtr64(value_slot(dk, g_i_puppet_uid)), uid))
+                for (int p = 0; p < res.yidhra_op_count; p++)
+                    if (res.yidhra_ops[p] == uid) { add_hunter(res, body, unit_in_photo, read_armor(d, dk, g_i_puppet_armor)); break; }
+        }
 
         // 求生者被监管扛在气球上：b_catch==True(实测 = 监管 carry_uid 指向的那个人)。
         // 收它的场景对象，监管视角据此过滤。只有 CivilianUnit([2]) 有这个属性，别的类 resolve 返回 -1
@@ -983,6 +1041,46 @@ static bool hunter_body(uint64_t &obj)
     if (v == 0) return false;
     obj = v;
     return true;
+}
+
+// 自动盖板目标的场景对象：全部监管(联合狩猎 2 个)，梦之女巫换成被操控的信徒，
+// 只返回跟我在同一个世界的(约瑟夫镜世界：游戏 check_in_same_world 不过就不判)。返回个数，准备阶段为 0
+struct HunterTarget { uint64_t obj; bool armor; };
+static int hunter_targets(HunterTarget *out, int cap)
+{
+    if (!g_available) return 0;
+    const Snapshot &s = g_buf[g_active];
+    int n = 0;
+    for (int i = 0; i < s.hunter_count && n < cap; i++)
+        if (s.hunter_in_photo[i] == s.in_mirror) out[n++] = {s.hunters[i], s.hunter_armor[i]};
+    return n;
+}
+
+// 显示用的监管本体(联合狩猎 2 个；女巫只有本体)。返回个数
+static int butcher_bodies(uint64_t *out, int cap)
+{
+    if (!g_available) return 0;
+    const Snapshot &s = g_buf[g_active];
+    int n = s.butcher_count < cap ? s.butcher_count : cap;
+    for (int i = 0; i < n; i++) out[i] = s.butchers[i];
+    return n;
+}
+static inline int butcher_count() { return g_available ? g_buf[g_active].butcher_count : 0; }
+// 联合狩猎的队友监管：显示用本体里不是我自己的那个(我是女巫时，正在操控信徒的本体也算我自己)
+static bool is_teammate_butcher(uintptr_t obj)
+{
+    if (!g_available || obj == 0) return false;
+    const Snapshot &s = g_buf[g_active];
+    if ((uint64_t)obj == s.self_butcher || (uint64_t)obj == s.anchor) return false;
+    for (int i = 0; i < s.butcher_count; i++) if (s.butchers[i] == (uint64_t)obj) return true;
+    return false;
+}
+static bool is_butcher_body(uintptr_t obj)
+{
+    if (!g_available || obj == 0) return false;
+    const Snapshot &s = g_buf[g_active];
+    for (int i = 0; i < s.butcher_count; i++) if (s.butchers[i] == (uint64_t)obj) return true;
+    return false;
 }
 
 // ---- 模仿者模式 ----

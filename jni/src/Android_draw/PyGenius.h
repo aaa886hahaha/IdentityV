@@ -130,7 +130,7 @@ struct Entry {
 static Entry g_buf[2][MAX_UNITS];
 static volatile int g_count[2] = {0, 0};
 // 花名册(见 read_roster())跟着同一次翻转发布。局外没有单位，g_count 会是 0，但花名册仍有内容
-static const int MAX_ROSTER = 8;
+static const int MAX_ROSTER = 12;   // 联合狩猎 2 + 8 = 10 人(2026-10-25 从 8 扩)
 struct RosterEntry {
     char     uid[24];      // 真人的账号 id 字符串；人机为空串
     int64_t  eid;          // 人机的 eid(int)；真人是 ObjectId，读不成 int 时为 -1
@@ -616,7 +616,9 @@ static bool eid_key_string(uint64_t eid_obj, char *out, size_t cap)
 //   - 还缓存 final_genius_dict 里匹配到的键对象指针，下一轮先比指针，连键字符串都不用读
 //   - 某轮读不到就沿用上一次读到的天赋，不清空(读到了就覆盖，包括读到空列表 —— 对面换天赋途中会短暂是 [])
 struct SeatCache { int seat; char key[32]; uint64_t key_obj; uint32_t bits; };
-static SeatCache g_seat[4];
+// 联合狩猎 8 个求生者(2026-10-25 从 4 扩到 8，座位号 1~8，用户上机确认)
+static const int MAX_SEAT = 8;
+static SeatCache g_seat[MAX_SEAT];
 static int g_seat_n = 0;
 static uint64_t g_seat_panel = 0;      // 建缓存时的 UIRoomWait 实例
 static uint64_t g_seat_src = 0;        // 建缓存时的 uid2pos dict；全部座位都建成功才记下，否则下一轮继续补
@@ -624,7 +626,7 @@ static uint64_t g_seat_src = 0;        // 建缓存时的 uid2pos dict；全部�
 static SeatCache *seat_slot(int seat)
 {
     for (int i = 0; i < g_seat_n; i++) if (g_seat[i].seat == seat) return &g_seat[i];
-    if (g_seat_n >= 4) return nullptr;
+    if (g_seat_n >= MAX_SEAT) return nullptr;
     SeatCache &c = g_seat[g_seat_n++];
     memset(&c, 0, sizeof(c));
     c.seat = seat;
@@ -672,7 +674,7 @@ static void read_civilian_skill_rows()
             uint64_t kp = getPtr64(key_slot(sk, i));
             if (kp == 0) continue;                                   // 已删除的条目
             want++;
-            if (!read_int(getPtr64(value_slot(sk, i)), v) || v < 1 || v > 4) continue;
+            if (!read_int(getPtr64(value_slot(sk, i)), v) || v < 1 || v > MAX_SEAT) continue;
             char key[32];
             if (!eid_key_string(kp, key, sizeof(key))) continue;
             SeatCache *c = seat_slot((int)v);
