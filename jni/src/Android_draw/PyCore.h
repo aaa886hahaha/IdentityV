@@ -347,6 +347,49 @@ inline Phase detect_phase(const char *&reason)
     return PHASE_UNKNOWN;
 }
 
+// ---- 准备房间里的监管人数：ui_dict['UIRoomWait'].b_uid2pid 的条目数(监管 uid -> pid，见 SKILL「区分三个阶段」) ----
+// 联合狩猎 2、普通局 1。pids 带回 pid(最多 2 个，读不到的为 -1)，准备阶段预知按它查表。读线程独占调用(thread_local 缓存)
+inline bool read_room_hunter_count(int &out, const char *&why, int *pids = nullptr)
+{
+    if (pids) pids[0] = pids[1] = -1;
+    static thread_local int64_t h_uimgr = -1, h_uidict = -1, h_room = -1, h_b = -1;
+    out = -1;
+    uint64_t md = game_kernel_dict(why);
+    if (!md) return false;
+    int64_t iu = find_key(md, "g_ui_mgr", h_uimgr);
+    if (iu < 0) { why = "no g_ui_mgr"; return false; }
+    h_uimgr = iu;
+    uint64_t ud = get_inst_dict(get_attr(md, iu));
+    if (!ud) { why = "g_ui_mgr dict"; return false; }
+    int64_t id = find_key(ud, "ui_dict", h_uidict);
+    if (id < 0) { why = "no ui_dict"; return false; }
+    h_uidict = id;
+    uint64_t uidict = get_attr(ud, id);
+    int64_t ir = find_key(uidict, "UIRoomWait", h_room);
+    if (ir < 0) { why = "no UIRoomWait"; return false; }
+    h_room = ir;
+    uint64_t rd = get_inst_dict(get_attr(uidict, ir));
+    if (!rd) { why = "UIRoomWait dict"; return false; }
+    int64_t ib = find_key(rd, "b_uid2pid", h_b);
+    if (ib < 0) { why = "no b_uid2pid"; return false; }
+    h_b = ib;
+    uint64_t bd = get_attr(rd, ib);
+    if (!is_obj(bd) || getPtr64(bd + 8) != PyRoot::g_dict_type) { why = "b_uid2pid not dict"; return false; }
+    Dict k;
+    if (!read_dict(bd, k)) { why = "b_uid2pid read"; return false; }
+    int n = 0;
+    for (int64_t i = 0; i < k.n_entries; i++) {
+        if (getPtr64(key_slot(k, i)) == 0) continue;           // 键为空 = 已删除的条目
+        int64_t pid = -1;
+        if (pids && n < 2 && read_int(getPtr64(value_slot(k, i)), pid)) pids[n] = (int)pid;
+        n++;
+    }
+    if (n < 1 || n > 2) { why = "b_uid2pid count"; return false; }   // 监管最多 2 个；别的数说明语义不对，退回不裁
+    out = n;
+    why = "";
+    return true;
+}
+
 // ---- 主交互按钮：游戏自己算的"现在这个按钮会做什么、对谁做"(2026-10-23 静态分析，未上机) ----
 // UIBattleButton 是 UIBattleBase 的父类(混入)，所以属性直接挂在 ui_dict['UIBattle'] 实例上：
 //   cbtn_alpha_st  CIV_HAND_ALPHA_STATE。2026-10-23 国际服上机日志实测：**3 = PUT_PANEL(放板)、4 = SPAN_PANEL(翻板，放下后立刻变 4)、

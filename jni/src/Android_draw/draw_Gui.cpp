@@ -322,6 +322,7 @@ char objtext[256];
 char Team[1024];
 char Name[1024];
 char prophet_text[1024];
+int g_room_hunter_n = -1;   // 准备房间里的监管人数(UIRoomWait.b_uid2pid 条目数)，-1 = 不在准备阶段/读不到。面板显示用
 
 // 预知文本里追加一个监管名(已经有了就不加)。联合狩猎两个监管时拼成 "[杰克] [小丑]"
 static void prophet_append(char *buf, size_t cap, const char *name)
@@ -800,6 +801,22 @@ void read_thread(long int PD1,long int PD2,long int PD3)
         // 自动盖板用的板子(类名含 woodplane)。getscene() 不认板子、它们进不了 data[]，所以单独收
         uint64_t boards_local[AutoPallet::MAX_BOARDS];
         int boards_n = 0;
+        // 准备阶段的预知直接读房间里的监管 pid(ui_dict['UIRoomWait'].b_uid2pid)查表，不看场景模型(2026-10-26 反编译)：
+        // 联合狩猎匹配局里我是求生者时，UIRoomWait._get_butcher_pos_id 把两个监管都分到座位 -1，
+        // 后进房的那个 update_role 会 destroy_model 掉前一个 —— 场景里永远只剩一个对方监管的模型，按类名怎么猜都只有一个。
+        // b_uid2pid 是 _show_butcher 在建模型之前给每个监管写的，模型就是用这个 pid 建的。
+        // 读不到(或有 pid 读失败)时退回按场景类名拼名字。大厅残留的监管模型也因此不用再单独过滤
+        const bool phase_lobby = PyScene::in_lobby();
+        int room_hunters = -1;
+        int room_pids[2] = {-1, -1};
+        if (!phase_lobby && PyScene::in_prepare() && PyRoot::g_ready.load()) {
+            const char *why = "";
+            PyCore::read_room_hunter_count(room_hunters, why, room_pids);
+        }
+        g_room_hunter_n = room_hunters;
+        bool room_pid_ok = room_hunters > 0;
+        for (int k = 0; k < room_hunters && k < 2; k++) if (room_pids[k] < 0) room_pid_ok = false;
+        std::string scene_last_hunter;   // room_pid_ok 时场景里最后一个监管的名字，pid 查不到表时兜底用
         for (int ii = 0; ii < Count && entity_count < 1000; ii++){
             cur_obj = getPtr64(curArray+0x8 * ii);	// 遍历数量次数            
                 
@@ -831,7 +848,10 @@ void read_thread(long int PD1,long int PD2,long int PD3)
     	        if (len >= 256 || len == 0 || len < 0)
     	            continue;
     	        filter_class_name.resize(len);
-    	        vm_readv(getPtr64(class_name_obj + 0x8), &filter_class_name[0], len);
+    	        // 内容读不到时 resize 后的缓冲里留着上一个对象类名的前半截，不能当类名、更不能进缓存
+    	        // (缓存只靠第一跳校验，写错一次就错一整局)。跳过本轮，下一轮再读
+    	        if (!vm_readv(getPtr64(class_name_obj + 0x8), &filter_class_name[0], len))
+    	            continue;
     	        // 跨局会不断有新对象，攒太多就整体清一次，下一轮重建(只是多花一轮的读取)
     	        // 每条约 180 字节(map 节点 + 类名字符串)：对局中约 300 条≈50KB，1500 条≈250KB
     	        if (g_name_cache.size() > 1500) g_name_cache.clear();
@@ -863,7 +883,8 @@ void read_thread(long int PD1,long int PD2,long int PD3)
         	//预知监管者
             // 局内：CPython 侧有监管单位，直接取它 unit.model 对应的场景对象的类名。
             //   这样另一形态(无常黑白)、约瑟夫相机、大厅残留都不会顶掉真监管。
-            // 准备阶段/大厅：units_by_type 里还没有监管单位(实测)，退回下面按类名匹配的老逻辑。
+            // 准备阶段：读得到房间监管 pid 就不看场景(见本轮开头 room_pid_ok)，本轮末尾按 pid 填。
+            // 大厅/准备阶段读不到 pid：units_by_type 里还没有监管单位(实测)，退回下面按类名匹配的老逻辑。
             //   ⚠ 准备阶段不能用 +0x73(visible) 过滤：打求生者时真监管的模型在准备界面是不可见的(实测)
             // 联合狩猎有两个监管(2026-10-25)：两个名字都拼进预知(去重)，见 prophet_append
             uint64_t real_hunter = 0;
@@ -874,7 +895,8 @@ void read_thread(long int PD1,long int PD2,long int PD3)
             else if (show_draw_prophet){//预知开始
                 if (strstr(filter_class_name.c_str(), "burke_console") == NULL&&strstr(filter_class_name.c_str(), "h55_joseph_camera") == NULL&&strstr(filter_class_name.c_str(), "redqueen_e_heijin_yizi") == NULL&&strstr(filter_class_name.c_str(), "_lod") == NULL){
                     if (strstr(filter_class_name.c_str(), "boss") != NULL){
-                        prophet_append(prophet_local, sizeof(prophet_local), getboss_prophet(filter_class_name.c_str()));
+                        if (room_pid_ok) scene_last_hunter = getboss_prophet(filter_class_name.c_str());   // 名字可能就是 filter_class_name 本身，必须拷贝
+                        else prophet_append(prophet_local, sizeof(prophet_local), getboss_prophet(filter_class_name.c_str()));
                     }
                 }
             }//预知结束
@@ -974,6 +996,28 @@ void read_thread(long int PD1,long int PD2,long int PD3)
         redqueen_mirror_obj = rq_mirror_local;
         mirror_obj          = mirror_local;
         mirror_preview_obj  = mirror_preview_local;
+        if (show_draw_prophet && room_pid_ok) {
+            int unknown_pids[2], n_unknown = 0;
+            for (int k = 0; k < room_hunters && k < 2; k++) {
+                const char *nm = getboss_by_pid(room_pids[k]);
+                if (nm) prophet_append(prophet_local, sizeof(prophet_local), nm);
+                else unknown_pids[n_unknown++] = room_pids[k];
+            }
+            // 表里没有的 pid(配表之后新出的监管)退回旧逻辑：准备阶段场景里最后一个监管模型。
+            // 大厅名单之前一直是这样单个覆盖，实测胜出的是准备房里的监管、不会报大厅残留(Name.h 也没有时显示原始类名)。
+            // 场景也给不出新名字时显示 pid，方便补表
+            if (n_unknown > 0) {
+                size_t before = strlen(prophet_local);
+                if (!scene_last_hunter.empty()) prophet_append(prophet_local, sizeof(prophet_local), scene_last_hunter.c_str());
+                if (strlen(prophet_local) == before) {
+                    for (int k = 0; k < n_unknown; k++) {
+                        char unknown[32];
+                        snprintf(unknown, sizeof(unknown), g_english ? "[pid %d]" : "[监管pid%d]", unknown_pids[k]);
+                        prophet_append(prophet_local, sizeof(prophet_local), unknown);
+                    }
+                }
+            }
+        }
         if (prophet_local[0]) memcpy(prophet_text, prophet_local, sizeof(prophet_text));
         AutoPallet::publish_boards(boards_local, boards_n);
         data_count = entity_count;
@@ -1156,6 +1200,7 @@ static const char *waterfight_name(int identity)
 
 void Draw_Main(ImDrawList *Draw){
     PySelf::set_copycat_book(copycat_mode);        // 身份簿只在开关打开时记，见 PySelf.h
+    PyWaterFight::set_enabled(waterfight_mode);    // 林中童话关着时它的线程不读内存，见 PyWaterFight.h
     if (libbase == 0 || read_state == 0) return;  // 数据未就绪，跳过本帧绘制
     int char_count = 0;
 
@@ -1419,7 +1464,8 @@ void Draw_Main(ImDrawList *Draw){
         float x = fi_gen_x, y = fi_gen_y, sz = fi_gen_size;
         float bar_w = sz * 7.0f, bar_h = sz * 0.8f, gap = sz * 0.4f, line_h = sz + 6.0f;
         int decoded = PyProgress::decoded_count();
-        if (decoded < 5){
+        const int need = PySelf::butcher_count() >= 2 ? 7 : 5;   // 联合狩猎(两个监管)要修 7 台(用户确认)，普通局 5 台
+        if (decoded < need){
             int gn = PyProgress::gen_total();
             for (int i = 0; i < gn; i++){
                 float p = 0.f;
@@ -2002,6 +2048,7 @@ void Draw_Main(ImDrawList *Draw){
             // 这里原本读一次 +0xaa(zy)，唯一用到它的是下面那段已停用的相机深度启发式，已删。
             if (!ShouldSkipEntity(data[i])){
                 if (show_draw_Role&&strstr(data[i].class_name, "chr") != NULL){
+                    sprintf(objtext, "%lx", data[i].obj);   // objtext 原来只在调试分支里写，这里会显示别的对象的地址
                     std::string test;
                     test += " [";
                     test += std::to_string((int) dist);
@@ -2452,7 +2499,7 @@ void Layout_tick_UI(bool *main_thread_flag) {
             ImTextT("矩阵偏移:%lx", "Matrix off:%lx", MatrixOffset);
             ImTextT("模块页数:%d", "Pages:%d", c);
             ImTextT("数组偏移:%lx", "Array off:%lx", ArrayaddrOffset);
-            ImTextT("监管者:%s", "Hunter:%s", prophet_text);
+            ImTextT("监管者:%s (房间监管%d)", "Hunter:%s (room hunters %d)", prophet_text, g_room_hunter_n);
             ImTextT("Py根:%s", "PyRoot:%s", PyRoot::status_text());
             ImTextT("密码机进度:%s (已破译%d)", "Ciphers:%s (decoded %d)", PyProgress::status_text(), PyProgress::decoded_count());
             ImTextT("天赋:%s", "Talents:%s", PyGenius::status_text());

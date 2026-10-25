@@ -675,9 +675,13 @@ namespace Touch {
             if (inject_has_tool_finger && inject_saw_tool_finger) put_ev(ev, k, EV_KEY, BTN_TOOL_FINGER, 0);
         }
         put_ev(ev, k, EV_SYN, SYN_REPORT, 0);
-        if (write(fd, ev, sizeof(input_event) * k) != (ssize_t) (sizeof(input_event) * k))
-            return INJECT_UP_FAILED;
-        return INJECT_OK;
+        // 按下已经写进去了，抬起写失败就会留下一根一直按着的手指(卡键)，所以多试几次
+        for (int attempt = 0; attempt < 5; attempt++) {
+            if (write(fd, ev, sizeof(input_event) * k) == (ssize_t) (sizeof(input_event) * k))
+                return INJECT_OK;
+            usleep(2000);
+        }
+        return INJECT_UP_FAILED;
     }
 
     Vector2 GetScale() {

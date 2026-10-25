@@ -48,7 +48,8 @@ struct Skeleton { float x[32], y[32], z[32]; bool ok[32]; bool valid; };
 
 static inline bool is_ptr(uint64_t p) { return p > 0x5000000000ULL && p < 0x8000000000ULL; }
 
-struct NameMap { int idx[32]; int max_idx; };
+// begin/end/check_*：命中缓存时的校验依据。只按 SKEL 地址查的话，换局后新骨架落在旧地址上会沿用旧映射、骨架画乱(用户复现过)
+struct NameMap { int idx[32]; int max_idx; uint64_t begin, end; int check_i; uint32_t check_id; };
 static std::unordered_map<uint64_t, NameMap> g_namecache;   // 键 = SKEL
 static std::atomic<int> g_swap_yz{-1};                      // -1 未定 / 0 不换 / 1 换
 static char g_log[256] = "(骨骼未启用)";
@@ -67,6 +68,7 @@ static bool build_namemap(uint64_t SKEL, NameMap &nm)
     if (count < 1 || count > 512) return false;
     for (int i = 0; i < NUM_TARGET; i++) nm.idx[i] = -1;
     nm.max_idx = -1;
+    nm.begin = begin; nm.end = end; nm.check_i = -1; nm.check_id = 0;
     char name[136];
     int found = 0;
     for (int i = 0; i < count && found < NUM_TARGET; i++) {
@@ -85,6 +87,7 @@ static bool build_namemap(uint64_t SKEL, NameMap &nm)
             if (nm.idx[t] < 0 && strcmp(name, TARGET[t]) == 0) {
                 nm.idx[t] = i;
                 if (i > nm.max_idx) nm.max_idx = i;
+                if (nm.check_i < 0) { nm.check_i = i; nm.check_id = id; }   // 第一根命中的骨骼当校验项
                 found++;
                 break;
             }
@@ -111,6 +114,15 @@ static bool read_unit(uint64_t M, bool is_self, Skeleton &out)
     for (int k = 0; k < 16; k++) if (!std::isfinite(wm[k])) return false;
 
     auto it = g_namecache.find(SKEL);
+    if (it != g_namecache.end()) {                                     // 命中也要核对：名字表首尾指针 + 校验项的名字 id(2 次读)
+        const NameMap &c = it->second;
+        uint64_t be[2] = {0, 0};
+        uint32_t cid = 0;
+        bool same = vm_readv(SKEL + 0x80, be, 16)
+                 && (be[0] & 0x00FFFFFFFFFFFFFFULL) == c.begin && (be[1] & 0x00FFFFFFFFFFFFFFULL) == c.end
+                 && c.check_i >= 0 && vm_readv(c.begin + (uint64_t)c.check_i * 16, &cid, 4) && cid == c.check_id;
+        if (!same) { g_namecache.erase(it); it = g_namecache.end(); }
+    }
     if (it == g_namecache.end()) {
         NameMap nm;
         if (!build_namemap(SKEL, nm)) { if (is_self) setlog("骨骼: 名字表建不起来(名字池偏移?)"); return false; }

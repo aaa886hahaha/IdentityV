@@ -68,6 +68,10 @@ static volatile bool g_available = false;      // 玩家读取状态(主)
 static volatile bool g_loot_avail = false;
 static volatile int  g_fail_streak = 0;
 static char g_status[96] = "";   // 空 = 未启动，见 status_text()
+// 绘制侧每帧同步「林中童话」开关(同 PySelf::set_copycat_book)。关着时线程不读游戏内存：
+// 原来普通对局里也每 16ms 扫一遍 units_by_type，实测白占约 1.2% 单核(2026-10-25)
+static std::atomic<bool> g_enabled{false};
+static inline void set_enabled(bool on) { g_enabled = on; }
 
 using PyCore::is_obj; using PyCore::Dict; using PyCore::read_dict;
 using PyCore::value_slot; using PyCore::find_key; using PyCore::get_attr;
@@ -214,6 +218,12 @@ static void thread_main()
 {
     int cycle = 0;
     while (true) {
+        if (!g_enabled.load()) {
+            g_available = false; g_loot_avail = false;
+            snprintf(g_status, sizeof(g_status), "%s", T("未开启", "off"));
+            usleep(100 * 1000);
+            continue;
+        }
         if (g_libbase && PyRoot::ensure()) {
             uint64_t ubt = get_ubt();
             if (ubt) {

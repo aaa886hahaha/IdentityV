@@ -229,6 +229,35 @@ static const char* getboss_prophet(const char* class_name) {
     return name;
 }
 
+// ==================== 准备阶段预知：监管 pid -> 名字 ====================
+// pid 来自 ui_dict['UIRoomWait'].b_uid2pid。表离线取自配表 pydata/player 里 class==1 的条目(player_tid 译名，2026-10-15 版脚本)，
+// 变体 pid(9/27/82/103/119/148/10007/10009/10017)跟本体同名。无常在准备阶段分不出黑白，统一叫宿伞之魂。
+// 查不到返回 nullptr(新出的监管，如心兽，那版配表里还没有)，调用方退回场景类名(draw_Gui.cpp read_thread 预知)
+struct PidName { int pid; const char *cn; const char *en; };
+static const PidName boss_pid_table[] = {
+    {1, "[厂长]", "[Hell Ember]"},        {27, "[厂长]", "[Hell Ember]"},
+    {2, "[小丑]", "[Smiley Face]"},       {9, "[小丑]", "[Smiley Face]"},     {10009, "[小丑]", "[Smiley Face]"},
+    {19, "[鹿头]", "[Gamekeeper]"},       {30, "[杰克]", "[The Ripper]"},     {60, "[蜘蛛]", "[Soul Weaver]"},
+    {63, "[红蝶]", "[Geisha]"},           {64, "[黄衣之主]", "[The Feaster]"}, {66, "[宿伞之魂]", "[Wu Chang]"},
+    {74, "[约瑟夫]", "[Photographer]"},   {80, "[疯眼]", "[Mad Eyes]"},
+    {81, "[梦之女巫]", "[Dream Witch]"},  {82, "[梦之女巫]", "[Dream Witch]"},
+    {84, "[爱哭鬼]", "[Axe Boy]"},        {85, "[红夫人]", "[Bloody Queen]"}, {86, "[孽蜥]", "[Evil Reptilian]"},
+    {93, "[26号守卫]", "[Guard 26]"},     {95, "[使徒]", "[Disciple]"},       {98, "[小提琴家]", "[Violinist]"},
+    {101, "[雕刻家]", "[Sculptor]"},      {102, "[破轮]", "[Breaking Wheel]"}, {103, "[破轮]", "[Breaking Wheel]"},
+    {105, "[博士]", "[Undead]"},          {109, "[渔女]", "[Naiad]"},         {112, "[蜡像师]", "[Wax Artist]"},
+    {116, "[记录员]", "[Clerk]"},         {117, "[噩梦]", "[Nightmare]"},     {119, "[噩梦]", "[Nightmare]"},
+    {126, "[守夜人]", "[Night Watch]"},   {127, "[隐士]", "[Hermit]"},        {129, "[歌剧演员]", "[Opera Singer]"},
+    {132, "[调皮鬼]", "[Trickster]"},     {133, "[愚人金]", "[Fool's Gold]"}, {10007, "[愚人金]", "[Fool's Gold]"},
+    {136, "[时空之影]", "[The Shadow]"},  {140, "[跛脚羊]", "[Goatman]"},     {143, "[喧嚣]", "[Hullabaloo]"},
+    {145, "[杂货商]", "[Peddler]"},       {147, "[台球手]", "[Cueist]"},      {148, "[台球手]", "[Cueist]"},
+    {151, "[女王蜂]", "[Queen Bee]"},     {10017, "[女王蜂]", "[Queen Bee]"}, {153, "[牙医]", "[Dentist]"},
+};
+static const char* getboss_by_pid(int pid) {
+    for (const auto &e : boss_pid_table)
+        if (e.pid == pid) return g_english ? e.en : e.cn;
+    return nullptr;
+}
+
 // ==================== 道具查找 (不缓存，出现少) ====================
 static const char* getprop(const char* class_name) {
     if (!class_name || !class_name[0]) return nullptr;

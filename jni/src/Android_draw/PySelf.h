@@ -265,11 +265,13 @@ static bool resolve_module()
 // "没有这个键"和"键对象所在页读不到"，拿它判会在对局中途的读失败里误判成局外、把人全藏掉。
 // 局外 = 没有键 1(监管) 也没有键 2(求生者)。2026-09-22 准备阶段实测键只有 53/59/74/100/1009。
 // 模仿者模式的玩家在键 1088，不算的话这个模式会被判成局外、人物整类不画
-static bool check_lobby(uint64_t ubt, bool &in_lobby)
+// 顺带给出 has_copycat(有没有模仿者玩家键)：没有就不用每轮跑 collect_copycat 那五次键扫描。
+// 读不全返回 false 时 has_copycat 不动(调用方默认 true，照旧全扫)
+static bool check_lobby(uint64_t ubt, bool &in_lobby, bool &has_copycat)
 {
     Dict k;
     if (!read_dict(ubt, k) || k.n_entries <= 0) return false;
-    bool has_player = false;
+    bool has_player = false, cc = false;
     for (int64_t i = 0; i < k.n_entries; i++) {
         uint64_t kp = getPtr64(key_slot(k, i));
         if (kp == 0) continue;                         // 已删除的条目
@@ -277,8 +279,10 @@ static bool check_lobby(uint64_t ubt, bool &in_lobby)
         int64_t sz = 0; uint32_t dg = 0;
         if (!vm_readv(kp + 16, &sz, 8) || !vm_readv(kp + 24, &dg, 4)) return false;
         if (sz == 1 && (dg == 1 || dg == 2 || is_copycat_player_type(dg))) has_player = true;
+        if (sz == 1 && is_copycat_player_type(dg)) cc = true;
     }
     in_lobby = !has_player;
+    has_copycat = cc;
     return true;
 }
 
@@ -821,8 +825,8 @@ static bool try_refresh()
         g_i_ubt = find_key(ud, "units_by_type", g_i_ubt);
         ubt = (g_i_ubt >= 0) ? get_attr(ud, g_i_ubt) : 0;
     }
-    bool in_lobby = false;
-    g_in_lobby = is_obj(ubt) && check_lobby(ubt, in_lobby) && in_lobby;
+    bool in_lobby = false, has_copycat = true;   // 键表读不全时按"有"处理
+    g_in_lobby = is_obj(ubt) && check_lobby(ubt, in_lobby, has_copycat) && in_lobby;
     if (is_obj(ubt)) scan_photo_unit(ubt, um);   // 约瑟夫镜世界激活信号(面板「镜世界:」)
 
     // 模仿者模式放在锚点之前：锚点失败时身份簿和坐标照样要更新(开会阶段锚点常读不到)
@@ -831,7 +835,12 @@ static bool try_refresh()
         memset(g_pos_ms, 0, sizeof(g_pos_ms));
         pos_um = um;
     }
-    if (is_obj(ubt)) collect_copycat(ubt, res);
+    if (is_obj(ubt) && has_copycat) collect_copycat(ubt, res);
+    else if (g_extra_n[g_extra_active.load()] != 0) {   // 不是模仿者局：食人鬼列表清空一次，免得残留上一局的
+        int ew = 1 - g_extra_active.load();
+        g_extra_n[ew] = 0;
+        g_extra_active.store(ew);
+    }
     pos_publish(now_ms());
     book_merge(res, um);
 
