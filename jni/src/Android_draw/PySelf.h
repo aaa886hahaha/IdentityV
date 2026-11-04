@@ -119,6 +119,9 @@ struct Snapshot {
     uint64_t body[MAX_BODIES];      // 本体集合，见上
     bool     body_mirror[MAX_BODIES]; // 与 body[] 对齐：该本体是不是约瑟夫镜世界的镜像投影(out_photo_uid 有值)
     bool     body_in_photo[MAX_BODIES]; // 与 body[] 对齐：该(真实)本体当前在不在镜世界(它的 uid ∈ PhotoUnit._players)
+    // 与 body[] 对齐：来自监管方的单位类型([1] 含巡视者、[236] 梦之信徒、[1065] 伊斯幻影)。
+    // 只管骨骼颜色；butchers 只收 [1] 本体，信徒不能进那里(会污染预知和联合狩猎判定)
+    bool     body_hunter[MAX_BODIES];
     int      body_count;
     // 约瑟夫镜世界：我当前操控的单位在不在镜世界里(anchor 的 in_photo_world 真 / out_photo_uid 有值)。
     // 配合 body_mirror 决定"另一个世界"：body_mirror != in_mirror 的本体画成白色鬼魂、不画天赋。
@@ -163,7 +166,7 @@ static int64_t   g_i_model = -1, g_i_another = -1, g_i_utype = -1, g_i_uid = -1;
 // 分开存之后每个类只在第一次出现时扫一次。缓存从不被直接信任：resolve_index() 每次都按名字核对，
 // 核对不上就重扫，所以最坏情况就是退回共用缓存那种多扫几遍，不会读错属性。
 // 表满了(类比这个多)就退回共用的 g_i_*。model / is_civilian_puppet 同理，一起按类存。
-struct ClassIndexCache { uint64_t type; int64_t i_another; int64_t i_model; int64_t i_cpuppet; int64_t i_catch; bool is_puppet; };
+struct ClassIndexCache { uint64_t type; int64_t i_another; int64_t i_model; int64_t i_cpuppet; int64_t i_catch; bool is_puppet; bool is_chxy; };
 static const int MAX_CLASSES = 8;
 static ClassIndexCache g_class_cache[MAX_CLASSES];
 static int     g_class_cache_count = 0;
@@ -286,16 +289,21 @@ static bool check_lobby(uint64_t ubt, bool &in_lobby, bool &has_copycat)
     return true;
 }
 
-// 类名(PyTypeObject.tp_name，+0x18 是 char*)里含不含 Puppet。
-// 实测 [1] 里的巡视者是 MyButcherPatrolPuppetUnit，挑"监管本体"时要跳过它
-static bool class_name_has_puppet(uint64_t type)
+// 类名(PyTypeObject.tp_name，+0x18 是 char*)里含不含某个词
+static bool class_name_has(uint64_t type, const char *word)
 {
     uint64_t np = getPtr64(type + 0x18);
     if (!is_obj(np)) return false;
     char buf[48] = {0};                                // 最长的 MyButcherPatrolPuppetUnit 也才 25 字节
     if (!vm_readv(np, buf, sizeof(buf) - 1)) return false;
-    return strstr(buf, "Puppet") != nullptr;
+    return strstr(buf, word) != nullptr;
 }
+// 实测 [1] 里的巡视者是 MyButcherPatrolPuppetUnit，挑"监管本体"时要跳过它(厂长傀儡 ButcherPuppetUnit 同样带 Puppet)
+static bool class_name_has_puppet(uint64_t type) { return class_name_has(type, "Puppet"); }
+// 厂长(Leo)的怒火分身：LSkillLeoChxyCreate -> LSkillBase.create_CHXY 建的 ButcherChxyUnit(圣诞活动版 ChristmasChxyUnit)，
+// 用监管完整模型、AI 追人。按单位类型它在 [105] 不该进 [1]，但实测被画成红色监管(= 进了本体集合)，
+// 所以按类名兜底：照画，只是不当自动盖板目标(用户 2026-10-30 定的)
+static bool class_name_has_chxy(uint64_t type) { return class_name_has(type, "Chxy"); }
 
 static inline void add_unique(uint64_t *tbl, int &cnt, int cap, uint64_t sp)
 {
@@ -317,13 +325,14 @@ static inline bool is_photo_ghost(uint64_t d, const Dict &dk)
     return PyCore::read_int(getPtr64(value_slot(dk, g_i_outphoto)), v) && v > 0;
 }
 
-// 加本体 + 同步记录它是不是镜像(约瑟夫镜世界)。新加入时才写 body_mirror，去重命中不覆盖
-static inline void add_body(Snapshot &res, uint64_t sp, bool mirror, bool in_photo)
+// 加本体 + 同步记录它是不是镜像(约瑟夫镜世界)、是不是监管方。新加入时才写，去重命中不覆盖
+static inline void add_body(Snapshot &res, uint64_t sp, bool mirror, bool in_photo, bool hunter_side)
 {
     for (int j = 0; j < res.body_count; j++) if (res.body[j] == sp) return;
     if (res.body_count < MAX_BODIES) {
         res.body_mirror[res.body_count] = mirror;
         res.body_in_photo[res.body_count] = in_photo;
+        res.body_hunter[res.body_count] = hunter_side;
         res.body[res.body_count++] = sp;
     }
 }
@@ -377,8 +386,10 @@ static void collect_units(uint64_t ubt, int type, Snapshot &res)
                 slot->type = cls;
                 slot->i_another = slot->i_model = slot->i_cpuppet = slot->i_catch = -1;
                 slot->is_puppet = class_name_has_puppet(cls);    // 类名一个类只读一次
+                slot->is_chxy = class_name_has_chxy(cls);
             }
         }
+        const bool is_chxy = slot ? slot->is_chxy : class_name_has_chxy(cls);
         int64_t &i_another = slot ? slot->i_another : g_i_another;
         int64_t &i_model = slot ? slot->i_model : g_i_unit_model;
         int64_t &i_cpuppet = slot ? slot->i_cpuppet : g_i_cpuppet;
@@ -409,7 +420,7 @@ static void collect_units(uint64_t ubt, int type, Snapshot &res)
         }
         // 约瑟夫镜世界门控：没拍照(photo 未激活)时镜像投影(out_photo_uid>0)整体不收 →
         // 不在本体集合里 → 绘制侧方框/名字/距离/骨骼自然全不画。拍照后才收，按 body_mirror 画成白色。
-        if (!(is_mirror && !g_photo_active.load())) add_body(res, body, is_mirror, unit_in_photo);
+        if (!(is_mirror && !g_photo_active.load())) add_body(res, body, is_mirror, unit_in_photo, type != 2);
         // 监管本体(预知监管)只认真身约瑟夫，镜像监管(若有)不当本体
         if (type == 1 && !is_mirror && !(slot ? slot->is_puppet : class_name_has_puppet(cls))) {
             if (res.hunter_body == 0) res.hunter_body = body;
@@ -422,12 +433,12 @@ static void collect_units(uint64_t ubt, int type, Snapshot &res)
             if (g_i_yidhra >= 0 && read_int(getPtr64(value_slot(dk, g_i_yidhra)), op)) {
                 if (res.yidhra_op_count < MAX_HUNTERS) res.yidhra_ops[res.yidhra_op_count++] = op;
                 if (res.uid != 0 && op == res.uid) res.self_butcher = body;   // 我是这个女巫(正在操控我的锚点)
-            } else {
+            } else if (!is_chxy) {                              // 怒火分身不当盖板目标，见 class_name_has_chxy
                 add_hunter(res, body, unit_in_photo, read_armor(d, dk, g_i_armor));
             }
         }
         // 梦之信徒：活着的游戏都能砸，但只收正在被操控的那个(追人的就是它)。[236] 在 [1] 之后扫，op 已就绪
-        if (type == 236 && !is_mirror && res.yidhra_op_count > 0) {
+        if (type == 236 && !is_mirror && !is_chxy && res.yidhra_op_count > 0) {
             g_i_puppet_uid = resolve_index(d, dk, g_i_puppet_uid, "uid");
             int64_t uid = 0;
             if (g_i_puppet_uid >= 0 && read_int(getPtr64(value_slot(dk, g_i_puppet_uid)), uid))
@@ -997,6 +1008,15 @@ static bool body_is_mirror(uintptr_t obj)
     if (!g_available) return false;
     const Snapshot &s = g_buf[g_active];
     for (int i = 0; i < s.body_count; i++) if (s.body[i] == (uint64_t)obj) return s.body_mirror[i];
+    return false;
+}
+
+// 这个本体是不是监管方单位(监管本体、巡视者、梦之信徒、伊斯幻影)。骨骼颜色用
+static bool is_hunter_side(uintptr_t obj)
+{
+    if (!g_available) return false;
+    const Snapshot &s = g_buf[g_active];
+    for (int i = 0; i < s.body_count; i++) if (s.body[i] == (uint64_t)obj) return s.body_hunter[i];
     return false;
 }
 

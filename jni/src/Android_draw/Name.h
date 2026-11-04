@@ -103,7 +103,6 @@ static const NameMapping boss_table[] = {
     {"burke",           "[疯眼]",     "[Mad Eyes]"},
     {"yidhra_xintu",    "[信徒]",     "[Follower]"},
     {"yidhra",          "[梦之女巫]", "[Dream Witch]"},
-    {"trap",            "[夹子]",     "[Trap]"},              // 国际服 TID_NAME_TRAP_LL
     {"boy",             "[爱哭鬼]",   "[Axe Boy]"},
     {"bomber",          "[26号守卫]", "[Guard 26]"},
     {"bonbon",          "[26号守卫]", "[Guard 26]"},
@@ -140,10 +139,10 @@ static const NameMapping prop_table[] = {
     {"jiutong",       "多夫林",   "Dovlin"},
     {"huzhou",        "护肘",     "Elbow Pads"},
     {"map",           "地图",     "Map"},
-    {"book",          "小人书",   "Travel Journals"},
+    {"pendant_book",  "小人书",   "Travel Journals"},  // 不能只写 book：会命中小说家的 h55_pendant_notebook(创作笔记，不画)
     {"gjx",           "工具箱",   "Toolkit"},
     {"glim",          "手电筒",   "Flashlight"},
-    {"xiangshuiping", "忘忧之香", "Euphoria"},
+    {"xiangshuiping", "香水", "Euphoria"},
     {"controller",    "遥控器",   "Controller"},
     {"football",      "橄榄球",   "Rugby Ball"},
     {"huaibiao",      "怀表",     "Pocket Watch"},    // 国际服 TID_WATCH_LV1
@@ -151,6 +150,7 @@ static const NameMapping prop_table[] = {
     {"tower",         "窥视者",   "Peeper"},
     {"huojian",       "哭丑火箭", "Rocket"},
     {"patro",         "巡视者",   "Patroller"},
+    {"trap.gim",      "夹子",     "Trap"},     // 鹿头夹子 chr/boss/butcher/dm65_butcher_ll/trap.gim，读取循环里特判归道具；全配表只有这一个 trap.gim
 };
 
 // ==================== 通用查找函数 ====================

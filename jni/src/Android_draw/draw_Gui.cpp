@@ -15,9 +15,14 @@
 #include "NativeBones.h"
 #include "GeniusTree.h"
 #include "PyWaterFight.h"
+#include "PyItems.h"
+#include "WaxAim.h"
 #include <linux/input.h>
 #include <sstream>
 #include <iomanip>
+#include <ctime>
+#include <vector>
+#include <algorithm>
 std::string filter_class_name;
 // 类名缓存：对象地址 -> {第一跳指针(校验用), 类名}。只有读线程碰它，不用加锁。见读取循环里的说明
 static std::unordered_map<uintptr_t, std::pair<uint64_t, std::string>> g_name_cache;
@@ -172,6 +177,18 @@ static bool voice = true;
 static bool inform_ghost = true; // 显示鬼魂
 static bool show_sohook = false;  // 骨骼与进度覆盖层
 static bool show_genius_tree = false;  // 监管天赋树(径向图，独立可拖动窗口)
+static bool show_crosshair = false;    // 准星(所有角色通用)，位置 = WaxAim::aim_x/aim_y
+static bool shot_hide_menu = true;     // 截图时先把主菜单藏起来
+// 准星位置按角色(pid)分别记：配置文件里每个角色一行 xhair=pid,x,y。换角色时自动套用；
+// 这个角色没存过就用蜡像师(pid 112)的，蜡像师也没有就用默认(游戏蜡枪标记，截图实测 2772x1280 下 (1385.5, 556.6))
+#include <map>
+static const float WAX_MARK_Y = 556.6f / 1280.f;
+// 准星：位置 + 样式 + 大小(臂长，像素) + 粗细(像素)，整套按角色记。x/y < 0 表示"没设"
+enum { XH_CROSS_DOT = 0, XH_CROSS, XH_DOT, XH_CIRCLE, XH_CIRCLE_DOT, XH_T, XH_STYLE_N };
+struct XhairCfg { float x = -1.f, y = -1.f; int style = XH_CROSS_DOT; float size = 12.f, thick = 2.f; };
+static std::map<int, XhairCfg> g_xhair;
+static XhairCfg g_xh;                                          // 当前套用中的(位置同步在 WaxAim::aim_x/aim_y，蜡像师瞄准线用)
+static int g_xhair_pid = -2;                                   // 当前已套用的角色，-2 = 需要重新套用
 static float panel_alpha = 0.94f;      // 菜单/天赋树窗口背景不透明度(同金铲铲 ui.alpha)。0.94 = ImGui 默认 WindowBg
 
 // ===== 固定信息：屏幕坐标 HUD 汇总，不依赖矩阵。每块独立开关 + 独立 X/Y/大小(size=文字像素高) =====
@@ -220,6 +237,10 @@ static const CfgItem CFG_ITEMS[] = {
     {"fi_hunter_on", CFG_BOOL, &fi_hunter_on}, {"fi_hunter_x", CFG_FLOAT, &fi_hunter_x}, {"fi_hunter_y", CFG_FLOAT, &fi_hunter_y}, {"fi_hunter_size", CFG_FLOAT, &fi_hunter_size},
     {"fi_civ_on", CFG_BOOL, &fi_civ_on},     {"fi_civ_x", CFG_FLOAT, &fi_civ_x},     {"fi_civ_y", CFG_FLOAT, &fi_civ_y},     {"fi_civ_size", CFG_FLOAT, &fi_civ_size},
     {"fi_civ_gap", CFG_FLOAT, &fi_civ_gap},
+    // 蜡像师
+    {"wax_on", CFG_BOOL, &WaxAim::enabled},      {"wax_traj", CFG_BOOL, &WaxAim::show_traj},
+    {"wax_always", CFG_BOOL, &WaxAim::show_always}, {"show_crosshair", CFG_BOOL, &show_crosshair},
+    {"shot_hide_menu", CFG_BOOL, &shot_hide_menu},
     // 自动盖板
     {"pallet_enabled", CFG_BOOL, &AutoPallet::enabled},           {"pallet_show_range", CFG_BOOL, &AutoPallet::show_range},
     {"pallet_show_touch", CFG_BOOL, &AutoPallet::show_touch_point}, {"pallet_touch_x", CFG_FLOAT, &AutoPallet::touch_x},
@@ -249,6 +270,12 @@ static void config_save()
             case CFG_FLOAT: fprintf(f, "%s=%.3f\n", it.key, *(float *)it.ptr); break;
         }
     }
+    if (g_xhair_pid > 0 && WaxAim::aim_x >= 0 && WaxAim::aim_y >= 0) {        // 当前角色的准星一并记下
+        g_xh.x = WaxAim::aim_x; g_xh.y = WaxAim::aim_y;
+        g_xhair[g_xhair_pid] = g_xh;
+    }
+    for (auto &kv : g_xhair)                                                  // xhair=角色pid,x,y,样式,大小,粗细
+        fprintf(f, "xhair=%d,%.1f,%.1f,%d,%.1f,%.1f\n", kv.first, kv.second.x, kv.second.y, kv.second.style, kv.second.size, kv.second.thick);
     bool ok = fflush(f) == 0;
     ok = (fclose(f) == 0) && ok;
     if (ok) snprintf(m, sizeof(m), T("已保存 %d 项 → %s", "Saved %d items -> %s"), (int)(sizeof(CFG_ITEMS) / sizeof(CFG_ITEMS[0])), CONFIG_PATH);
@@ -294,6 +321,21 @@ static void config_load(bool startup = false)
         if (!eq) continue;
         *eq = '\0';
         const char *val = eq + 1;
+        if (strcmp(line, "xhair") == 0) {                               // 每个角色的准星(旧行只有 pid,x,y，样式/大小/粗细取默认)
+            int pid = 0; XhairCfg c;
+            if (sscanf(val, "%d,%f,%f,%d,%f,%f", &pid, &c.x, &c.y, &c.style, &c.size, &c.thick) >= 3 && pid > 0) {
+                if (c.style < 0 || c.style >= XH_STYLE_N) c.style = XH_CROSS_DOT;
+                g_xhair[pid] = c; n++;
+            }
+            continue;
+        }
+        if (strcmp(line, "wax_aim_x") == 0 || strcmp(line, "wax_aim_y") == 0) {   // 旧版只有蜡像师一套，迁到 pid 112
+            float v = (float)atof(val);
+            XhairCfg &c = g_xhair[WaxAim::WAX_PID];
+            if (line[8] == 'x') c.x = v; else c.y = v;
+            n++;
+            continue;
+        }
         for (const CfgItem &it : CFG_ITEMS) {
             if (strcmp(it.key, line) != 0) continue;
             switch (it.type) {
@@ -306,6 +348,7 @@ static void config_load(bool startup = false)
         }
     }
     fclose(f);
+    g_xhair_pid = -2;                                                   // 读完按当前角色重新套用准星位置
     if (panel_alpha < 0.10f) panel_alpha = 0.10f;
     if (panel_alpha > 1.0f)  panel_alpha = 1.0f;
     cfg_apply_main = cfg_main_x >= 0.f && cfg_main_y >= 0.f;
@@ -638,6 +681,112 @@ bool ShouldSkipEntity(const DataStruct& obj) {
     return false;
 }
 
+// ---- 签名候选(2026-10-30)：启动扫描不再"命中即锁"，bss 里所有矩阵签名、数组签名都记下来 ----
+// 原来锁死的是一个槽位/一个数组：运行中该槽位被清空或挪作他用(用户实测"启动正常、运行中突然 3D 全没了，
+// HUD 和 Python 层正常")就再也恢复不了，只能重开叠加层。现在锁的是签名，槽位/数组坏了就在候选里重选：
+//   矩阵 —— 渲染线程每帧校验，失败当帧在签名窗口里重选(见 Draw_Main 的 find_matrix_slot)，锚点投影当真值
+//   数组 —— 读线程每轮数本体集合(Python 侧 model+0x20)命中几个，一个没中就换命中最多的候选(try_switch_array)
+// 候选全部失效才请求重扫 bss(读线程做，10 秒节流)。双缓冲：重扫写非活跃那份再翻转，渲染线程读活跃那份
+static const int MAX_SIG = 8;
+struct SigSet { uint64_t msig[MAX_SIG]; int msig_n; long arr[MAX_SIG]; int arr_n; };
+static SigSet g_sigs[2];
+static std::atomic<int> g_sigs_active{0};
+static std::atomic<bool> g_rescan_req{false};
+
+static void scan_signatures(const ModuleBssInfo &bss, SigSet &out)
+{
+    out.msig_n = out.arr_n = 0;
+    long pages = (long)((bss.taddr - bss.addr) / 4096);
+    long buff[512];
+    for (long i = 0; i < pages; i++) {
+        if (!vm_readv(bss.addr + i * 4096, buff, 0x1000)) continue;
+        for (int ii = 0; ii < 512; ii++) {
+            uint64_t here = bss.addr + i * 4096 + ii * 8;
+            if (*(long long*)(&buff[ii]) == 0x656A624F72655028LL && out.msig_n < MAX_SIG)
+                out.msig[out.msig_n++] = here;
+            if (buff[ii] == 16384 && out.arr_n < MAX_SIG &&
+                getDword(here - 0x8) == 257 && getFloat(here - 16) == 1.0f)
+                out.arr[out.arr_n++] = (long)(here - libbase + 56);
+        }
+    }
+}
+
+// 当前数组一个本体都没命中时调：在其它候选里找命中最多的(至少 1 个)，找到就切过去。只在读线程里调
+static bool try_switch_array()
+{
+    const SigSet &s = g_sigs[g_sigs_active.load()];
+    static uint64_t elems[10000];
+    long best = 0; int best_hits = 0;
+    for (int k = 0; k < s.arr_n; k++) {
+        if (s.arr[k] == ArrayaddrOffset) continue;
+        uint64_t a = getPtr64(libbase + s.arr[k]), e = getPtr64(libbase + s.arr[k] + 8);
+        if (a < 0x5000000000 || e <= a) continue;
+        uint64_t n = (e - a) / 8;
+        if (n == 0 || n > 10000) continue;
+        if (!vm_readv(a, elems, n * 8)) continue;
+        int hits = 0;
+        for (uint64_t j = 0; j < n; j++)
+            if (PySelf::is_body((uintptr_t)(elems[j] & 0x00FFFFFFFFFFFFFFULL))) hits++;
+        if (hits > best_hits) { best_hits = hits; best = s.arr[k]; }
+    }
+    if (best_hits > 0) {
+        printf("[数组切换] 0x%lx -> 0x%lx 本体命中 %d\n", ArrayaddrOffset, best, best_hits);
+        ArrayaddrOffset = best;
+        return true;
+    }
+    g_rescan_req = true;    // 候选里也没有：请求重扫 bss
+    return false;
+}
+
+// ---- 场景数组按变化重扫(2026-10-30) ----
+// 原来固定每 2 秒完整处理一遍，新召唤物/地上新掉的道具/准备阶段的预知最多晚 2 秒才出现。
+// 现在每 100ms 把整个指针数组一次读回来(约 300 个指针 = 2.4KB，一次 vm_readv)，排序后跟上一轮比：
+//   排序 = 只比"有哪些对象"，不管顺序(万一游戏会给数组重新排序，不至于每 100ms 都判成变化)
+//   比内容而不是比头尾：删一个又加一个、中间删掉拿末尾补位时，个数和头尾都不变，只看头尾会漏
+// 变了就立刻完整处理；两次完整处理至少隔 250ms(防止特效频繁生成销毁时扫个不停)；
+// 不管变没变，满 2 秒保底处理一次(指针没变但对象换了模型、类名变了的情况，比指针是发现不了的)
+static inline int64_t mono_ms()
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+// 读出整个指针数组(保持原顺序：data[] 的顺序有人依赖，见固定信息 C 的反向打印、预知的"最后一个监管")。
+// 头、尾是两次独立读取，游戏恰好在中间扩容数组就会拿到新旧拼接的一对，再读一次头对不上就当无效
+static bool read_array_snapshot(uint64_t &arr, std::vector<uint64_t> &out)
+{
+    uint64_t a = getPtr64(libbase + ArrayaddrOffset);
+    uint64_t e = getPtr64(libbase + ArrayaddrOffset + 8);
+    if (getPtr64(libbase + ArrayaddrOffset) != a) return false;
+    if (a < 0x5000000000 || e <= a) return false;
+    uint64_t n = (e - a) / 8;
+    if (n == 0 || n > 10000) return false;
+    out.resize(n);
+    if (vm_readv(a, out.data(), n * 8)) {
+        for (auto &p : out) p &= 0x00FFFFFFFFFFFFFFULL;
+    } else {
+        for (uint64_t i = 0; i < n; i++) out[i] = getPtr64(a + i * 8);   // 整块读失败(某页读不到)：逐个读，读不到的是 0
+    }
+    arr = a;
+    return true;
+}
+
+// 完整处理完一轮后调：等到对象集合变了，或者满 2 秒
+static void wait_array_change(const std::vector<uint64_t> &last_sorted)
+{
+    const int64_t start = mono_ms();
+    std::vector<uint64_t> now;
+    uint64_t a = 0;
+    usleep(250 * 1000);
+    while (mono_ms() - start < 2000) {
+        if (!read_array_snapshot(a, now)) return;            // 读成无效(进局重建等)：交给主循环那条分支处理
+        std::sort(now.begin(), now.end());
+        if (now != last_sorted) return;
+        usleep(100 * 1000);
+    }
+}
+
 void read_thread(long int PD1,long int PD2,long int PD3)
 {
     bool waitingLogged = false;
@@ -699,50 +848,40 @@ void read_thread(long int PD1,long int PD2,long int PD3)
         printf("[错误] libbase无效, 无法继续\n");
         sleep(9999);
     }
-    c = (result.taddr-result.addr)/4096;
-    long buff[512];
     while (MatrixOffset==0||ArrayaddrOffset==0)
     {
-    	for (int i = 0; i < c; i++){
-        	vm_readv(result.addr+(i*4096), &buff, 0x1000);
-        	for (int ii=0;ii<512;ii+=1){
-
-        	    if (MatrixOffset == 0 && *(long long*)(&buff[ii]) == 0x656A624F72655028LL){
-        	        uint64_t sig_addr = result.addr + i*4096 + ii*8;
-        	        // 2026-09-17 热更后 +0x430 恒为0。该处是一组步长0x88的指针，三个元素都能走到
-        	        // 同一个矩阵对象，这次更新只是让它整体位移了0x10。写死任何一个下次还会废，
-        	        // 改成在窗口内找"整条链都走得通"的槽位(p1有效 且 p1+0xa58 也有效)，自愈。
-        	        // 注意上界：只判 >0x5000000000 会让浮点垃圾(如0x400674954293DF)也蒙混过关，
-        	        // 本机用户态指针都在 0x77xx/0x79xx 段，统一卡 <0x8000000000。
-        	        for (int off = 0x300; off <= 0x500; off += 8){
-        	            uint64_t cand_slot = sig_addr + off;
-        	            uint64_t p1 = getPtr64(cand_slot);            // getPtr64 已做 0xB4 掩码
-        	            if (p1 <= 0x5000000000 || p1 >= 0x8000000000) continue;
-        	            uint64_t p2 = getPtr64(p1 + 0xa58);
-        	            if (p2 <= 0x5000000000 || p2 >= 0x8000000000) continue;
-        	            MatrixOffset = cand_slot - libbase;
-        	            printf("[矩阵命中] 签名=0x%llX 槽位=+0x%X 根=0x%llX MatrixOffset=0x%lx\n",
-        	                   (unsigned long long)sig_addr, off, (unsigned long long)cand_slot, MatrixOffset);
-        	            break;
-        	        }
-        	    }
-
-        	    if (ArrayaddrOffset == 0 && buff[ii] == 16384){
-                    if (getDword(result.addr + 4096*i + 8*ii - 0x8) == 257 &&
-                        getFloat(result.addr + 4096*i + 8*ii - 16) == 1.0f){
-                        ArrayaddrOffset = result.addr - libbase + i*4096 + ii*8 + 56;
-                        printf("[数组命中] 偏移=0x%llX\n", (unsigned long long)ArrayaddrOffset);
-                    }
-                }
-    	    }
+        // 一趟扫完 bss，所有签名都进候选(见 SigSet)，再从候选里挑初始的。挑错了运行中会自己换
+        scan_signatures(result, g_sigs[0]);
+        g_sigs_active = 0;
+        const SigSet &s = g_sigs[0];
+        printf("[签名] 矩阵签名 %d 个 数组签名 %d 个\n", s.msig_n, s.arr_n);
+        // 2026-09-17 热更后 +0x430 恒为0。签名后是一组步长0x88的指针，三个元素都能走到
+        // 同一个矩阵对象，这次更新只是让它整体位移了0x10。写死任何一个下次还会废，
+        // 改成在窗口内找"整条链都走得通"的槽位(p1有效 且 p1+0xa58 也有效)，自愈。
+        // 注意上界：只判 >0x5000000000 会让浮点垃圾(如0x400674954293DF)也蒙混过关，
+        // 本机用户态指针都在 0x77xx/0x79xx 段，统一卡 <0x8000000000。
+        for (int k = 0; k < s.msig_n && MatrixOffset == 0; k++){
+            for (int off = 0x300; off <= 0x500; off += 8){
+                uint64_t cand_slot = s.msig[k] + off;
+                uint64_t p1 = getPtr64(cand_slot);            // getPtr64 已做 0xB4 掩码
+                if (p1 <= 0x5000000000 || p1 >= 0x8000000000) continue;
+                uint64_t p2 = getPtr64(p1 + 0xa58);
+                if (p2 <= 0x5000000000 || p2 >= 0x8000000000) continue;
+                MatrixOffset = cand_slot - libbase;
+                printf("[矩阵命中] 签名=0x%llX 槽位=+0x%X 根=0x%llX MatrixOffset=0x%lx\n",
+                       (unsigned long long)s.msig[k], off, (unsigned long long)cand_slot, MatrixOffset);
+                break;
+            }
         }
-        if (MatrixOffset!=0 && ArrayaddrOffset!=0){
-            uint64_t tmpArr = getPtr64(libbase + ArrayaddrOffset);
-            uint64_t tmpEnd = getPtr64(libbase + ArrayaddrOffset + 8);
-            if (tmpArr > 0x5000000000 && tmpEnd > tmpArr) break;
-            printf("[数组无效] 重新扫描 Array=0x%llX End=0x%llX\n", (unsigned long long)tmpArr, (unsigned long long)tmpEnd);
-            ArrayaddrOffset = 0;
+        for (int k = 0; k < s.arr_n && ArrayaddrOffset == 0; k++){
+            uint64_t tmpArr = getPtr64(libbase + s.arr[k]);
+            uint64_t tmpEnd = getPtr64(libbase + s.arr[k] + 8);
+            if (tmpArr > 0x5000000000 && tmpEnd > tmpArr) {
+                ArrayaddrOffset = s.arr[k];
+                printf("[数组命中] 偏移=0x%llX\n", (unsigned long long)ArrayaddrOffset);
+            }
         }
+        if (MatrixOffset!=0 && ArrayaddrOffset!=0) break;
         sleep(5);
     }
     read_state = 2;
@@ -759,6 +898,10 @@ void read_thread(long int PD1,long int PD2,long int PD3)
     PySelf::start(libbase);
     // 林中童话(打水仗 BR)：玩家[1601]+物资[1602/1606]，独立线程 100ms 一轮，只在 waterfight_mode 时绘制
     PyWaterFight::start(libbase);
+    // 道具白名单(cur_world.item_mgr._uid2item)：独立线程 100ms 一轮，只在「绘制道具」开着时读
+    PyItems::start(libbase);
+    // 蜡像师喷蜡辅助瞄准：独立线程 33ms 一轮，只在我是蜡像师时算(见 WaxAim.h)
+    WaxAim::start(libbase);
     // 自动盖板：独立线程 10ms 一轮，板子列表由下面的读取循环每轮发布过去
     AutoPallet::start();
 
@@ -774,21 +917,32 @@ void read_thread(long int PD1,long int PD2,long int PD3)
     // 现在读空就保留上一轮(绘制侧照旧)，照常 2 秒后再扫。不需要"连续读空就清零"：
     // 每局都会重建数组，下一轮有效扫描会整体覆盖，不会有跨局残留。
     // 也不需要快速重试：对象地址一局内不变，上一轮可信就一直可信，重扫只是为了收新建的对象。
+    // 两轮之间的等待见 wait_array_change(对象集合变了立刻扫，否则 2 秒保底)
+    time_t last_rescan = 0;
+    std::vector<uint64_t> snap, snap_sorted;
     while (true)
     {
-    	uint64_t curArray = getPtr64(libbase + ArrayaddrOffset);
-        uint64_t curArrayEnd = getPtr64(libbase + ArrayaddrOffset + 8);
-        // 头、尾是两次独立读取，游戏恰好在中间扩容数组就会拿到新旧拼接的一对，
-        // 算出来的数量是错的。再读一次头，对不上就当本轮无效
-        if (getPtr64(libbase + ArrayaddrOffset) != curArray) curArray = 0;
-        uint64_t curCount = curArrayEnd > curArray ? (curArrayEnd - curArray) / 8 : 0;
-	    if (curArray < 0x5000000000 || curCount == 0 || curCount > 10000) {
+        // 候选全部失效时(数组这边 try_switch_array、矩阵那边渲染线程)请求的重扫。10 秒节流，写非活跃那份再翻转
+        if (g_rescan_req.load() && time(NULL) - last_rescan >= 10) {
+            g_rescan_req = false;
+            last_rescan = time(NULL);
+            int w = 1 - g_sigs_active.load();
+            scan_signatures(result, g_sigs[w]);
+            g_sigs_active = w;
+            printf("[签名重扫] 矩阵签名 %d 个 数组签名 %d 个\n", g_sigs[w].msig_n, g_sigs[w].arr_n);
+        }
+        // 整个指针数组一次读回来(头尾校验见 read_array_snapshot)，下面逐项处理用这份快照
+    	uint64_t curArray = 0;
+	    if (!read_array_snapshot(curArray, snap)) {
             read_state = 1;   // 只影响面板状态文字，不影响绘制(Draw_Main 只在 0 时跳过)
+            // 局内(有本体集合)还读成无效：先看别的候选里有没有装着本体的，有就立刻换过去重扫。
+            // 进局重建数组那一下所有候选都没有本体，不会误切
+            if (PySelf::body_set_ready() && try_switch_array()) continue;
             sleep(2);
             continue;
         }
         Arrayaddr = curArray;
-        Count = curCount;
+        Count = (long)snap.size();
         read_state = 2;
     	int entity_count=0;
         // 镜面这几个指针和预知文本先收在局部变量里，扫完一次性发布(见本轮末尾)。
@@ -817,11 +971,15 @@ void read_thread(long int PD1,long int PD2,long int PD3)
         bool room_pid_ok = room_hunters > 0;
         for (int k = 0; k < room_hunters && k < 2; k++) if (room_pids[k] < 0) room_pid_ok = false;
         std::string scene_last_hunter;   // room_pid_ok 时场景里最后一个监管的名字，pid 查不到表时兜底用
+        // 真值：局内本体集合(Python 侧 unit.model+0x20)应该都在场景数组里。一个都没中 = 数组锁错/被挪作他用
+        const bool truth_ready = PySelf::body_set_ready();
+        int truth_hits = 0;
         for (int ii = 0; ii < Count && entity_count < 1000; ii++){
-            cur_obj = getPtr64(curArray+0x8 * ii);	// 遍历数量次数            
-                
-    		if (cur_obj == 0)   			
-        		continue;    			    			
+            cur_obj = snap[ii];
+
+    		if (cur_obj == 0)
+        		continue;
+    		if (truth_ready && PySelf::is_body(cur_obj)) truth_hits++;
     		
     	    // 类名要走五跳指针再加长度和内容，共 7 次驱动读；一轮 300 个对象就是 2000 多次，
     	    // 实测占了整轮 12ms 里的一半。同一个对象活着的时候类名不会变，所以按地址缓存。
@@ -912,7 +1070,15 @@ void read_thread(long int PD1,long int PD2,long int PD3)
     			// 所以这个洞主要在开「绘制调试」时发作。
     			data[entity_count].camp = 0;
     			data[entity_count].str[0] = '\0';
-    			if (strstr(filter_class_name.c_str(), "boss") != NULL){
+    			// 鹿头夹子(ClaspTrapUnit，skill_creature 73)：模型放在监管目录下，按类名会归监管、再被本体集合挡掉，
+    			// 本体集合不可用时还会被画成红色「[鹿头]」。这里先截下来归道具。预知监管上面已经算过，仍归鹿头
+    			if (strstr(filter_class_name.c_str(), "dm65_butcher_ll") != NULL && strstr(filter_class_name.c_str(), "trap.gim") != NULL){
+    			const char* prop_result = getprop(filter_class_name.c_str());
+    			if (prop_result == NULL) continue;
+    			strcpy(data[entity_count].str, prop_result);
+    			data[entity_count].camp=4;
+    			}
+    			else if (strstr(filter_class_name.c_str(), "boss") != NULL){
     			//data[指针数量].str=getboss(过滤类名.c_str());
     			strcpy(data[entity_count].str, getboss(filter_class_name.c_str()));
     			data[entity_count].camp=1;
@@ -982,8 +1148,12 @@ void read_thread(long int PD1,long int PD2,long int PD3)
 			}    						
         }
         // 本轮一个对象都没收到：不发布，保留上一轮，按正常周期等下一轮(见循环前的说明)
+        // 本体一个都不在这个数组里：换到装着本体的候选立刻重扫，这一轮不发布(绘制侧沿用上一轮)
+        if (truth_ready && truth_hits == 0 && try_switch_array()) continue;
+        snap_sorted = snap;
+        std::sort(snap_sorted.begin(), snap_sorted.end());
         if (entity_count == 0) {
-            sleep(2);
+            wait_array_change(snap_sorted);
             continue;
         }
         if (!first_frame_logged){
@@ -1021,9 +1191,8 @@ void read_thread(long int PD1,long int PD2,long int PD3)
         if (prophet_local[0]) memcpy(prophet_text, prophet_local, sizeof(prophet_text));
         AutoPallet::publish_boards(boards_local, boards_n);
         data_count = entity_count;
-        // 2026-09-23：3 秒 -> 2 秒。一轮实测约 9ms，读线程 CPU 0.3% -> 0.45%，
-        // data[] 的撕裂窗口同比例从 0.3% 到 0.45%，都可忽略；换来新对象和预知监管更快出现
-        sleep(2);
+        // 2026-09-23：3 秒 -> 2 秒(一轮实测约 9ms)。2026-10-30：改成对象集合变了就扫(最快 250ms)，2 秒保底
+        wait_array_change(snap_sorted);
     }
 }
 
@@ -1147,6 +1316,53 @@ static inline bool matrix_finite(const float *m)
     for (int i = 0; i < 16; i++) if (!std::isfinite(m[i])) return false;
     return true;
 }
+
+// 从槽位里读出的根指针 p1 走到矩阵：p1 -> +0xa58 -> 矩阵对象 -> +0x2c0。
+// 除了指针范围和 16 个数有限，还要求是透视矩阵(w 那一列不全为 0)：正交的(阴影相机之类)投影出来没有近大远小，不可能是主相机
+static bool read_matrix_root(uint64_t p1, uint64_t &mobj, float out[16])
+{
+    p1 &= 0x00FFFFFFFFFFFFFFULL;
+    if (!is_user_ptr(p1)) return false;
+    mobj = getPtr64(p1 + 0xa58);
+    if (!is_user_ptr(mobj)) return false;
+    if (!vm_readv(mobj + 0x2c0, out, 64) || !matrix_finite(out)) return false;
+    return fabsf(out[3]) + fabsf(out[7]) + fabsf(out[11]) > 1e-6f;
+}
+
+// 真值：锚点(g_cam_ctrl.unit = 相机跟随的单位)用这个矩阵投影，必须在相机前方、落在屏幕附近(NDC ±1.5，放宽到屏外一点)
+static bool anchor_in_view(const float *m, const float *a)
+{
+    float w = m[3]*a[0] + m[7]*a[1] + m[11]*a[2] + m[15];
+    if (w <= 0.01f) return false;
+    float nx = (m[0]*a[0] + m[4]*a[1] + m[8]*a[2] + m[12]) / w;
+    float ny = (m[1]*a[0] + m[5]*a[1] + m[9]*a[2] + m[13]) / w;
+    return fabsf(nx) <= 1.5f && fabsf(ny) <= 1.5f;
+}
+
+// 当前槽位不行时在所有矩阵签名的窗口里重选(跳过 skip)。每个签名的窗口一次读完，只有像指针的才往下走。
+// 返回 2 = 找到通过真值的(没有真值时等于结构通过)；1 = 只找到结构通过、真值不过的(取第一个)；0 = 一个都读不出来
+static int find_matrix_slot(uint64_t skip, const float *anc, uint64_t &slot_out, uint64_t &mobj_out, float out[16])
+{
+    const SigSet &s = g_sigs[g_sigs_active.load()];
+    int got = 0;
+    uint64_t win[65];
+    float tmp[16];
+    uint64_t mobj = 0;
+    for (int k = 0; k < s.msig_n; k++) {
+        if (!vm_readv(s.msig[k] + 0x300, win, sizeof(win))) continue;
+        for (int j = 0; j < 65; j++) {
+            uint64_t slot = s.msig[k] + 0x300 + j * 8;
+            if (slot == skip) continue;
+            if (!read_matrix_root(win[j], mobj, tmp)) continue;
+            if (!anc || anchor_in_view(tmp, anc)) {
+                slot_out = slot; mobj_out = mobj; memcpy(out, tmp, 64);
+                return 2;
+            }
+            if (got == 0) { got = 1; slot_out = slot; mobj_out = mobj; memcpy(out, tmp, 64); }
+        }
+    }
+    return got;
+}
 // 校验不过时沿用上一帧的矩阵，连续超过这么多帧才停止投影(约 80ms，肉眼看不出偏移)。
 // 初值大于上限：启动后还没拿到过一次有效矩阵时，matrix[] 全是 0，不能拿来投影。
 static constexpr int MATRIX_STALE_MAX = 5;
@@ -1198,10 +1414,176 @@ static const char *waterfight_name(int identity)
     return (identity >= 1 && identity <= 10) ? (g_english ? E[identity] : N[identity]) : "?";
 }
 
+// 这件道具是不是我的：主人是我(当前操控单位或主角色，机械师操控玩偶时两者不同)，
+// 或者它在玩具商的包里、包贴在我身上(包里的道具 owner=None，模型每 tick 被挪到我脚下)
+static bool item_is_mine(const PyItems::Entry &it, uint64_t anchor_obj)
+{
+    const int64_t me = PySelf::self_uid(), main = PyItems::main_uid();
+    auto is_me = [&](int64_t u) { return u > 0 && (u == me || u == main); };
+    if (it.owned) return is_me(it.owner_uid) || (anchor_obj != 0 && it.owner_body == anchor_obj);
+    return is_me(it.attach_uid);
+}
+
+// ---- 蜡像师喷蜡辅助瞄准(WaxAim.h 算，这里只投影和画) ----
+// 当前视线：屏幕中心对应的方向 d 满足 clip_x = clip_y = 0，即 d ⟂ (m0,m4,m8) 且 d ⟂ (m1,m5,m9)，取叉积再按 w>0 定号。
+// 世界分量顺序和投影公式一致：(X, 高度, Y)
+static bool wax_view_dir(float &dx, float &dh, float &dy)
+{
+    float a[3] = {matrix[0], matrix[4], matrix[8]}, b[3] = {matrix[1], matrix[5], matrix[9]};
+    dx = a[1] * b[2] - a[2] * b[1]; dh = a[2] * b[0] - a[0] * b[2]; dy = a[0] * b[1] - a[1] * b[0];
+    float n = sqrtf(dx * dx + dh * dh + dy * dy);
+    if (!(n > 1e-9f)) return false;
+    dx /= n; dh /= n; dy /= n;
+    if (matrix[3] * dx + matrix[7] * dh + matrix[11] * dy < 0) { dx = -dx; dh = -dh; dy = -dy; }
+    return true;
+}
+
+// 无穷远方向投影(w 不含平移)。天空中的瞄准线用它：相机转到该方向时它正好落在屏幕中心
+static bool wax_proj_dir(float dx, float dh, float dy, ImVec2 &o)
+{
+    float w = matrix[3] * dx + matrix[7] * dh + matrix[11] * dy;
+    if (w <= 1e-4f) return false;
+    o.x = px + (matrix[0] * dx + matrix[4] * dh + matrix[8] * dy) / w * px;
+    o.y = py - (matrix[1] * dx + matrix[5] * dh + matrix[9] * dy) / w * py;
+    return true;
+}
+
+static bool wax_proj_pt(const float *p, ImVec2 &o)
+{
+    float w = matrix[3] * p[0] + matrix[7] * p[1] + matrix[11] * p[2] + matrix[15];
+    if (w <= 0.01f) return false;
+    o.x = px + (matrix[0] * p[0] + matrix[4] * p[1] + matrix[8] * p[2] + matrix[12]) / w * px;
+    o.y = py - (matrix[1] * p[0] + matrix[5] * p[1] + matrix[9] * p[2] + matrix[13]) / w * py;
+    return true;
+}
+
+static void draw_wax_aim(ImDrawList *Draw)
+{
+    float vx, vh, vy;
+    if (!wax_view_dir(vx, vh, vy)) return;
+    float hl = sqrtf(vx * vx + vy * vy);
+    float elev_now = atan2f(vh, hl) * 180.f / (float)M_PI;
+    if (hl > 1e-4f) WaxAim::set_view(vx / hl, vy / hl, elev_now);
+
+    const WaxAim::Result &r = WaxAim::result();
+    if (!WaxAim::enabled || !r.is_wax) return;
+    const float mx = WaxAim::aim_x >= 0 ? WaxAim::aim_x : px, my = WaxAim::aim_y >= 0 ? WaxAim::aim_y : py * 2.f * WAX_MARK_Y;
+    const ImVec2 off(mx - px, my - py);                    // 游戏瞄准标记相对屏幕中心的偏移
+    const float D2R = (float)M_PI / 180.f;
+
+    // 天空瞄准线：相机俯仰到 p 时视线仰角 = 现在的仰角 + (last_pitch - p)(last_pitch 正 = 往下看，2026-11-04 上机确认)
+    // 当前俯仰正好在区间边界时 e = elev_now，线端点必然落在标记上 —— 所以线和标记对不对得上只取决于标记像素位置准不准
+    auto sky = [&](float hx, float hz, float yaw, float p, ImVec2 &o) {
+        float e = (elev_now + (r.last_pitch - p)) * D2R;
+        float c = cosf(yaw), s = sinf(yaw);
+        float ux = hx * c - hz * s, uz = hx * s + hz * c;
+        if (!wax_proj_dir(cosf(e) * ux, sinf(e), cosf(e) * uz, o)) return false;
+        o.x += off.x; o.y += off.y;
+        return true;
+    };
+    for (int i = 0; i < r.nb; i++) {
+        const WaxAim::Band &b = r.b[i];
+        ImVec2 a0, a1, w0, w1;
+        float pm = (b.p0 + b.p1) * 0.5f;
+        if (!sky(b.hx, b.hz, 0, b.p0, a0) || !sky(b.hx, b.hz, 0, b.p1, a1)) continue;
+        if (!sky(b.hx, b.hz, -b.half_yaw, pm, w0) || !sky(b.hx, b.hz, b.half_yaw, pm, w1)) continue;
+        float th = sqrtf((w1.x - w0.x) * (w1.x - w0.x) + (w1.y - w0.y) * (w1.y - w0.y));
+        th = th < 12.f ? 12.f : (th > 80.f ? 80.f : th);
+        float len = sqrtf((a1.x - a0.x) * (a1.x - a0.x) + (a1.y - a0.y) * (a1.y - a0.y));
+        if (len < 6.f) { float k = (6.f - len) * 0.5f / (len > 0.1f ? len : 1.f);   // 太短的拉长到 6 像素
+            float ex = (a1.x - a0.x) * k, ey = len > 0.1f ? (a1.y - a0.y) * k : 3.f;
+            a0.x -= ex; a0.y -= ey; a1.x += ex; a1.y += ey; }
+        ImColor col = b.surv ? ImColor(60, 230, 90, 210) : ImColor(255, 200, 0, 210);   // 只画天线区间：黄；穿过求生者：绿
+        Draw->AddLine(a0, a1, col, th);
+    }
+
+    // 落点预测(喷射中)：只画终点小球，按结果上色(青机身/黄天线/红墙地/灰没落地)，黑边便于在亮背景上看清
+    if (r.end_kind != 0) {
+        ImVec2 e;
+        if (wax_proj_pt(r.end, e)) {
+            ImColor ec = r.end_kind == 1 ? ImColor(0, 210, 255, 255) : r.end_kind == 2 ? ImColor(255, 200, 0, 255)
+                       : r.end_kind == 3 ? ImColor(255, 60, 60, 255) : ImColor(160, 160, 160, 255);
+            Draw->AddCircleFilled(e, 10.f, ec);
+            Draw->AddCircle(e, 10.f, ImColor(0, 0, 0, 220), 0, 2.f);
+        }
+    }
+
+}
+
+// 某角色的准星：存过的用存的，没有就用蜡像师的，再没有就用默认(位置 = 游戏蜡枪标记，样式 = 十字加点)
+static XhairCfg xhair_for(int pid)
+{
+    auto it = g_xhair.find(pid);
+    if (it != g_xhair.end() && it->second.x >= 0 && it->second.y >= 0) return it->second;
+    it = g_xhair.find(WaxAim::WAX_PID);
+    if (it != g_xhair.end() && it->second.x >= 0 && it->second.y >= 0) return it->second;
+    XhairCfg d; d.x = px; d.y = py * 2.f * WAX_MARK_Y;
+    return d;
+}
+
+// 换角色时套用该角色的准星(角色 = g_cam_ctrl.unit.pid，WaxAim 线程每帧读)
+static void xhair_follow_role()
+{
+    int pid = WaxAim::status().pid;
+    if (pid <= 0 || pid == g_xhair_pid) return;
+    g_xhair_pid = pid;
+    g_xh = xhair_for(pid);
+    WaxAim::aim_x = g_xh.x; WaxAim::aim_y = g_xh.y;
+}
+
+static const char *xhair_style_name(int s)
+{
+    switch (s) {
+        case XH_CROSS_DOT:  return T("十字+点", "Cross + dot");
+        case XH_CROSS:      return T("十字", "Cross");
+        case XH_DOT:        return T("圆点", "Dot");
+        case XH_CIRCLE:     return T("圆圈", "Circle");
+        case XH_CIRCLE_DOT: return T("圆圈+点", "Circle + dot");
+        case XH_T:          return T("T 形", "T-shape");
+    }
+    return "?";
+}
+
+// ---- 准星(所有角色通用，默认关)：画在 WaxAim::aim_x/aim_y，白色带黑边 ----
+// 大小 = 臂长(十字/T)或半径(圆圈)，粗细 = 线宽；十字中间留空 = 大小 × 5/12(默认 12 → 5，同原来)
+static void draw_crosshair_at(ImDrawList *Draw, float mx, float my, const XhairCfg &c)
+{
+    const ImColor fg(255, 255, 255, 235), bg(0, 0, 0, 200);
+    const float len = c.size, gap = c.size * 5.f / 12.f, th = c.thick;
+    const float dot = th * 0.8f;                                  // 默认粗细 2 → 点半径 1.6，同原来
+    const ImVec2 d[4] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+    for (int pass = 0; pass < 2; pass++) {                        // 先画黑边再画白线，亮暗背景都看得清
+        ImColor col = pass ? fg : bg;
+        float w = pass ? th : th + 2.f;
+        float r_dot = pass ? dot : dot + 1.2f;
+        bool arms = c.style == XH_CROSS_DOT || c.style == XH_CROSS || c.style == XH_T;
+        if (arms)
+            for (int k = 0; k < 4; k++) {
+                if (c.style == XH_T && k == 3) continue;          // T 形不画上臂
+                const ImVec2 &v = d[k];
+                Draw->AddLine({mx + v.x * gap, my + v.y * gap}, {mx + v.x * (gap + len), my + v.y * (gap + len)}, col, w);
+            }
+        if (c.style == XH_CIRCLE || c.style == XH_CIRCLE_DOT)
+            Draw->AddCircle({mx, my}, len, col, 0, w);
+        if (c.style == XH_CROSS_DOT || c.style == XH_CIRCLE_DOT || c.style == XH_T)
+            Draw->AddCircleFilled({mx, my}, r_dot, col);
+        if (c.style == XH_DOT)
+            Draw->AddCircleFilled({mx, my}, pass ? len * 0.35f : len * 0.35f + 1.2f, col);
+    }
+}
+
+static void draw_crosshair(ImDrawList *Draw)
+{
+    const float mx = WaxAim::aim_x >= 0 ? WaxAim::aim_x : px, my = WaxAim::aim_y >= 0 ? WaxAim::aim_y : py * 2.f * WAX_MARK_Y;
+    draw_crosshair_at(Draw, mx, my, g_xh);
+}
+
 void Draw_Main(ImDrawList *Draw){
     PySelf::set_copycat_book(copycat_mode);        // 身份簿只在开关打开时记，见 PySelf.h
     PyWaterFight::set_enabled(waterfight_mode);    // 林中童话关着时它的线程不读内存，见 PyWaterFight.h
+    PyItems::set_enabled(show_draw_Prop);          // 道具白名单同理，见 PyItems.h
     if (libbase == 0 || read_state == 0) return;  // 数据未就绪，跳过本帧绘制
+    xhair_follow_role();                           // 准星位置跟着当前角色走
     int char_count = 0;
 
     // ---- 自身锚点：引擎自己持有的答案。相机深度启发式兜底已停用，这是唯一来源 ----
@@ -1220,17 +1602,52 @@ void Draw_Main(ImDrawList *Draw){
     // 原来是 getPtr64(getPtr64(..)+0xa58)+0x2c0 一步到位：任一跳读成 0(内存压力下驱动静默返回 0，
     // 或跨对局时 +0xa58 真的为空)就得到 0x2c0 这种地址，后面 vm_readv 失败也没人看返回值。
     // 现在校验不过就不更新 Matrix/matrix[]，沿用上一帧，见 MATRIX_STALE_MAX。
+    // 2026-10-30：锁的是签名不是槽位。当前槽位读不出来、或读出来但锚点投影不对(真值不过)，当帧就在签名窗口里重选：
+    //   找到通过真值的 -> 立刻切过去；当前读不出来时，只要有结构通过的也先切(比停止投影强)；
+    //   过场/合照/结算时相机不跟人，所有候选真值一起不过 -> 不切、照用当前的。找不到就降频到每 10 帧试一次。
+    //   连续约 5 秒一个都读不出来才请求读线程重扫 bss。没有锚点(大厅/准备)时只做结构校验
     bool matrix_fresh = false;
     {
-        uint64_t root = getPtr64(libbase + MatrixOffset);
-        uint64_t mobj = is_user_ptr(root) ? getPtr64(root + 0xa58) : 0;
-        if (is_user_ptr(mobj)) {
-            float tmp[16];
-            if (vm_readv(mobj + 0x2c0, tmp, sizeof(tmp)) && matrix_finite(tmp)) {
-                Matrix = mobj + 0x2c0;
-                memcpy(matrix, tmp, sizeof(matrix));
-                matrix_fresh = true;
+        static int retry_wait = 0, dead_rounds = 0;
+        float anc[3];
+        bool has_truth = false;
+        if (has_auth_self) {
+            uint64_t coor = getPtr64(auth_self + 0x28);
+            has_truth = is_user_ptr(coor) && vm_readv(coor + 0xa0, anc, 12) && !(anc[0] == 0 && anc[2] == 0);
+        }
+        uint64_t cur_slot = libbase + MatrixOffset;
+        uint64_t mobj = 0;
+        float tmp[16];
+        bool cur_ok = read_matrix_root(getPtr64(cur_slot), mobj, tmp);
+        bool cur_true = cur_ok && (!has_truth || anchor_in_view(tmp, anc));
+        if (cur_true) {
+            retry_wait = 0;
+            dead_rounds = 0;
+        } else if (retry_wait > 0) {
+            retry_wait--;
+        } else {
+            uint64_t ns = 0, nm = 0;
+            float nt[16];
+            int r = find_matrix_slot(cur_slot, has_truth ? anc : nullptr, ns, nm, nt);
+            if (r == 2 || (r == 1 && !cur_ok)) {
+                printf("[矩阵切换] 槽位 0x%lx -> 0x%lx(%s)\n", MatrixOffset, (long)(ns - libbase),
+                       r == 2 ? "真值通过" : "当前读不出");
+                MatrixOffset = (long)(ns - libbase);
+                mobj = nm;
+                memcpy(tmp, nt, sizeof(tmp));
+                cur_ok = true;
             }
+            if (r != 2) retry_wait = 10;
+            if (r == 0 && !cur_ok) {
+                if (++dead_rounds >= 30) { g_rescan_req = true; dead_rounds = 0; }
+            } else {
+                dead_rounds = 0;
+            }
+        }
+        if (cur_ok) {
+            Matrix = mobj + 0x2c0;
+            memcpy(matrix, tmp, sizeof(matrix));
+            matrix_fresh = true;
         }
     }
     if (matrix_fresh) g_matrix_stale = 0;
@@ -1684,6 +2101,87 @@ void Draw_Main(ImDrawList *Draw){
         }
     }
 
+    if (matrix_usable) draw_wax_aim(Draw);   // 蜡像师喷蜡瞄准线/落点(不是蜡像师时只更新视线朝向)
+    if (show_crosshair) draw_crosshair(Draw);
+
+    // ---- 密码机破译进度：按 Python 侧真实世界列表画(同大门)，不走 data[] 和 is_real_generator ----
+    // 约瑟夫局每进出一次镜世界，游戏对密码机 set_visible → lod_callback 切网格，几次之后场景侧判据会挡掉真实密码机，
+    // 场景内标记消失而 HUD 正常(2026-10-30)。镜像密码机在 PyProgress 里就没收，这里也就不会画。
+    // 坐标优先读场景对象(每帧实时)，没有场景对象时用 position。PyProgress 不可用时实体循环里的老分支兜底
+    if (show_draw_secret_mechine && PyProgress::available()){
+        for (int i = 0; i < PyProgress::gen_total(); i++){
+            PyProgress::Entry g;
+            if (!PyProgress::get_gen_entry(i, g)) continue;
+            if (PyProgress::is_decoded(g.progress)) continue;    // 破译完的机器本身和进度都不画
+            float mx = g.x, mz = g.z, my = g.y;                   // x / 高度 / y
+            if (g.scene_obj){
+                uintptr_t coor_ptr = getPtr64((uintptr_t)g.scene_obj + 0x28);
+                float c[3];
+                if (coor_ptr && vm_readv(coor_ptr + 0xa0, c, 12) && !(c[0] == 0 && c[2] == 0)){
+                    mx = c[0]; mz = c[1]; my = c[2];
+                }
+            }
+            if (mx == 0 || my == 0) continue;
+
+            float cam = matrix[3]*mx + matrix[7]*mz + matrix[11]*my + matrix[15];
+            if (cam <= 0.01f) continue;                    // 在相机背后
+            float gdist = sqrt(pow(mx - Z.X, 2) + pow(my - Z.Y, 2) + pow(mz - Z.Z, 2)) / dist_scale;
+            if (gdist >= 300) continue;
+            float sx = px + (matrix[0]*mx + matrix[4]*mz + matrix[8]*my + matrix[12]) / cam * px;
+            float sy = py - (matrix[1]*mx + matrix[5]*(mz+8.5f) + matrix[9]*my + matrix[13]) / cam * py;
+
+            std::ostringstream oss;
+            oss << std::fixed << std::setprecision(1) << gdist;
+            std::string dist_text = " " + oss.str() + T(" 米", " m");
+            char head[24];
+            snprintf(head, sizeof(head), "[%.1f%%]", g.progress);
+            // 两段分开上色：头用进度色，距离在"我是蜡像师且最大仰角能附着"时变绿(WaxAim.h，替代原来 61~63 米)
+            auto hs = ImGui::CalcTextSize(head, 0, 25);
+            auto ds = ImGui::CalcTextSize(dist_text.c_str(), 0, 25);
+            float x0 = sx - (hs.x + ds.x) / 2.0f;
+            Draw->AddText({x0, sy}, progress_color(g.progress), head);
+            Draw->AddText({x0 + hs.x, sy},
+                WaxAim::gen_green(g.scene_obj) ? color_green : ImColor(255, 255, 255, 255),
+                dist_text.c_str());
+            // 进度条画在文字上方；进度为 0 时没有意义，不画
+            if (g.progress > 0.05f){
+                const float bar_w = 120.0f, bar_h = 10.0f;
+                float bx = sx - bar_w / 2.0f, by = sy - bar_h - 3.0f;
+                Draw->AddRectFilled({bx, by}, {bx + bar_w * (g.progress / 100.0f), by + bar_h}, progress_color(g.progress));
+                Draw->AddRect({bx, by}, {bx + bar_w, by + bar_h}, ImColor(255,255,255,255));
+            }
+        }
+    }
+
+    // ---- 护肘：手持时不挂模型(model_bind_type!=0，游戏往主人模型上 add_mesh)，场景里没有跟着人走的对象，
+    // 按主人本体的坐标画(2026-10-30，见 PyItems.h)。配表里 model_bind_type!=0 的只有护肘 63/2004。
+    // 地上的护肘(没主人)模型会被放回场景，走实体循环正常画
+    if (show_draw_Prop && PyItems::available()){
+        const char *elbow_name = getprop("h55_pendant_huzhou");
+        for (int i = 0; elbow_name && i < PyItems::count(); i++){
+            PyItems::Entry it;
+            if (!PyItems::get(i, it)) continue;
+            if (!it.owned || it.bind_type == 0 || it.owner_body == 0) continue;
+            if (item_is_mine(it, auth_self)) continue;
+            uintptr_t coor_ptr = getPtr64((uintptr_t)it.owner_body + 0x28);
+            float c[3];
+            if (!coor_ptr || !vm_readv(coor_ptr + 0xa0, c, 12)) continue;
+            float mx = c[0], mz = c[1], my = c[2];                // x / 高度 / y
+            if (mx == 0 || my == 0 || mz <= -300) continue;
+
+            float cam = matrix[3]*mx + matrix[7]*mz + matrix[11]*my + matrix[15];
+            if (cam <= 0.01f) continue;                    // 在相机背后
+            float edist = sqrt(pow(mx - Z.X, 2) + pow(my - Z.Y, 2) + pow(mz - Z.Z, 2)) / dist_scale;
+            if (edist >= 300) continue;
+            float sx = px + (matrix[0]*mx + matrix[4]*mz + matrix[8]*my + matrix[12]) / cam * px;
+            float sy = py - (matrix[1]*mx + matrix[5]*(mz+8.5f) + matrix[9]*my + matrix[13]) / cam * py;
+
+            std::string s = elbow_name;                    // 在人身上，不带距离(人自己的标签有)
+            auto ts = ImGui::CalcTextSize(s.c_str(), 0, 25);
+            Draw->AddText({sx - ts.x/2.0f, sy}, ImColor(255,200,0,255), s.c_str());
+        }
+    }
+
     // ---- 模仿者模式：按身份簿里每个活人的 unit.position 自己投影(学若辰，2026-09-26) ----
     // 不走下面的实体循环：假面舞会时模型换成石像，按 model+0x20 配对会整个配不上。
     // 位置从 Python 单位上读，换不换模型都一样。坐标拿不到的人(没校准/这轮读失败超过 300ms)
@@ -1791,10 +2289,11 @@ void Draw_Main(ImDrawList *Draw){
                 float sy = py - (matrix[1]*ox + matrix[5]*oy + matrix[9]*oz + matrix[13]) / cam * py;
                 bp[t] = ImVec2(sx, sy); bok[t] = true;
             }
-            // 监管红、求生者绿(监管本体 = PySelf::butcher_bodies，联合狩猎两个)。约瑟夫镜世界里"另一个世界"的人画白色
+            // 监管方红、求生者绿。约瑟夫镜世界里"另一个世界"的人画白色
+            // 监管方 = 本体集合里来自 [1]/[236]/[1065] 的单位：联合狩猎两个监管、巡视者、梦之信徒、伊斯幻影都红
             ImU32 bcol;
             if (PySelf::is_other_world(Ms[u]))      bcol = (ImU32)BotBoneColor;
-            else if (PySelf::is_butcher_body(Ms[u]))  bcol = (ImU32)ImColor(255, 60, 60, 230);   // 联合狩猎两个监管都红
+            else if (PySelf::is_hunter_side(Ms[u]))   bcol = (ImU32)ImColor(255, 60, 60, 230);
             else                                      bcol = (ImU32)ImColor(40, 255, 90, 230);
             for (int e = 0; e < NativeBones::NUM_EDGE; e++) {
                 int a = NativeBones::EDGES[e][0], b = NativeBones::EDGES[e][1];
@@ -1985,9 +2484,9 @@ void Draw_Main(ImDrawList *Draw){
     		    }
 
     	    else if (strstr(data[i].class_name, "sender") != NULL){
-    	        // 判据见上面 is_real_generator() 的注释。若发现密码机被破译完成后从叠加层消失，改那里。
-    	        // 约瑟夫镜世界的镜像密码机(PyProgress 黑名单)不画，否则满屏重复的"[密码机]"空标记
-    	        if (show_draw_secret_mechine && is_real_generator(data[i].obj) && !PyProgress::is_mirror_generator(data[i].obj)){
+    	        // 兜底：PyProgress 可用时密码机在实体循环前按 Python 侧列表画(见那里)，这里只在它不可用时走。
+    	        // 判据见上面 is_real_generator() 的注释。
+    	        if (show_draw_secret_mechine && !PyProgress::available() && is_real_generator(data[i].obj)){
     	            // 进度来自 Python 侧的 GeneratorUnit，靠 model 指针身份配对(见 PyProgress.h)。
     	            // 配不上时(model 为空/链路失效)退化成原来的 "[密码机] X.X 米"。
     	            float progress = 0.f;
@@ -2000,13 +2499,13 @@ void Draw_Main(ImDrawList *Draw){
     	                if (has_progress) snprintf(head, sizeof(head), "[%.1f%%]", progress);
     	                else        snprintf(head, sizeof(head), "%s", T("[密码机]", "[Cipher]"));
 
-    	                // 两段分开上色：头用进度色，距离沿用原来 61~63 米变绿的规则
+    	                // 两段分开上色：头用进度色，距离在"我是蜡像师且最大仰角能附着"时变绿(WaxAim.h，替代原来 61~63 米)
     	                auto hs = ImGui::CalcTextSize(head, 0, 25);
     	                auto ds = ImGui::CalcTextSize(dist_text.c_str(), 0, 25);
     	                float x0 = r_x - (hs.x + ds.x) / 2.0f;
     	                Draw->AddText({x0, r_y}, has_progress ? progress_color(progress) : ImColor(255,255,255,255), head);
     	                Draw->AddText({x0 + hs.x, r_y},
-    	                    ((int)dist >= 61 && (int)dist <= 63) ? color_green : ImColor(255, 255, 255, 255),
+    	                    WaxAim::gen_green(data[i].obj) ? color_green : ImColor(255, 255, 255, 255),
     	                    dist_text.c_str());
 
     	                // 进度条画在文字上方；进度为 0 时没有意义，不画
@@ -2022,23 +2521,49 @@ void Draw_Main(ImDrawList *Draw){
     		}
 	
 		    if (show_draw_Prop&&data[i].camp==4){
-                // 自己身上的道具按距离剔除。必须只算**水平**距离:
-                // 道具是挂在角色骨骼上的(手/胸口)，挂点比角色原点(脚底)高一截，
-                // 实测 h55_pendant_glim(手电筒) 高度差固定 +0.73 米、水平只差 0.36 米。
-                // 三维距离因此恒有 0.7+ 米的底噪，亚米阈值永远不成立 —— 挂件类道具靠
-                // 三维距离**不可能**滤掉，跟站位无关，是结构性偏移。
-                // 所以这里必须单独算水平距离，不能拿全局 dist(三维)比。
-                float prop_hdist = sqrt(pow(D.X - Z.X, 2) + pow(D.Y - Z.Y, 2)) / dist_scale;
-                // 阈值 1.5 米：手电筒实测水平只差 0.36 米，但 1.0 米实战仍有漏网，
-                // 说明别的挂件(火箭/橄榄球等)挂点更靠外。代价是贴身队友手里的道具
-                // 也会被隐藏，1.5 米内的地面道具本来也在视野里，可以接受。
-                if (prop_hdist >= 1.5f) {
+                // 道具模型(h55_pendant_*)按游戏自己的道具清单过滤(PyItems.h，2026-10-30)：
+                //   不在 _uid2item 里 = 用完已销毁、场景里残留的模型，不画；
+                //   护肘这类 model_bind_type!=0 的手持道具，场景里那个模型停在创建点，不画(下面按主人位置另画)；
+                //   自己的(主人是我 / 所在的玩具商包贴在我身上)不画。
+                // 清单不可用或这轮没读全、以及不是道具模型的，退回下面的老逻辑。
+                // 厂长傀儡/窥视者/巡视者是单位不是道具，模型却也在 h55_pendant 下(skill_creature 1~4 / 12,70 / 15,125)，
+                // 不在 _uid2item 里，进白名单会被全挡掉，所以排除。小丑骑的火箭同理，但它在 PyItems 里按单位收了
+                const char *cn = data[i].class_name;
+                const bool is_pendant = strstr(cn, "h55_pendant") != NULL && strstr(cn, "pendant_puppet") == NULL
+                                     && strstr(cn, "pendant_tower") == NULL && strstr(cn, "pendant_patrol") == NULL;
+                PyItems::Entry item;
+                bool draw_prop;
+                bool on_body = false;   // 在人身上(有主人，或所在的玩具商包贴在人身上)：只写名字不带距离
+                if (strstr(cn, "trap.gim") != NULL) {
+                    // 鹿头夹子：是单位不是道具，不进 _uid2item，也没人拿在手上，不走距离剔除。
+                    // 我是监管时不画：游戏本来就显示，而且放夹子时的瞄准预览(VSkillClaspTrapCharge.rtc_model)
+                    // 用的是同一个 trap.gim，会被当成夹子画出来
+                    draw_prop = !(has_auth_self && self_camp == 1);
+                } else if (is_pendant && PyItems::lookup(data[i].obj, item)) {
+                    draw_prop = !(item.owned && item.bind_type != 0) && !item_is_mine(item, auth_self);
+                    on_body = item.owned || item.attach_uid > 0;
+                } else if (is_pendant && PyItems::complete()) {
+                    draw_prop = false;
+                } else {
+                    // 老逻辑：自己身上的道具按距离剔除。必须只算**水平**距离:
+                    // 道具是挂在角色骨骼上的(手/胸口)，挂点比角色原点(脚底)高一截，
+                    // 实测 h55_pendant_glim(手电筒) 高度差固定 +0.73 米、水平只差 0.36 米。
+                    // 三维距离因此恒有 0.7+ 米的底噪，亚米阈值永远不成立 —— 挂件类道具靠
+                    // 三维距离**不可能**滤掉，跟站位无关，是结构性偏移。
+                    // 阈值 1.5 米：手电筒实测水平只差 0.36 米，但 1.0 米实战仍有漏网，
+                    // 说明别的挂件(火箭/橄榄球等)挂点更靠外。代价是贴身队友手里的道具也会被隐藏。
+                    float prop_hdist = sqrt(pow(D.X - Z.X, 2) + pow(D.Y - Z.Y, 2)) / dist_scale;
+                    draw_prop = prop_hdist >= 1.5f;
+                }
+                if (draw_prop) {
                     const char* propName = getprop(data[i].class_name);
                     if (propName) {
                         std::string s = propName;
-                        if (g_english) s += " ";      // 中文名后直接接数字，英文要隔开
-                        s += std::to_string((int) dist);
-                        s += T(" 米", " m");
+                        if (!on_body) {
+                            if (g_english) s += " ";      // 中文名后直接接数字，英文要隔开
+                            s += std::to_string((int) dist);
+                            s += T(" 米", " m");
+                        }
                         auto textSize = ImGui::CalcTextSize(s.c_str(), 0, 25);
                         Draw->AddText({r_x-(textSize.x/2),r_y}, ImColor(255,200,0,255), s.c_str());
                     }
@@ -2411,6 +2936,46 @@ void VolumeKeyHide() {
     free(fdArray);
 }
 
+#include <sys/stat.h>
+#include <ctime>
+// ---- 截图(带叠加层)：手机自带截图按图层/UID 过滤，截不到叠加层；root 跑 screencap 抓的是整屏合成结果，叠加层在里面 ----
+// 流程：点按钮 -> 主菜单隐藏 3 帧(让不带菜单的画面先显示出来) -> 后台线程 screencap 存到相册截图目录 -> 通知媒体库 -> 菜单恢复
+static std::atomic<int> g_shot_state{0};      // 0 空闲  1 正在藏菜单(等帧)  2 正在截
+static int  g_shot_wait_frames = 0;
+static char g_shot_msg[200] = "";
+static std::atomic<bool> g_shot_msg_new{false};
+
+static void shot_worker()
+{
+    time_t now = time(nullptr);
+    struct tm lt; localtime_r(&now, &lt);
+    char path[160];
+    strftime(path, sizeof(path), "/storage/emulated/0/Pictures/Screenshots/IdentityV_%Y%m%d_%H%M%S.png", &lt);
+    system("mkdir -p /storage/emulated/0/Pictures/Screenshots");
+    char cmd[320];
+    snprintf(cmd, sizeof(cmd), "screencap -p '%s'", path);
+    int rc = system(cmd);
+    struct stat st;
+    if (rc == 0 && stat(path, &st) == 0 && st.st_size > 0) {
+        snprintf(cmd, sizeof(cmd), "am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE -d 'file://%s' >/dev/null 2>&1", path);
+        system(cmd);                                              // 让相册立刻看到
+        snprintf(g_shot_msg, sizeof(g_shot_msg), T("已截图: %s", "Screenshot saved -> %s"), path + strlen("/storage/emulated/0/"));
+    } else {
+        snprintf(g_shot_msg, sizeof(g_shot_msg), "%s", T("截图失败(screencap 没有输出)", "Screenshot failed (screencap produced nothing)"));
+    }
+    g_shot_msg_new = true;
+    g_shot_state = 0;
+}
+
+static void shot_tick()
+{
+    if (g_shot_msg_new.exchange(false)) cfg_set_msg(g_shot_msg);
+    if (g_shot_state == 1 && --g_shot_wait_frames <= 0) {
+        g_shot_state = 2;
+        std::thread(shot_worker).detach();
+    }
+}
+
 void Layout_tick_UI(bool *main_thread_flag) {
     // 启动后第一帧：先记默认值，再读 /data 下的配置(要在 ImGui 上下文建好之后，cfg_set_msg 用到 GetTime)
     static bool cfg_autoloaded = false;
@@ -2432,8 +2997,10 @@ void Layout_tick_UI(bool *main_thread_flag) {
     // SoHook::Update(pid);
 
     Draw_Main(ImGui::GetForegroundDrawList());
+    shot_tick();
 
-    if (show_window) {
+    if (show_window && (g_shot_state == 0 || !shot_hide_menu)) {  // 截图时按开关决定藏不藏主菜单
+
         ImGui::SetNextWindowBgAlpha(panel_alpha);
         if (cfg_apply_main) { ImGui::SetNextWindowPos({cfg_main_x, cfg_main_y}, ImGuiCond_Always); cfg_apply_main = false; }
         ImGui::Begin("New_Edition", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
@@ -2481,6 +3048,13 @@ void Layout_tick_UI(bool *main_thread_flag) {
         ImGui::SameLine();
         if (ImGui::Button(g_english ? "中文" : "English"))
             g_english = !g_english;
+        ImGui::SameLine();
+        if (ImGui::Button(T("截图(含叠加层)", "Screenshot (with overlay)")) && g_shot_state == 0) {
+            g_shot_wait_frames = shot_hide_menu ? 3 : 0;      // 藏菜单要先等几帧让不带菜单的画面显示出来
+            g_shot_state = 1;
+        }
+        ImGui::SameLine();
+        ImGui::Checkbox(T("截图时隐藏菜单", "Hide menu in shot"), &shot_hide_menu);
         ImGui::SetNextItemWidth(ImGui::GetFontSize() * 8);
         ImGui::SliderFloat(T("透明度###panel_alpha", "Opacity###panel_alpha"), &panel_alpha, 0.10f, 1.0f, "%.2f");
         if (ImGui::Button(T("保存配置###cfg_save", "Save Config###cfg_save"))) config_save();
@@ -2537,6 +3111,42 @@ void Layout_tick_UI(bool *main_thread_flag) {
             ImGui::Checkbox(T("监管天赋树", "Hunter Talent Tree"), &show_genius_tree);   // 径向图，独立可拖动窗口
         }
 
+        // 准星：所有角色通用，默认关。位置/样式/大小/粗细整套按角色记(保存配置时写进去)；
+        // 位置同时是蜡像师瞄准线对齐用的标记位置。没设过的角色沿用蜡像师的，再没有用默认(游戏蜡枪标记，十字+点)
+        if (ImGui::CollapsingHeader(T("准星###xhair", "Crosshair###xhair"))) {
+            float mw = (float)displayInfo.width, mh = (float)displayInfo.height;
+            if (WaxAim::aim_x < 0) WaxAim::aim_x = mw * 0.5f;
+            if (WaxAim::aim_y < 0) WaxAim::aim_y = mh * WAX_MARK_Y;
+            ImGui::Checkbox(T("显示准星##xh_on", "Show crosshair##xh_on"), &show_crosshair);
+            ImGui::SameLine();
+            if (ImGui::Button(T("恢复默认##xh_reset", "Reset##xh_reset"))) {
+                // 删掉本角色的记录：回到蜡像师的(当前就是蜡像师则回到默认)
+                if (g_xhair_pid > 0) g_xhair.erase(g_xhair_pid);
+                if (g_xhair_pid == WaxAim::WAX_PID) { g_xh = XhairCfg(); g_xh.x = mw * 0.5f; g_xh.y = mh * WAX_MARK_Y; }
+                else g_xh = xhair_for(g_xhair_pid);
+                WaxAim::aim_x = g_xh.x; WaxAim::aim_y = g_xh.y;
+            }
+            bool changed = false;
+            ImGui::SetNextItemWidth(ImGui::GetFontSize() * 8);
+            if (ImGui::BeginCombo(T("样式##xh_style", "Style##xh_style"), xhair_style_name(g_xh.style))) {
+                for (int s = 0; s < XH_STYLE_N; s++)
+                    if (ImGui::Selectable(xhair_style_name(s), s == g_xh.style)) { g_xh.style = s; changed = true; }
+                ImGui::EndCombo();
+            }
+            changed |= ImGui::SliderFloat(T("大小##xh_size", "Size##xh_size"), &g_xh.size, 3.0f, 60.0f, "%.0f");
+            changed |= ImGui::SliderFloat(T("粗细##xh_thick", "Thickness##xh_thick"), &g_xh.thick, 1.0f, 8.0f, "%.1f");
+            changed |= ImGui::SliderFloat(T("X##xh_x", "X##xh_x"), &WaxAim::aim_x, 0.0f, mw, "%.0f");
+            changed |= ImGui::SliderFloat(T("Y##xh_y", "Y##xh_y"), &WaxAim::aim_y, 0.0f, mh, "%.0f");
+            if (changed && g_xhair_pid > 0) {
+                g_xh.x = WaxAim::aim_x; g_xh.y = WaxAim::aim_y;
+                g_xhair[g_xhair_pid] = g_xh;
+            }
+            if (g_xhair_pid > 0)
+                ImGui::TextColored(ImVec4(0.65f, 0.65f, 0.65f, 1), T("当前角色 pid %d：%s", "Role pid %d: %s"), g_xhair_pid,
+                                   g_xhair.count(g_xhair_pid) ? T("用本角色的设置", "own settings") : T("沿用蜡像师/默认", "from Waxwork/default"));
+            ImGui::TextColored(ImVec4(0.65f, 0.65f, 0.65f, 1), "%s", T("改完点「保存配置」才会写进文件", "Click Save Config to keep changes"));
+        }
+
         // 固定信息(屏幕 HUD 汇总)：每块独立开关 + 独立 X/Y/大小。调好位置后把初值固化即可
         if (ImGui::CollapsingHeader(T("固定信息###fixed", "Fixed HUD###fixed"))) {
             float mw = (float)displayInfo.width, mh = (float)displayInfo.height;
@@ -2570,6 +3180,21 @@ void Layout_tick_UI(bool *main_thread_flag) {
             }
         }
 
+
+        // 蜡像师喷蜡辅助瞄准：把游戏的蜡枪瞄准标记抬进天空中的粗线里 = 能附着(见 WaxAim.h)
+        if (ImGui::CollapsingHeader(T("蜡像师###wax", "Waxwork###wax"))) {
+            const ImVec4 C_OK(0.4f, 1, 0.4f, 1), C_BAD(1, 0.45f, 0.45f, 1), C_DIM(0.65f, 0.65f, 0.65f, 1);
+            ImGui::Checkbox(T("开启##wax_on", "Enable##wax_on"), &WaxAim::enabled);
+            ImGui::SameLine();
+            ImGui::Checkbox(T("落点小球##wax_traj", "Landing dot##wax_traj"), &WaxAim::show_traj);
+            ImGui::Checkbox(T("不喷射时也画瞄准线##wax_always", "Aim lines when not spraying##wax_always"), &WaxAim::show_always);
+            WaxAim::Status st = WaxAim::status();
+            const char *cs = WaxAim::col_status();
+            bool col_ok = strstr(cs, "三角") || strstr(cs, "tris");
+            if (st.is_wax) ImGui::TextColored(col_ok ? C_OK : C_BAD, "%s", col_ok ? T("蜡像师：已识别，遮挡已加载", "Waxwork detected, occlusion loaded")
+                                                                                   : T("蜡像师：已识别，本图没有遮挡文件", "Waxwork detected, no occlusion file for this map"));
+            else           ImGui::TextColored(C_DIM, "%s", T("当前不是蜡像师", "Not playing Waxwork"));
+        }
 
         // 模仿者模式：开关 + 身份簿。开着时名字换成"N号 身份"、不画射线；读到的身份记在簿子里，
         // 开会阶段页被换出读不到时沿用(见 PySelf.h 身份簿)。关掉开关簿子清空

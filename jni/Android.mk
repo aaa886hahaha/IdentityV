@@ -58,5 +58,7 @@ LOCAL_SRC_FILES += src/My_Utils/stb_image.cpp
 
 
 LOCAL_LDLIBS := -llog -landroid -lEGL -lGLESv3 -ldl
+# 蜡像师遮挡用的碰撞资源包(jni/src/res/wax_col.pak，WaxAim.h 里 .incbin 嵌入)按图 zlib 压缩，运行时用系统 libz 解压
+LOCAL_LDLIBS += -lz
 
 include $(BUILD_EXECUTABLE) #可执行文件

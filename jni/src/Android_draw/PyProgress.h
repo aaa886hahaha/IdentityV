@@ -106,11 +106,6 @@ static volatile int g_door_count[2] = {0, 0};
 // 镜面也在同一次刷新里填、共用 g_active 翻转
 static MirrorPlane g_mirror_buf[2] = {};
 
-// 约瑟夫镜世界的镜像密码机**场景对象**黑名单：它们不进 g_buf(没进度)，但场景对象仍在 data[] 里、
-// 会被 is_real_generator 画成"[密码机]"空标记。绘制侧用 is_mirror_generator() 跳过。跟 g_active 同步翻转
-static uint64_t g_mirror_gen[2][MAX_GENERATORS];
-static int      g_mirror_gen_n[2] = {0, 0};
-
 static uintptr_t g_libbase = 0;
 static uint64_t  g_module_dict = 0;                 // game_kernel 的 md_dict，进程内稳定
 static int64_t   g_i_unit_mgr = -1, g_i_ubt = -1, g_i_fix = -1, g_i_pos = -1, g_i_model = -1;
@@ -268,7 +263,6 @@ static bool try_refresh()
 
     // 大门、镜面先收：放在密码机那几个 return false 之前，免得"没有密码机列表"把它们也带下水
     int write_idx = 1 - g_active;
-    g_mirror_gen_n[write_idx] = 0;                 // 约瑟夫镜世界镜像密码机黑名单，本轮重建
     collect_doors(ubt, write_idx);
     collect_mirror(ubt, write_idx);
 
@@ -299,18 +293,7 @@ static bool try_refresh()
         uint64_t d = getPtr64(inst - 0x18);
         Dict dk;
         if (!read_dict(d, dk)) continue;
-        if (is_photo_ghost(d, dk)) {   // 约瑟夫镜世界的镜像密码机：不进进度缓冲，场景对象记进黑名单供绘制侧跳过
-            g_i_model = resolve_index(d, dk, g_i_model, "model");
-            if (g_i_model >= 0) {
-                uint64_t mo = getPtr64(value_slot(dk, g_i_model));
-                if (is_obj(mo)) {
-                    uint64_t sp = getPtr64(mo + 0x20);
-                    if (is_obj(sp) && g_mirror_gen_n[write_idx] < MAX_GENERATORS)
-                        g_mirror_gen[write_idx][g_mirror_gen_n[write_idx]++] = sp;
-                }
-            }
-            continue;
-        }
+        if (is_photo_ghost(d, dk)) continue;   // 约瑟夫镜世界的镜像密码机：不进缓冲(场景内标记和 HUD 都只画真实世界)
 
         g_i_fix   = resolve_index(d, dk, g_i_fix,   "fix_process");
         g_i_model = resolve_index(d, dk, g_i_model, "model");
@@ -425,13 +408,16 @@ static inline bool is_decoded(float progress) { return progress >= 99.95f; }
 // 绘制侧自行按 is_decoded() 过滤掉修完的，使其从面板消失。
 static inline int gen_total() { return g_available ? g_count[g_active] : 0; }
 
-// 约瑟夫镜世界：这个场景对象是不是镜像密码机(要在绘制侧跳过，不画"[密码机]"空标记)
-static bool is_mirror_generator(uintptr_t obj)
+// 场景内密码机标记直接遍历这里画(同大门)，不走 data[] 和场景侧判据 is_real_generator：
+// 约瑟夫局每进出一次镜世界，游戏都会对密码机 set_visible → lod_callback 切网格(GeneratorUnit.set_visible，
+// 2026-10-30 反编译)，普通局从不发生；几次之后场景侧判据就挡掉了真实密码机(HUD 走这里所以一直正常)
+static bool get_gen_entry(int i, Entry &out)
 {
     if (!g_available) return false;
-    int b = g_active, n = g_mirror_gen_n[b];
-    for (int i = 0; i < n; i++) if (g_mirror_gen[b][i] == (uint64_t)obj) return true;
-    return false;
+    int b = g_active;
+    if (i < 0 || i >= g_count[b]) return false;
+    out = g_buf[b][i];
+    return true;
 }
 static bool get_gen(int i, float &progress)
 {

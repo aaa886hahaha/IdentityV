@@ -57,7 +57,29 @@ static char g_log[256] = "(骨骼未启用)";
 static inline void setlog(const char *s) { snprintf(g_log, sizeof(g_log), "%s", s); }
 static inline const char *log_text() { return g_log; }
 
-// 建 target 名字 -> 骨骼数组下标(每个 SKEL 只做一次)
+// 一个骨骼名拆成 前缀("biped"/"biped01"/"biped03"...) + 目标后缀，返回前缀组号(0~MAX_GROUP-1)、
+// 不是 "biped<两位数字> <目标>" 形式返回 -1。组 0 = 无前缀 "biped"，组 k = "biped%02d"(k 取数字+1，冲突时并到最后一组)
+static const int MAX_GROUP = 8;
+static int split_biped(const char *name, int &target)
+{
+    if (strncmp(name, "biped", 5) != 0) return -1;
+    const char *p = name + 5;
+    int group = 0;
+    if (p[0] >= '0' && p[0] <= '9' && p[1] >= '0' && p[1] <= '9') {
+        group = (p[0] - '0') * 10 + (p[1] - '0') + 1;
+        if (group >= MAX_GROUP) group = MAX_GROUP - 1;
+        p += 2;
+    }
+    if (p[0] != ' ') return -1;
+    for (int t = 0; t < NUM_TARGET; t++)
+        if (strcmp(p, TARGET[t] + 5) == 0) { target = t; return group; }   // TARGET 都是 "biped xxx"，比 " xxx"
+    return -1;
+}
+
+// 建 target 名字 -> 骨骼数组下标(每个 SKEL 只做一次)。
+// 一个骨架里可能有好几套 biped：破轮 polun.skeleton 是三个人拼的，biped / biped01 只有头颈脊椎腿、没手臂，
+// biped03 才 17 个目标全有(2026-10-30 从 chr_boss.idx 的动画 NAME 块读出)。所以按前缀分组，取命中最多的一组，
+// 平手取无前缀那组 —— 普通角色只有 "biped"，结果跟原来一样。
 static bool build_namemap(uint64_t SKEL, NameMap &nm)
 {
     uint64_t begin = getPtr64(SKEL + 0x80), end = getPtr64(SKEL + 0x88);
@@ -66,12 +88,12 @@ static bool build_namemap(uint64_t SKEL, NameMap &nm)
     if ((bytes & 15) != 0 || bytes > 0x2000) return false;
     int count = (int)(bytes / 16);
     if (count < 1 || count > 512) return false;
-    for (int i = 0; i < NUM_TARGET; i++) nm.idx[i] = -1;
-    nm.max_idx = -1;
-    nm.begin = begin; nm.end = end; nm.check_i = -1; nm.check_id = 0;
+    int gidx[MAX_GROUP][NUM_TARGET];
+    uint32_t gid[MAX_GROUP][NUM_TARGET];
+    int ghits[MAX_GROUP] = {0};
+    for (int g = 0; g < MAX_GROUP; g++) for (int t = 0; t < NUM_TARGET; t++) gidx[g][t] = -1;
     char name[136];
-    int found = 0;
-    for (int i = 0; i < count && found < NUM_TARGET; i++) {
+    for (int i = 0; i < count; i++) {
         uint64_t item = begin + (uint64_t)i * 16;
         uint32_t id = 0;
         if (!vm_readv(item, &id, 4)) continue;
@@ -83,14 +105,22 @@ static bool build_namemap(uint64_t SKEL, NameMap &nm)
         if (!is_ptr(l2)) continue;
         if (!vm_readv(l2 + 0x10, name, sizeof(name) - 1)) continue;
         name[sizeof(name) - 1] = 0;
-        for (int t = 0; t < NUM_TARGET; t++)
-            if (nm.idx[t] < 0 && strcmp(name, TARGET[t]) == 0) {
-                nm.idx[t] = i;
-                if (i > nm.max_idx) nm.max_idx = i;
-                if (nm.check_i < 0) { nm.check_i = i; nm.check_id = id; }   // 第一根命中的骨骼当校验项
-                found++;
-                break;
-            }
+        int t = -1;
+        int g = split_biped(name, t);
+        if (g < 0 || gidx[g][t] >= 0) continue;
+        gidx[g][t] = i; gid[g][t] = id; ghits[g]++;
+        if (ghits[0] == NUM_TARGET) break;   // 无前缀组已满：平手也是它赢，后面不用再读(普通角色和原来一样提前结束)
+    }
+    int best = 0;
+    for (int g = 1; g < MAX_GROUP; g++) if (ghits[g] > ghits[best]) best = g;
+    nm.max_idx = -1;
+    nm.begin = begin; nm.end = end; nm.check_i = -1; nm.check_id = 0;
+    for (int t = 0; t < NUM_TARGET; t++) {
+        int i = gidx[best][t];
+        nm.idx[t] = i;
+        if (i < 0) continue;
+        if (i > nm.max_idx) nm.max_idx = i;
+        if (nm.check_i < 0 || i < nm.check_i) { nm.check_i = i; nm.check_id = gid[best][t]; }   // 命中的骨骼里下标最小的当校验项
     }
     return nm.max_idx >= 0;
 }

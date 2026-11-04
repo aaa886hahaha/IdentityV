@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
+#include <atomic>
 #include "PyRoot.h"
 
 namespace PyCore {
@@ -70,10 +71,8 @@ struct Dict { uint64_t entries; int stride; int64_t n_entries; };
 
 // ⚠ entries 起始必须逐实例算：同一个类的不同实例 dict 大小可以不一样，
 // 把一个实例算出的偏移套到别的实例上会读到无关属性
-inline bool read_dict(uint64_t d, Dict &out)
+inline bool read_keys(uint64_t keys, Dict &out)
 {
-    if (!is_obj(d)) return false;
-    uint64_t keys = getPtr64(d + 0x20);
     if (!is_obj(keys)) return false;
     uint8_t hdr[32];
     if (!vm_readv(keys, hdr, 32)) return false;
@@ -85,6 +84,12 @@ inline bool read_dict(uint64_t d, Dict &out)
     out.stride    = (kind == 0) ? 24 : 16;
     out.n_entries = nent;
     return true;
+}
+
+inline bool read_dict(uint64_t d, Dict &out)
+{
+    if (!is_obj(d)) return false;
+    return read_keys(getPtr64(d + 0x20), out);
 }
 
 inline uint64_t key_slot(const Dict &k, int64_t i)   { return k.entries + i * k.stride + (k.stride == 24 ? 8 : 0); }
@@ -121,10 +126,8 @@ inline void remember_interned(const char *name, uint64_t kp)
     }
 }
 
-inline int64_t find_key(uint64_t d, const char *name, int64_t hint)
+inline int64_t find_key_in(const Dict &k, const char *name, int64_t hint)
 {
-    Dict k;
-    if (!read_dict(d, k)) return -1;
     const uint64_t want = interned_of(name);
     if (hint >= 0 && hint < k.n_entries) {
         uint64_t kp = getPtr64(key_slot(k, hint));
@@ -150,6 +153,13 @@ inline int64_t find_key(uint64_t d, const char *name, int64_t hint)
     for (int64_t i = 0; i < k.n_entries; i++)
         if (str_equals(getPtr64(key_slot(k, i)), name)) return i;
     return -1;
+}
+
+inline int64_t find_key(uint64_t d, const char *name, int64_t hint)
+{
+    Dict k;
+    if (!read_dict(d, k)) return -1;
+    return find_key_in(k, name, hint);
 }
 
 inline uint64_t get_attr(uint64_t d, int64_t idx)
@@ -179,6 +189,79 @@ inline uint64_t get_inst_dict(uint64_t obj)
     uint64_t d = getPtr64(obj - 0x18);
     if (!is_obj(d) || getPtr64(d + 8) != PyRoot::g_dict_type) return 0;
     return d;
+}
+
+// ---- 实例属性视图：managed dict 的两种存法都认(2026-10-31，PyItems 用；老模块仍走 get_inst_dict) ----
+// CPython 3.11 的实例在对象前面有两个槽：-0x18 = dict 指针，-0x20 = values 数组指针。
+// 属性少、__dict__ 从没被访问过的对象(ItemMgr、道具实例这类)**根本没有 dict 对象**：-0x18 是 NULL，
+// 值在 values[i]，键是类型共享的 ht_cached_keys(split keys，dk_kind=2)，第 i 个键对应 values[i]。
+// get_inst_dict 只认 -0x18，遇到这种实例返回 0 —— 道具清单就是这样整条读不出来的(上机日志只有「已启动」)。
+// 物化过的 dict 也可能是 split table(ma_values 非 0)，这时值同样在 values[i]、不在 entries 里。
+// 某个键在共享表里但这个实例没设过：values[i] 是 NULL，调用方当成"没有这个属性"。
+struct InstView { Dict k; uint64_t values; };      // values != 0：值在 values + i*8
+
+inline std::atomic<int> g_cached_keys_off{0};       // PyHeapTypeObject.ht_cached_keys，按布局算是 0x368，运行时校验
+
+inline bool split_keys_ok(uint64_t keys)
+{
+    if (!is_obj(keys)) return false;
+    uint8_t hdr[32];
+    if (!vm_readv(keys, hdr, 32)) return false;
+    int64_t nent = 0; memcpy(&nent, hdr + 24, 8);
+    return hdr[10] == 2 && hdr[8] >= 3 && hdr[8] <= 16 && nent >= 0 && nent <= ((int64_t)1 << hdr[8]);
+}
+
+inline uint64_t type_cached_keys(uint64_t type)
+{
+    int off = g_cached_keys_off.load();
+    if (off) return split_keys_ok(getPtr64(type + off)) ? getPtr64(type + off) : 0;
+    // 3.11 arm64：PyTypeObject 0x198 + async 0x20 + number 0x120 + mapping 0x18 + sequence 0x50 + buffer 0x10
+    //   -> ht_name 0x350, ht_slots, ht_qualname, ht_cached_keys 0x368。不对再在附近扫一遍
+    if (split_keys_ok(getPtr64(type + 0x368))) { g_cached_keys_off = 0x368; return getPtr64(type + 0x368); }
+    for (int o = 0x300; o <= 0x400; o += 8)
+        if (split_keys_ok(getPtr64(type + o))) { g_cached_keys_off = o; return getPtr64(type + o); }
+    return 0;
+}
+
+inline bool inst_view(uint64_t obj, InstView &v)
+{
+    if (!is_obj(obj)) return false;
+    uint64_t d = getPtr64(obj - 0x18);
+    if (is_obj(d) && getPtr64(d + 8) == PyRoot::g_dict_type) {
+        if (!read_dict(d, v.k)) return false;
+        uint64_t mv = getPtr64(d + 0x28);
+        v.values = is_obj(mv) ? mv : 0;
+        return true;
+    }
+    uint64_t type = getPtr64(obj + 8);
+    uint64_t flags = 0;
+    if (!is_obj(type) || !vm_readv(type + 0xA8, &flags, 8) || !(flags & (1u << 4))) return false;   // Py_TPFLAGS_MANAGED_DICT
+    uint64_t vals = getPtr64(obj - 0x20);
+    if (!is_obj(vals)) return false;
+    if (!read_keys(type_cached_keys(type), v.k)) return false;
+    v.values = vals;
+    return true;
+}
+
+inline uint64_t inst_value_slot(const InstView &v, int64_t i)
+{
+    return v.values ? v.values + i * 8 : value_slot(v.k, i);
+}
+
+// 按名字取属性值(对象指针)，idx 是调用方的序号缓存。没有这个属性(或这个实例没设过)时 ok=false
+inline uint64_t inst_attr(const InstView &v, int64_t &idx, const char *name, bool &ok)
+{
+    if (idx >= 0 && idx < v.k.n_entries) {
+        uint64_t kp = getPtr64(key_slot(v.k, idx));
+        uint64_t want = interned_of(name);
+        if (!((want && kp == want) || str_equals(kp, name))) idx = -1;
+    } else {
+        idx = -1;
+    }
+    if (idx < 0) idx = find_key_in(v.k, name, -1);
+    uint64_t val = idx >= 0 ? getPtr64(inst_value_slot(v, idx)) : 0;
+    ok = val != 0;
+    return val;
 }
 
 // 读一个 PyLong。带防竞态校验：解引用后重读指针确认没变，再看 refcount 和类型
