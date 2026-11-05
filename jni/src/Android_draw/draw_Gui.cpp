@@ -256,6 +256,7 @@ static const CfgItem CFG_ITEMS[] = {
 };
 
 static void cfg_set_msg(const char *s) { snprintf(cfg_msg, sizeof(cfg_msg), "%s", s); cfg_msg_time = ImGui::GetTime(); }
+static void cfg_mark_saved();   // 定义在下面(要用 CFG_COUNT)
 
 static void config_save()
 {
@@ -278,7 +279,7 @@ static void config_save()
         fprintf(f, "xhair=%d,%.1f,%.1f,%d,%.1f,%.1f\n", kv.first, kv.second.x, kv.second.y, kv.second.style, kv.second.size, kv.second.thick);
     bool ok = fflush(f) == 0;
     ok = (fclose(f) == 0) && ok;
-    if (ok) snprintf(m, sizeof(m), T("已保存 %d 项 → %s", "Saved %d items -> %s"), (int)(sizeof(CFG_ITEMS) / sizeof(CFG_ITEMS[0])), CONFIG_PATH);
+    if (ok) { snprintf(m, sizeof(m), T("已保存 %d 项 → %s", "Saved %d items -> %s"), (int)(sizeof(CFG_ITEMS) / sizeof(CFG_ITEMS[0])), CONFIG_PATH); cfg_mark_saved(); }
     else    snprintf(m, sizeof(m), T("保存失败: %s", "Save failed: %s"), strerror(errno));
     cfg_set_msg(m);
 }
@@ -303,6 +304,38 @@ static void config_restore_defaults()
         memcpy(it.ptr, &cfg_defaults[i], it.type == CFG_BOOL ? sizeof(bool) : 4);
     }
     cfg_set_msg(T("已恢复默认(要写回文件请再点保存)", "Defaults restored (click Save to write the file)"));
+}
+
+// 未保存标记：记下"最后一次保存/读取时"的值，每帧比对，不同就在保存按钮上加 *。
+// 窗口位置(win_*)不比：拖一下窗口就变、首次运行没有文件时也一定不同，标出来只会一直亮着
+static uint32_t cfg_saved[CFG_COUNT];
+static std::map<int, XhairCfg> cfg_saved_xhair;
+
+static void cfg_mark_saved()
+{
+    for (int i = 0; i < CFG_COUNT; i++) {
+        const CfgItem &it = CFG_ITEMS[i];
+        cfg_saved[i] = 0;
+        memcpy(&cfg_saved[i], it.ptr, it.type == CFG_BOOL ? sizeof(bool) : 4);
+    }
+    cfg_saved_xhair = g_xhair;
+}
+
+static bool cfg_dirty()
+{
+    for (int i = 0; i < CFG_COUNT; i++) {
+        const CfgItem &it = CFG_ITEMS[i];
+        if (strncmp(it.key, "win_", 4) == 0) continue;
+        uint32_t v = 0;
+        memcpy(&v, it.ptr, it.type == CFG_BOOL ? sizeof(bool) : 4);
+        if (v != cfg_saved[i]) return true;
+    }
+    if (g_xhair.size() != cfg_saved_xhair.size()) return true;
+    for (auto &kv : g_xhair) {
+        auto f = cfg_saved_xhair.find(kv.first);
+        if (f == cfg_saved_xhair.end() || memcmp(&f->second, &kv.second, sizeof(XhairCfg)) != 0) return true;
+    }
+    return false;
 }
 
 static void config_load(bool startup = false)
@@ -355,6 +388,7 @@ static void config_load(bool startup = false)
     cfg_apply_tree = cfg_tree_w > 0.f && cfg_tree_h > 0.f;
     snprintf(m, sizeof(m), T("已读取 %d 项 ← %s", "Loaded %d items <- %s"), n, CONFIG_PATH);
     cfg_set_msg(m);
+    cfg_mark_saved();
 }
 
 float z_x, z_y, z_z, d_x, d_y, d_z, camera, r_x, r_y, r_w;
@@ -618,7 +652,6 @@ long getModuleBasegjf(int pid, const char *module_name) {
     return 0;
 }
 
-int c;
 char libso[256] = {"libclient.so"};
 
 // ==================== 过滤表 ====================
@@ -687,11 +720,28 @@ bool ShouldSkipEntity(const DataStruct& obj) {
 //   矩阵 —— 渲染线程每帧校验，失败当帧在签名窗口里重选(见 Draw_Main 的 find_matrix_slot)，锚点投影当真值
 //   数组 —— 读线程每轮数本体集合(Python 侧 model+0x20)命中几个，一个没中就换命中最多的候选(try_switch_array)
 // 候选全部失效才请求重扫 bss(读线程做，10 秒节流)。双缓冲：重扫写非活跃那份再翻转，渲染线程读活跃那份
-static const int MAX_SIG = 8;
+static const int MAX_SIG = 32;   // 2026-11-04 数组新判据更宽，8 个怕把真的挤掉
 struct SigSet { uint64_t msig[MAX_SIG]; int msig_n; long arr[MAX_SIG]; int arr_n; };
 static SigSet g_sigs[2];
 static std::atomic<int> g_sigs_active{0};
 static std::atomic<bool> g_rescan_req{false};
+
+// ===== 【临时诊断】方框偶发消失、骨骼还在(2026-11-05)。查完根因整段删(搜「临时诊断」) =====
+// 渲染线程：骨骼画了、方框那段却没走到的本体，记成一个"缺框片段"，片段结束时打一行(持续帧数 + 开始那帧的原因)。
+// 读线程：本体在快照里却没进 data[] 时打一行原因。
+// g_scan_busy = 读线程此刻正在改写 data[]；g_scan_gen = 每发布一轮 +1。渲染帧期间两者有动静 = 可能撞上撕裂
+#include <cstdarg>
+static std::atomic<bool> g_scan_busy{false};
+static std::atomic<uint32_t> g_scan_gen{0};
+static std::atomic<int> g_diag_lines{0};  // 一次运行最多打 400 行，防刷屏
+static void diag_log(const char *fmt, ...)
+{
+    if (g_diag_lines.fetch_add(1) >= 400) return;
+    va_list ap; va_start(ap, fmt);
+    vprintf(fmt, ap);
+    va_end(ap);
+    fflush(stdout);                       // stdout 重定向到文件后是全缓冲，诊断行要立刻落盘
+}
 
 static void scan_signatures(const ModuleBssInfo &bss, SigSet &out)
 {
@@ -704,11 +754,93 @@ static void scan_signatures(const ModuleBssInfo &bss, SigSet &out)
             uint64_t here = bss.addr + i * 4096 + ii * 8;
             if (*(long long*)(&buff[ii]) == 0x656A624F72655028LL && out.msig_n < MAX_SIG)
                 out.msig[out.msig_n++] = here;
-            if (buff[ii] == 16384 && out.arr_n < MAX_SIG &&
-                getDword(here - 0x8) == 257 && getFloat(here - 16) == 1.0f)
-                out.arr[out.arr_n++] = (long)(here - libbase + 56);
+            // 数组签名(以数组头槽位 H 为准)：H-0x40 低 32 位 = 257、H-0x48 = f32 1.0，H/H+8/H+0x10 是一组合法的
+            // std::vector begin/end/cap。原来还要求 H-0x38 = 16384，2026-11-04 朋友机(新版 so)那里变成每次不同的值、
+            // 老判据 0 命中；用户本机(0917 版)转储确认新判据同样成立，16384 那条已删
+            if ((uint32_t)buff[ii] == 257 && out.arr_n < MAX_SIG && getFloat(here - 8) == 1.0f) {
+                uint64_t H = here + 0x40;
+                uint64_t b = getPtr64(H), e = getPtr64(H + 8), c = getPtr64(H + 0x10);
+                bool vec_ok = b > 0x5000000000 && b < 0x8000000000 && e >= b && c >= e &&
+                              ((e - b) & 7) == 0 && ((c - b) & 7) == 0 && (c - b) / 8 <= 10000;
+                if (vec_ok) out.arr[out.arr_n++] = (long)(H - libbase);
+            }
         }
     }
+}
+
+// ---- 数组签名兜底：用 Python 层反推场景数组(2026-11-04) ----
+// 朋友机(另一版 so，矩阵签名 +0xAA5F338、槽位 +0x330)实测数组签名 16384/257/1.0f 一直 0 个命中，
+// 扫描永远出不来。场景数组本质是一对 {begin, end} 指针，元素就是各对象的场景指针 —— 而 Python 层
+// 本体集合(unit.model+0x20)给的正是"一定在这个数组里"的那几个指针。所以在 bss 里找每一对像
+// {begin,end} 的相邻 qword，把它指向的数组读回来数本体命中，命中最多(平手取元素多的，场景总表是超集)
+// 且至少命中一半本体的就是它。只有局内才有本体，大厅/准备阶段反推不了(那时等签名或等进局)
+static ModuleBssInfo g_bss = {0, 0};
+
+static long find_array_by_bodies()
+{
+    const uint64_t M = 0x00FFFFFFFFFFFFFFULL;
+    uint64_t bodies[64];
+    int nb = PySelf::copy_bodies(bodies, 64);
+    if (nb <= 0 || g_bss.addr == 0 || g_bss.taddr <= g_bss.addr) return 0;
+    std::sort(bodies, bodies + nb);
+    const long pages = (long)((g_bss.taddr - g_bss.addr) / 4096);
+    static uint64_t buff[513];
+    static uint64_t elems[10000 + 512];       // 尾部留余量：朋友机的驱动见过"读内存超写"
+    long best = 0; int best_hits = 0; uint64_t best_n = 0; int cand = 0;
+    for (long i = 0; i < pages; i++) {
+        uint64_t page = g_bss.addr + i * 4096;
+        // 多读 8 字节，跨页的那一对 {begin,end} 也能看到；最后一页或读失败退回整页
+        int lim = 511;
+        if (i + 1 < pages && vm_readv(page, buff, 0x1008)) lim = 512;
+        else if (!vm_readv(page, buff, 0x1000)) continue;
+        for (int ii = 0; ii < lim; ii++) {
+            uint64_t a = buff[ii] & M, e = buff[ii + 1] & M;
+            if (a <= 0x5000000000 || a >= 0x8000000000 || e <= a || e >= 0x8000000000) continue;
+            if ((e - a) & 7) continue;
+            uint64_t n = (e - a) / 8;
+            if (n < (uint64_t)nb || n > 10000) continue;
+            cand++;
+            if (!vm_readv(a, elems, n * 8)) continue;
+            int hits = 0;
+            for (uint64_t j = 0; j < n; j++)
+                if (std::binary_search(bodies, bodies + nb, elems[j] & M)) hits++;
+            if (hits > best_hits || (hits == best_hits && hits > 0 && n > best_n)) {
+                best_hits = hits; best_n = n; best = (long)(page + ii * 8 - libbase);
+            }
+        }
+    }
+    printf("[数组反推] 本体 %d 个 候选 %d 个 最佳偏移=0x%lx 命中 %d 元素 %llu\n",
+           nb, cand, best, best_hits, (unsigned long long)best_n);
+    if (best_hits > 0 && best_hits * 2 >= nb) return best;
+    return 0;
+}
+
+// 反推成功后把数组头槽位前后的内容打进日志，用来找回新版的数组签名。
+// 老签名(以数组头槽位 H 为准)：H-0x38 = u64 16384，H-0x40 = u32 257，H-0x48 = f32 1.0。
+// 每个 qword 同时按 u64 / 两个 u32 / 两个 f32 打印，哪个变了一眼可见
+static void dump_array_neighborhood(long head_off)
+{
+    uint64_t q[20];                                    // H-0x80 .. H+0x18
+    uint64_t base = libbase + head_off - 0x80;
+    if (!vm_readv(base, q, sizeof(q))) { printf("[数组签名] 槽位附近读取失败\n"); return; }
+    printf("[数组签名] 数组头槽位 H=libbase+0x%lx，老签名 H-0x38=16384 H-0x40=257 H-0x48=1.0f\n", head_off);
+    for (int i = 0; i < 20; i++) {
+        long rel = -0x80 + i * 8;
+        uint32_t lo = (uint32_t)q[i], hi = (uint32_t)(q[i] >> 32);
+        float flo, fhi; memcpy(&flo, &lo, 4); memcpy(&fhi, &hi, 4);
+        printf("[数组签名] H%s0x%02lx: %016llx u32=%u,%u f32=%g,%g\n", rel < 0 ? "-" : "+", rel < 0 ? -rel : rel,
+               (unsigned long long)q[i], lo, hi, flo, fhi);
+    }
+}
+
+// 反推一次要把 bss 整段过一遍(约 3700 页 + 候选数组)，节流 10 秒
+static long find_array_by_bodies_throttled()
+{
+    static time_t last = 0;
+    time_t now = time(NULL);
+    if (now - last < 10) return 0;
+    last = now;
+    return find_array_by_bodies();
 }
 
 // 当前数组一个本体都没命中时调：在其它候选里找命中最多的(至少 1 个)，找到就切过去。只在读线程里调
@@ -734,7 +866,15 @@ static bool try_switch_array()
         ArrayaddrOffset = best;
         return true;
     }
-    g_rescan_req = true;    // 候选里也没有：请求重扫 bss
+    // 签名候选里也没有：拿本体集合在 bss 里反推(签名在新版本里失效时只能靠这条)
+    long inferred = find_array_by_bodies_throttled();
+    if (inferred != 0 && inferred != ArrayaddrOffset) {
+        printf("[数组切换] 0x%lx -> 0x%lx (反推)\n", ArrayaddrOffset, inferred);
+        ArrayaddrOffset = inferred;
+        dump_array_neighborhood(inferred);
+        return true;
+    }
+    g_rescan_req = true;    // 都没有：请求重扫 bss
     return false;
 }
 
@@ -844,10 +984,34 @@ void read_thread(long int PD1,long int PD2,long int PD3)
         result = get_module_bss(pid, libso);
     printf("[基址] libbase=0x%llX BSS=0x%llX-0x%llX\n",
            (unsigned long long)libbase, (unsigned long long)result.addr, (unsigned long long)result.taddr);
+    g_bss = result;
     if (libbase < 0x5000000000){
         printf("[错误] libbase无效, 无法继续\n");
         sleep(9999);
     }
+
+    // Py 模块和自动盖板只依赖 pid/libbase，不依赖场景签名，所以放在签名扫描之前启动(2026-11-04)。
+    // 原来放在扫描循环之后：热更改掉数组签名时扫描永远出不来，Py 层跟着全灭(朋友机实测"Py根:未启动")。
+    // 现在场景签名卡住时，面板 Py根/天赋/阶段/自身 这几行照样能显示，可以单独判断 Py 层在新版本下还能不能用
+    // CPython 根(sys.modules + 类型对象)：读 so 的 ELF 段表定位 .PyRuntime，三个 Py 模块共用
+    PyRoot::start(pid, libbase);
+    // 密码机破译进度：走 CPython 对象图，自带后台线程(400ms 一轮)，跟这里的 3 秒大循环解耦
+    PyProgress::start(libbase);
+    // 天赋与辅助特质：同一条 CPython 链路，独立线程 500ms 一轮(一局内基本不变，不用刷那么勤)
+    PyGenius::start(libbase);
+    // 游戏阶段(大厅/准备/局内)：读 g_ui_mgr.ui_dict 里挂着哪个 UI 对象，独立线程 500ms 一轮
+    PyScene::start(libbase);
+    // 自身锚点(g_cam_ctrl.unit)与废弃模型黑名单：100ms 一轮，切换操控对象时要立刻跟上
+    PySelf::start(libbase);
+    // 林中童话(打水仗 BR)：玩家[1601]+物资[1602/1606]，独立线程 100ms 一轮，只在 waterfight_mode 时绘制
+    PyWaterFight::start(libbase);
+    // 道具白名单(cur_world.item_mgr._uid2item)：独立线程 100ms 一轮，只在「绘制道具」开着时读
+    PyItems::start(libbase);
+    // 蜡像师喷蜡辅助瞄准：独立线程 33ms 一轮，只在我是蜡像师时算(见 WaxAim.h)
+    WaxAim::start(libbase);
+    // 自动盖板：独立线程 10ms 一轮，板子列表由下面的读取循环每轮发布过去
+    AutoPallet::start();
+
     while (MatrixOffset==0||ArrayaddrOffset==0)
     {
         // 一趟扫完 bss，所有签名都进候选(见 SigSet)，再从候选里挑初始的。挑错了运行中会自己换
@@ -873,12 +1037,31 @@ void read_thread(long int PD1,long int PD2,long int PD3)
                 break;
             }
         }
-        for (int k = 0; k < s.arr_n && ArrayaddrOffset == 0; k++){
-            uint64_t tmpArr = getPtr64(libbase + s.arr[k]);
-            uint64_t tmpEnd = getPtr64(libbase + s.arr[k] + 8);
-            if (tmpArr > 0x5000000000 && tmpEnd > tmpArr) {
-                ArrayaddrOffset = s.arr[k];
-                printf("[数组命中] 偏移=0x%llX\n", (unsigned long long)ArrayaddrOffset);
+        // 候选可能不止一个：挑元素最多的(场景总表有两三百个对象，别的小数组比不过)。两台机实测都只有 1 个候选。
+        // 挑错了进局后 try_switch_array 会按 Python 本体集合换
+        if (ArrayaddrOffset == 0) {
+            long pick = 0; uint64_t pick_n = 0;
+            for (int k = 0; k < s.arr_n; k++){
+                uint64_t tmpArr = getPtr64(libbase + s.arr[k]);
+                uint64_t tmpEnd = getPtr64(libbase + s.arr[k] + 8);
+                uint64_t n = (tmpArr > 0x5000000000 && tmpEnd > tmpArr) ? (tmpEnd - tmpArr) / 8 : 0;
+                printf("[数组候选] 偏移=0x%lx 元素 %llu\n", s.arr[k], (unsigned long long)n);
+                if (n == 0 || n > 10000) continue;
+                if (n > pick_n) { pick_n = n; pick = s.arr[k]; }
+            }
+            if (pick != 0) {
+                ArrayaddrOffset = pick;
+                printf("[数组命中] 偏移=0x%llX 元素 %llu\n", (unsigned long long)ArrayaddrOffset, (unsigned long long)pick_n);
+                dump_array_neighborhood(ArrayaddrOffset);   // 签名正常的机器也打一份，当对照
+            }
+        }
+        // 签名没找到(或找到但数组头无效)：局内用 Python 本体集合反推。Py 模块已在扫描前启动，进局后本体集合就有了
+        if (ArrayaddrOffset == 0 && PySelf::body_set_ready()) {
+            long inferred = find_array_by_bodies();
+            if (inferred != 0) {
+                ArrayaddrOffset = inferred;
+                printf("[数组命中] 偏移=0x%llX (Python 反推)\n", (unsigned long long)ArrayaddrOffset);
+                dump_array_neighborhood(inferred);
             }
         }
         if (MatrixOffset!=0 && ArrayaddrOffset!=0) break;
@@ -886,30 +1069,10 @@ void read_thread(long int PD1,long int PD2,long int PD3)
     }
     read_state = 2;
 
-    // CPython 根(sys.modules + 类型对象)：读 so 的 ELF 段表定位 .PyRuntime，三个 Py 模块共用
-    PyRoot::start(pid, libbase);
-    // 密码机破译进度：走 CPython 对象图，自带后台线程(400ms 一轮)，跟这里的 3 秒大循环解耦
-    PyProgress::start(libbase);
-    // 天赋与辅助特质：同一条 CPython 链路，独立线程 500ms 一轮(一局内基本不变，不用刷那么勤)
-    PyGenius::start(libbase);
-    // 游戏阶段(大厅/准备/局内)：读 g_ui_mgr.ui_dict 里挂着哪个 UI 对象，独立线程 500ms 一轮
-    PyScene::start(libbase);
-    // 自身锚点(g_cam_ctrl.unit)与废弃模型黑名单：100ms 一轮，切换操控对象时要立刻跟上
-    PySelf::start(libbase);
-    // 林中童话(打水仗 BR)：玩家[1601]+物资[1602/1606]，独立线程 100ms 一轮，只在 waterfight_mode 时绘制
-    PyWaterFight::start(libbase);
-    // 道具白名单(cur_world.item_mgr._uid2item)：独立线程 100ms 一轮，只在「绘制道具」开着时读
-    PyItems::start(libbase);
-    // 蜡像师喷蜡辅助瞄准：独立线程 33ms 一轮，只在我是蜡像师时算(见 WaxAim.h)
-    WaxAim::start(libbase);
-    // 自动盖板：独立线程 10ms 一轮，板子列表由下面的读取循环每轮发布过去
-    AutoPallet::start();
-
+    // 这里只打一行日志；Arrayaddr/Count 由下面主循环每轮按快照重新赋值
     Arrayaddr = getPtr64(libbase + ArrayaddrOffset);
     uint64_t ArrayEnd = getPtr64(libbase + ArrayaddrOffset + 8);
-    Count = (ArrayEnd - Arrayaddr) / 8;
-    if (Count <= 0 || Count > 10000) Count = 1000;   // 兜底值：实测对局中 Count 只有 274~307
-    printf("[数组] Arrayaddr=0x%llX End=0x%llX Count=%d\n", (unsigned long long)Arrayaddr, (unsigned long long)ArrayEnd, (int)Count);
+    printf("[数组] Arrayaddr=0x%llX End=0x%llX Count=%d\n", (unsigned long long)Arrayaddr, (unsigned long long)ArrayEnd, (int)((ArrayEnd - Arrayaddr) / 8));
 
     // 读空的轮次一律不发布：准备阶段 -> 进局那一下游戏会重建场景数组，偶尔一轮正好撞上：
     // 数组头读出来无效，或数组有效但一个对象都没收到。原来这两种情况都当场发布空列表，
@@ -974,12 +1137,27 @@ void read_thread(long int PD1,long int PD2,long int PD3)
         // 真值：局内本体集合(Python 侧 unit.model+0x20)应该都在场景数组里。一个都没中 = 数组锁错/被挪作他用
         const bool truth_ready = PySelf::body_set_ready();
         int truth_hits = 0;
+        // 【临时诊断】本体没进 data[] 的原因，按对象记，原因变了才打一行(0 = 进了 data[])
+        static std::unordered_map<uint64_t, int> diag_reason;
+        auto body_note = [&](uint64_t obj, int reason, int extra) {
+            auto it = diag_reason.find(obj);
+            int prev = it == diag_reason.end() ? 0 : it->second;
+            if (prev == reason) return;
+            static const char *const RN[] = {"已进data[]", "不在场景数组快照里", "类名长度无效", "类名内容读失败",
+                                             "快照里重复", "类名不含player/boss", "分类分支continue"};
+            diag_log("[框诊断] 读线程 本体0x%llx %s -> %s (extra=%d gen=%u)\n", (unsigned long long)obj,
+                     RN[prev], RN[reason], extra, g_scan_gen.load());
+            if (reason == 0) diag_reason.erase(obj); else diag_reason[obj] = reason;
+            if (diag_reason.size() > 256) diag_reason.clear();
+        };
+        g_scan_busy = true;   // 【临时诊断】下面开始原地改写 data[]
         for (int ii = 0; ii < Count && entity_count < 1000; ii++){
             cur_obj = snap[ii];
 
     		if (cur_obj == 0)
         		continue;
-    		if (truth_ready && PySelf::is_body(cur_obj)) truth_hits++;
+    		const bool diag_body = truth_ready && PySelf::is_body(cur_obj);
+    		if (diag_body) truth_hits++;
     		
     	    // 类名要走五跳指针再加长度和内容，共 7 次驱动读；一轮 300 个对象就是 2000 多次，
     	    // 实测占了整轮 12ms 里的一半。同一个对象活着的时候类名不会变，所以按地址缓存。
@@ -1003,13 +1181,17 @@ void read_thread(long int PD1,long int PD2,long int PD3)
     	    } else {
     	        uint64_t class_name_obj = getPtr64(getPtr64(getPtr64(getPtr64(chain_head)+0x8)+0x20)+0x20)+0x0;
     	        int len = getDword(class_name_obj + 0x10);
-    	        if (len >= 256 || len == 0 || len < 0)
+    	        if (len >= 256 || len == 0 || len < 0) {
+    	            if (diag_body) body_note(cur_obj, 2, len);
     	            continue;
+    	        }
     	        filter_class_name.resize(len);
     	        // 内容读不到时 resize 后的缓冲里留着上一个对象类名的前半截，不能当类名、更不能进缓存
     	        // (缓存只靠第一跳校验，写错一次就错一整局)。跳过本轮，下一轮再读
-    	        if (!vm_readv(getPtr64(class_name_obj + 0x8), &filter_class_name[0], len))
+    	        if (!vm_readv(getPtr64(class_name_obj + 0x8), &filter_class_name[0], len)) {
+    	            if (diag_body) body_note(cur_obj, 3, len);
     	            continue;
+    	        }
     	        // 跨局会不断有新对象，攒太多就整体清一次，下一轮重建(只是多花一轮的读取)
     	        // 每条约 180 字节(map 节点 + 类名字符串)：对局中约 300 条≈50KB，1500 条≈250KB
     	        if (g_name_cache.size() > 1500) g_name_cache.clear();
@@ -1030,7 +1212,7 @@ void read_thread(long int PD1,long int PD2,long int PD3)
         		}        		    
         	}
         	if (is_dup == 1){
-    		    continue;
+    		    continue;   // 已经在 data[] 里了(同一指针出现两次)，不算缺
     		}
         	// 过滤随从等无关对象。Python 层的角色本体(unit.model+0x20)不过黑名单：台球手球形态的模型是
         	// chr/boss/billy/billy_weapon01.gim(皮肤 14801，BilliardComponent.billiard_change_model 换上)，会被 "weapon" 误杀(2026-10-25)
@@ -1074,7 +1256,7 @@ void read_thread(long int PD1,long int PD2,long int PD3)
     			// 本体集合不可用时还会被画成红色「[鹿头]」。这里先截下来归道具。预知监管上面已经算过，仍归鹿头
     			if (strstr(filter_class_name.c_str(), "dm65_butcher_ll") != NULL && strstr(filter_class_name.c_str(), "trap.gim") != NULL){
     			const char* prop_result = getprop(filter_class_name.c_str());
-    			if (prop_result == NULL) continue;
+    			if (prop_result == NULL) { if (diag_body) body_note(cur_obj, 6, 0); continue; }
     			strcpy(data[entity_count].str, prop_result);
     			data[entity_count].camp=4;
     			}
@@ -1090,13 +1272,13 @@ void read_thread(long int PD1,long int PD2,long int PD3)
     			}
     			else if (strstr(filter_class_name.c_str(), "scene") != NULL){
     			const char* scene_result = getscene(filter_class_name.c_str());
-    			if (scene_result == NULL) continue;
+    			if (scene_result == NULL) { if (diag_body) body_note(cur_obj, 6, 1); continue; }
     			strcpy(data[entity_count].str, scene_result);
     			data[entity_count].camp=3;
     			}
     			else if (strstr(filter_class_name.c_str(), "prop") != NULL){
     			const char* prop_result = getprop(filter_class_name.c_str());
-    			if (prop_result == NULL) continue;
+    			if (prop_result == NULL) { if (diag_body) body_note(cur_obj, 6, 2); continue; }
     			strcpy(data[entity_count].str, prop_result);
     			data[entity_count].camp=4;
     			}
@@ -1119,8 +1301,10 @@ void read_thread(long int PD1,long int PD2,long int PD3)
         			       getFloat(data[entity_count].objcoor + 0xa8),
         			       data[entity_count].class_name);
         		}
+    			if (diag_body) body_note(cur_obj, 0, 0);
     			entity_count++;
 			}
+			else if (diag_body) body_note(cur_obj, 5, 0);
     			
 			//红夫人模式：本体和镜中红夫人的类名都是 redqueen.gim，只能靠对象字段区分。
 			// 2026-09-22 热更后旧判据失效：镜中红夫人的 +0x70 不再是 65150(鬼魂)，也在地面上，
@@ -1146,6 +1330,19 @@ void read_thread(long int PD1,long int PD2,long int PD3)
     		    	mirror_local=cur_obj;
     			}    			
 			}    						
+        }
+        g_scan_busy = false;   // 【临时诊断】data[] 改写结束
+        // 【临时诊断】本体集合里、却根本不在这份快照里的
+        if (truth_ready) {
+            uint64_t bodies[64];
+            int nb = PySelf::copy_bodies(bodies, 64);
+            for (int k = 0; k < nb; k++) {
+                bool found = false;
+                for (uint64_t p : snap) if (p == bodies[k]) { found = true; break; }
+                if (!found) body_note(bodies[k], 1, (int)snap.size());
+            }
+            if (truth_hits == 0)
+                diag_log("[框诊断] 读线程 本轮本体命中 0 (快照 %d 项, 本体 %d 个)\n", (int)snap.size(), nb);
         }
         // 本轮一个对象都没收到：不发布，保留上一轮，按正常周期等下一轮(见循环前的说明)
         // 本体一个都不在这个数组里：换到装着本体的候选立刻重扫，这一轮不发布(绘制侧沿用上一轮)
@@ -1191,6 +1388,7 @@ void read_thread(long int PD1,long int PD2,long int PD3)
         if (prophet_local[0]) memcpy(prophet_text, prophet_local, sizeof(prophet_text));
         AutoPallet::publish_boards(boards_local, boards_n);
         data_count = entity_count;
+        g_scan_gen++;          // 【临时诊断】发布了一轮
         // 2026-09-23：3 秒 -> 2 秒(一轮实测约 9ms)。2026-10-30：改成对象集合变了就扫(最快 250ms)，2 秒保底
         wait_array_change(snap_sorted);
     }
@@ -1244,6 +1442,109 @@ static inline ImColor progress_color(float v)
     if (v <= 60.0f) return color_yellow;
     return color_red;
 }
+
+// 人物方框：只画四个边角(每边中间留空)，减少遮挡。参数顺序跟 AddRect 一致方便替换，rounding/flags 不用。
+// 边角臂长取短边的 30%(方框宽 = 高/2，所以横竖臂等长)
+static void corner_box(ImVec2 a, ImVec2 b, ImU32 col, float /*rounding*/ = 0.f, int /*flags*/ = 0, float thick = 1.8f)
+{
+    ImDrawList *dl = ImGui::GetForegroundDrawList();
+    float L = fminf(fabsf(b.x - a.x), fabsf(b.y - a.y)) * 0.3f;
+    ImVec2 c[4][3] = {
+        {{a.x, a.y + L}, {a.x, a.y}, {a.x + L, a.y}},   // 左上
+        {{b.x - L, a.y}, {b.x, a.y}, {b.x, a.y + L}},   // 右上
+        {{b.x, b.y - L}, {b.x, b.y}, {b.x - L, b.y}},   // 右下
+        {{a.x + L, b.y}, {a.x, b.y}, {a.x, b.y - L}},   // 左下
+    };
+    for (auto &p : c) dl->AddPolyline(p, 3, col, 0, thick);
+}
+
+// 骨骼包围盒(屏幕坐标)：骨骼轮每帧按单位(M = 场景对象)累计，方框绘制时取用。一帧最多 32 个单位
+static uint64_t g_bone_box_m[32];
+static float    g_bone_box[32][4];      // x1, y1, x2, y2
+static int      g_bone_box_n = 0;
+static int bone_box_slot(uint64_t M, bool create)
+{
+    for (int k = 0; k < g_bone_box_n; k++) if (g_bone_box_m[k] == M) return k;
+    if (!create || g_bone_box_n >= 32) return -1;
+    int k = g_bone_box_n++;
+    g_bone_box_m[k] = M;
+    g_bone_box[k][0] = g_bone_box[k][1] = 1e30f;
+    g_bone_box[k][2] = g_bone_box[k][3] = -1e30f;
+    return k;
+}
+static void bone_box_add_point(uint64_t M, ImVec2 p)
+{
+    int k = bone_box_slot(M, true);
+    if (k < 0) return;
+    if (p.x < g_bone_box[k][0]) g_bone_box[k][0] = p.x;
+    if (p.y < g_bone_box[k][1]) g_bone_box[k][1] = p.y;
+    if (p.x > g_bone_box[k][2]) g_bone_box[k][2] = p.x;
+    if (p.y > g_bone_box[k][3]) g_bone_box[k][3] = p.y;
+}
+static void bone_box_add_circle(uint64_t M, ImVec2 c, float r)
+{
+    bone_box_add_point(M, ImVec2(c.x - r, c.y - r));
+    bone_box_add_point(M, ImVec2(c.x + r, c.y + r));
+}
+// 取包围盒并外扩一圈(短边的 10%，至少 4px)，盒太小(少于 2 根骨骼投影出来)算没有
+static bool bone_box_get(uint64_t M, float &x1, float &y1, float &x2, float &y2)
+{
+    int k = bone_box_slot(M, false);
+    if (k < 0) return false;
+    float w = g_bone_box[k][2] - g_bone_box[k][0], h = g_bone_box[k][3] - g_bone_box[k][1];
+    if (!(w > 1.f && h > 1.f)) return false;
+    float pad = fmaxf(4.f, fminf(w, h) * 0.1f);
+    x1 = g_bone_box[k][0] - pad; y1 = g_bone_box[k][1] - pad;
+    x2 = g_bone_box[k][2] + pad; y2 = g_bone_box[k][3] + pad;
+    return true;
+}
+
+// 一副骨架投到屏幕上的包围盒(含头圆，跟骨骼轮的画法一致)，外扩同 bone_box_get。reflect=true 时每根骨骼的水平两轴先关于镜线反射。
+// 给不进骨骼轮的对象用(镜中红夫人、红夫人镜子里的求生者)：它们的方框也按骨骼来，跟普通人物一致
+static bool skeleton_screen_box(const NativeBones::Skeleton &sk, bool reflect, float &x1, float &y1, float &x2, float &y2)
+{
+    ImVec2 bp[NativeBones::NUM_TARGET];
+    bool bok[NativeBones::NUM_TARGET];
+    float mnx = 1e30f, mny = 1e30f, mxx = -1e30f, mxy = -1e30f;
+    auto add = [&](float x, float y) { mnx = fminf(mnx, x); mny = fminf(mny, y); mxx = fmaxf(mxx, x); mxy = fmaxf(mxy, y); };
+    int n = 0;
+    for (int t = 0; t < NativeBones::NUM_TARGET; t++) {
+        bok[t] = false;
+        if (!sk.ok[t]) continue;
+        float ox = sk.x[t], oy = sk.y[t], oz = sk.z[t];
+        if (reflect) calculate_line_reflection(mirror_line_x1, mirror_line_y1, mirror_line_x2, mirror_line_y2, sk.x[t], sk.z[t], &ox, &oz);
+        float cam = matrix[3]*ox + matrix[7]*oy + matrix[11]*oz + matrix[15];
+        if (cam <= 0.01f) continue;
+        bp[t] = ImVec2(px + (matrix[0]*ox + matrix[4]*oy + matrix[8]*oz + matrix[12]) / cam * px,
+                       py - (matrix[1]*ox + matrix[5]*oy + matrix[9]*oz + matrix[13]) / cam * py);
+        bok[t] = true; n++;
+        add(bp[t].x, bp[t].y);
+    }
+    if (n < 2) return false;
+    if (bok[0]) {                                     // 头圆：同骨骼轮(沿 脊椎->颈 往上顶)
+        ImVec2 up(0.f, -1.f);
+        float r = 6.0f;
+        if (bok[1] && bok[2]) {
+            float dx = bp[1].x - bp[2].x, dy = bp[1].y - bp[2].y, L = sqrtf(dx*dx + dy*dy);
+            if (L > 0.5f) { up.x = dx / L; up.y = dy / L; r = L * 0.28f; }
+        }
+        r = fminf(fmaxf(r, 3.0f), 26.0f);
+        ImVec2 base = bok[1] ? bp[1] : bp[0];
+        ImVec2 hc(base.x + up.x * (r + 3.0f), base.y + up.y * (r + 3.0f));
+        add(hc.x - r, hc.y - r); add(hc.x + r, hc.y + r);
+    }
+    float w = mxx - mnx, h = mxy - mny;
+    if (!(w > 1.f && h > 1.f)) return false;
+    float pad = fmaxf(4.f, fminf(w, h) * 0.1f);
+    x1 = mnx - pad; y1 = mny - pad; x2 = mxx + pad; y2 = mxy + pad;
+    return true;
+}
+
+// 【临时诊断】本帧画了骨骼的本体 / 本帧方框那段走到的对象(诊断说明见 diag_log 那段)
+static uint64_t g_diag_bone[32];
+static int      g_diag_bone_n = 0;
+static uint64_t g_diag_box[64];
+static int      g_diag_box_n = 0;
 
 // 固定信息用：按指定像素字号画文字 / 量文字宽高(默认字号由字体决定，这里显式传 size 才能跟随滑动条)
 static inline void fi_text(ImDrawList *dl, float x, float y, float size, ImU32 col, const char *txt)
@@ -1605,7 +1906,7 @@ void Draw_Main(ImDrawList *Draw){
     // 2026-10-30：锁的是签名不是槽位。当前槽位读不出来、或读出来但锚点投影不对(真值不过)，当帧就在签名窗口里重选：
     //   找到通过真值的 -> 立刻切过去；当前读不出来时，只要有结构通过的也先切(比停止投影强)；
     //   过场/合照/结算时相机不跟人，所有候选真值一起不过 -> 不切、照用当前的。找不到就降频到每 10 帧试一次。
-    //   连续约 5 秒一个都读不出来才请求读线程重扫 bss。没有锚点(大厅/准备)时只做结构校验
+    //   局内连续约 5 秒一个都读不出来才请求读线程重扫 bss(局外不请求)。没有锚点(大厅/准备)时只做结构校验
     bool matrix_fresh = false;
     {
         static int retry_wait = 0, dead_rounds = 0;
@@ -1631,14 +1932,16 @@ void Draw_Main(ImDrawList *Draw){
             int r = find_matrix_slot(cur_slot, has_truth ? anc : nullptr, ns, nm, nt);
             if (r == 2 || (r == 1 && !cur_ok)) {
                 printf("[矩阵切换] 槽位 0x%lx -> 0x%lx(%s)\n", MatrixOffset, (long)(ns - libbase),
-                       r == 2 ? "真值通过" : "当前读不出");
+                       r == 2 ? (has_truth ? "真值通过" : "结构通过") : "当前读不出");
                 MatrixOffset = (long)(ns - libbase);
                 mobj = nm;
                 memcpy(tmp, nt, sizeof(tmp));
                 cur_ok = true;
             }
             if (r != 2) retry_wait = 10;
-            if (r == 0 && !cur_ok) {
+            // 只在局内(有锚点)累计：局外这根下面本来就没有主相机矩阵，读不出是常态；
+            // 而签名在 bss 里一个进程内不动，局外重扫只会找回同一组槽位(两份日志几百次都是)。没锚点走 else 清零，防上一局的计数带进下一局
+            if (r == 0 && !cur_ok && has_auth_self) {
                 if (++dead_rounds >= 30) { g_rescan_req = true; dead_rounds = 0; }
             } else {
                 dead_rounds = 0;
@@ -1776,7 +2079,7 @@ void Draw_Main(ImDrawList *Draw){
             const char *nm = waterfight_name(pl.identity);             // label 用动物名
             auto ts = ImGui::CalcTextSize(nm, 0, 25);
             Draw->AddText({bx1 + bw/2 - ts.x/2, by1 - 45}, c, nm);      // 上：动物名
-            ImGui::GetForegroundDrawList()->AddRect({bx1, by1}, {bx1 + bw, by1 + bh}, c, 3, 0, 1.8f);
+            corner_box({bx1, by1}, {bx1 + bw, by1 + bh}, c, 3, 0, 1.8f);
             if (has_self) {                                             // 下：距离
                 char dt[24];
                 snprintf(dt, sizeof(dt), T("%d 米", "%d m"), (int)d);
@@ -2214,7 +2517,7 @@ void Draw_Main(ImDrawList *Draw){
             auto ts = ImGui::CalcTextSize(text, 0, 25);
             Draw->AddText({bx1 + bw/2 - ts.x/2, by1 - 45}, c, text);
             if (show_draw_Rect)
-                ImGui::GetForegroundDrawList()->AddRect({bx1, by1}, {bx1 + bw, by1 + bh}, c, 3, 0, 1.8f);
+                corner_box({bx1, by1}, {bx1 + bw, by1 + bh}, c, 3, 0, 1.8f);
             if (show_draw_Distance) {
                 char dt[24];
                 snprintf(dt, sizeof(dt), T("%d 米", "%d m"), (int)d);
@@ -2246,7 +2549,7 @@ void Draw_Main(ImDrawList *Draw){
             auto ts = ImGui::CalcTextSize(lbl, 0, 25);
             Draw->AddText({bx1 + bw/2 - ts.x/2, by1 - 45}, c, lbl);
             if (show_draw_Rect)
-                ImGui::GetForegroundDrawList()->AddRect({bx1, by1}, {bx1 + bw, by1 + bh}, c, 3, 0, 1.8f);
+                corner_box({bx1, by1}, {bx1 + bw, by1 + bh}, c, 3, 0, 1.8f);
             if (show_draw_Distance) {
                 char dt[24];
                 snprintf(dt, sizeof(dt), T("%d 米", "%d m"), (int)d);
@@ -2257,6 +2560,10 @@ void Draw_Main(ImDrawList *Draw){
     }
 
     // ---- 原生骨骼(抄若辰 sob_3A6074/39F0CC 偏移链,驱动读,零注入;见 NativeBones.h) ----
+    // 本帧画出来的骨骼包围盒(屏幕坐标，含头圆)：方框优先用它，保证骨骼一定在框里(2026-11-05)。
+    // 原来方框是写死的世界高度(脚底 -1.5~+18.5 单位)，头圆最小半径/上顶量/线宽又是固定像素，远处骨骼会冒出框顶
+    g_bone_box_n = 0;
+    g_diag_bone_n = 0;
     if (show_draw_Bones && PySelf::available() && !PySelf::is_joseph_match()) {   // 约瑟夫局永远不画骨骼(用户要求,无视开关)
         uint64_t self_m = 0; PySelf::anchor(self_m);
         uint64_t Ms[32];
@@ -2315,9 +2622,132 @@ void Draw_Main(ImDrawList *Draw){
                 ImVec2 hc(base.x + up.x * (r + 3.0f), base.y + up.y * (r + 3.0f));
                 if (bok[1]) Draw->AddLine(bp[1], ImVec2(hc.x - up.x * r, hc.y - up.y * r), bcol, 2.2f);  // 脖子接圆底
                 Draw->AddCircleFilled(hc, r, bcol, 16);
+                bone_box_add_circle(Ms[u], hc, r);
             }
+            for (int t = 0; t < NativeBones::NUM_TARGET; t++) if (bok[t]) bone_box_add_point(Ms[u], bp[t]);
+            float bx1, by1, bx2, by2;
+            if (bone_box_get(Ms[u], bx1, by1, bx2, by2) && g_diag_bone_n < 32) g_diag_bone[g_diag_bone_n++] = Ms[u];   // 【临时诊断】本帧画了骨骼的本体
         }
     }
+
+    // ---- 红夫人镜像求生者：画一个求生者关于镜线的镜像(名字/方框/距离/骨骼) ----
+    // 抽成 lambda(2026-11-04)：自身那行在循环开头就 continue 掉了，我是求生者时自己的镜像原来画不出来。
+    // 现在常规求生者和自身各调一次。会改写 D(反射后的坐标)，调完这一行就不能再用 D
+    auto draw_mirror_image = [&](int i) {
+            if (getFloat(data[i].obj+0x1a0)==450&&data[i].camp==2){
+                std::string ss;
+                // 镜线在 Draw_Main 开头算好(放下的镜子 / 准备阶段预览镜子二选一)，这里只做一次关于直线的对称
+                float orig_x = D.X, orig_y = D.Y;
+                calculate_line_reflection(mirror_line_x1, mirror_line_y1, mirror_line_x2, mirror_line_y2, orig_x, orig_y, &D.X, &D.Y);
+                camera = matrix[3] * D.X + matrix[7] * D.Z + matrix[11] * D.Y + matrix[15];
+                dist = sqrt(pow(D.X - Z.X, 2) + pow(D.Y - Z.Y, 2) + pow(D.Z - Z.Z, 2)) / dist_scale;
+                if (dist > 60) return;   // 用户要求：过滤 60m 外的镜像求生者(镜像反射点到自身的距离)，别让远处镜像刷屏
+        		r_x = px + (matrix[0] * D.X + matrix[4] * D.Z + matrix[8] * D.Y + matrix[12]) / camera * px;
+                r_y = py - (matrix[1] * D.X + matrix[5] * (D.Z+ 8.5) + matrix[9] * (D.Y) + matrix[13]) / camera * py;
+                r_w = py - (matrix[1] * D.X + matrix[5] * (D.Z+ 28.5) + matrix[9] * (D.Y) + matrix[13]) / camera * py;
+												
+        		W = (r_y - r_w) / 2;	// 宽度
+        		H = r_y - r_w;		// 高度
+        		X1 = r_x - (r_y - r_w) / 4;	// X1
+        		Y1 = r_y - H / 2;	// Y1
+        		X2 = X1 + W;		// X2
+        		Y2 = Y1 + H;		// Y2
+        
+                if (W>0){
+                    // swap_yz 只在主骨骼轮读自身时校准；若"显示骨骼"关着主轮没跑，这里先拿自身补一次。
+                    if (NativeBones::g_swap_yz.load() < 0) {
+                        uint64_t self_cal = 0;
+                        if (PySelf::anchor(self_cal)) { NativeBones::Skeleton tmp; NativeBones::read_unit(self_cal, true, tmp); }
+                    }
+                    // 骨骼先读：方框按反射后的骨骼包围盒算(跟普通人物一致)，读不到才用上面写死高度那套
+                    NativeBones::Skeleton msk;
+                    const bool msk_ok = NativeBones::read_unit(data[i].obj, false, msk) && msk.valid;
+                    {
+                        float sx1, sy1, sx2, sy2;
+                        if (msk_ok && skeleton_screen_box(msk, true, sx1, sy1, sx2, sy2)) {
+                            X1 = sx1; Y1 = sy1; X2 = sx2; Y2 = sy2; W = X2 - X1; H = Y2 - Y1;
+                        }
+                    }
+
+                    ss += data[i].str;
+                    auto textSize = ImGui::CalcTextSize(ss.c_str(), 0, 25);
+                    Draw->AddText({X1 + W/2-(textSize.x/2),Y1-45}, BotBoneColor, ss.c_str());
+                        
+                    if (true){   // 方框默认画(不受"方框绘制"开关影响，用户要求)
+                        corner_box({X1, Y1},{X2, Y2}, BotBoneColor,3, 0,1.8f);
+    			    }
+    			        
+                    if (show_draw_Distance){
+                        std::string mirror_dist_str;
+                        mirror_dist_str += std::to_string((int) dist);
+                        mirror_dist_str += T(" 米", " m");
+                        auto textSize = ImGui::CalcTextSize(mirror_dist_str.c_str(), 0, 25);
+                        Draw->AddText({X1 + W/2-(textSize.x/2),Y2+10}, BotBoneColor, mirror_dist_str.c_str());
+                    }
+                        
+                    // 射线不画(用户要求)。
+                    // 骨骼默认画(不受"显示骨骼"开关影响)。
+                    // 【2026-10-19 重做】此前"方案B"把骨架当刚体整体平移到镜像落点(只反射根、其余骨骼
+                    //   保持真人世界偏移 delta=bone-root 原样搬过去)，数学上不是镜像：
+                    //   ① 朝向/手性不翻转 —— 真人侧身/背身时镜中姿态方向错；
+                    //   ② 平移后的点仍按各自深度投影 —— 镜像落点离相机近时(照镜子最常见)人体尺度被透视放大→变大变形。
+                    //   当年"逐根反射→忽大忽小"的归因是错的：镜面反射是等距变换、绝不改变骨架自身尺寸
+                    //   (主骨骼轮 1404-1412 同样逐骨骼各自深度投影却不变形)；真凶是旧镜线来源(本体+247/预览)
+                    //   每帧抖动。镜线已迁到稳定的 Python MaryMirrorUnit(246)，逐根反射现在安全。
+                    //   所以改回"对每根骨骼的水平两轴做真·镜面反射(高度不动)+ 正常投影"：反射后整副骨架落在
+                    //   镜面另一侧(照镜子时在相机前方、投得出)，大小/透视天然=真人站在镜像位置，方向自动翻成真镜像。
+                    // (swap_yz 校准和读骨骼挪到了本块开头，方框要先用)
+                    if (msk_ok) {
+                        ImVec2 bp[NativeBones::NUM_TARGET];
+                        bool bok[NativeBones::NUM_TARGET];
+                        for (int t = 0; t < NativeBones::NUM_TARGET; t++) {
+                            bok[t] = false;
+                            if (!msk.ok[t]) continue;
+                            // 每根骨骼的水平坐标(X, Y)关于镜线做真·镜面反射，高度(oy)不反射。
+                            float ox, oz;
+                            calculate_line_reflection(mirror_line_x1, mirror_line_y1,
+                                                      mirror_line_x2, mirror_line_y2,
+                                                      msk.x[t], msk.z[t], &ox, &oz);
+                            float oy = msk.y[t];                    // 高度不反射
+                            float cam = matrix[3]*ox + matrix[7]*oy + matrix[11]*oz + matrix[15];
+                            if (cam <= 0.01f) continue;
+                            float sx = px + (matrix[0]*ox + matrix[4]*oy + matrix[8]*oz + matrix[12]) / cam * px;
+                            float sy = py - (matrix[1]*ox + matrix[5]*oy + matrix[9]*oz + matrix[13]) / cam * py;
+                            bp[t] = ImVec2(sx, sy); bok[t] = true;
+                        }
+                        for (int e = 0; e < NativeBones::NUM_EDGE; e++) {
+                            int a = NativeBones::EDGES[e][0], b = NativeBones::EDGES[e][1];
+                            if (a == 0 || b == 0) continue;           // 头单独画
+                            if (bok[a] && bok[b]) Draw->AddLine(bp[a], bp[b], BotBoneColor, 2.2f);
+                        }
+                        if (bok[0]) {                                  // 头圆，抄主骨骼轮的画法
+                            ImVec2 up(0.f, -1.f);
+                            float r = 6.0f;
+                            if (bok[1] && bok[2]) {
+                                float dx = bp[1].x - bp[2].x, dy = bp[1].y - bp[2].y;
+                                float L = sqrtf(dx*dx + dy*dy);
+                                if (L > 0.5f) { up.x = dx / L; up.y = dy / L; r = L * 0.28f; }
+                            }
+                            if (r < 3.0f) r = 3.0f;
+                            if (r > 26.0f) r = 26.0f;
+                            ImVec2 base = bok[1] ? bp[1] : bp[0];
+                            ImVec2 hc(base.x + up.x * (r + 3.0f), base.y + up.y * (r + 3.0f));
+                            if (bok[1]) Draw->AddLine(bp[1], ImVec2(hc.x - up.x * r, hc.y - up.y * r), BotBoneColor, 2.2f);
+                            Draw->AddCircleFilled(hc, r, BotBoneColor, 16);
+                        }
+                    }
+                }//判断W
+            }
+    };
+
+    // 【临时诊断】本帧方框那段走到的对象清零；记下循环开始时读线程的状态(撕裂窗口)
+    g_diag_box_n = 0;
+    const bool     diag_busy0 = g_scan_busy.load();
+    const uint32_t diag_gen0  = g_scan_gen.load();
+    const int      diag_count0 = data_count;
+    // 镜中红夫人：优先 Python 侧 247 单位的 model+0x20，读不到才用读线程按 +0x6D 位认的那个
+    uint64_t mirror_img = PyProgress::mirror_image_obj();
+    if (mirror_img == 0) mirror_img = redqueen_mirror_obj;
 
     for (int i = 0; i < data_count; i++){
 
@@ -2339,6 +2769,8 @@ void Draw_Main(ImDrawList *Draw){
             if (!ShouldSkipEntity(data[i]) && !(D.X==0 && D.Y==0) && D.Z>-300) {
                 Z.X = D.X; Z.Z = D.Z; Z.Y = D.Y;
             }
+            // 我是求生者时自己的镜像也要画(红夫人镜子里的我)。lambda 里自带 camp==2 / 450 判断，监管自身不会画
+            if (mirror && redqueenmod && !(D.X==0 && D.Y==0) && D.Z>-300) draw_mirror_image(i);
             continue; // 不管有效无效, 自身都不需要再走下面的常规实体流程
         }
 
@@ -2351,6 +2783,9 @@ void Draw_Main(ImDrawList *Draw){
         // 大厅/准备阶段(units_by_type 读全了且没有键 1/2)：没有任何玩家单位，场景里的人物对象全是
         // 无宿主的时装挂件(头饰/袖子)，阵营 1/2 整类不画。预知监管在读取循环里算，不受影响
         if ((data[i].camp == 1 || data[i].camp == 2) && PySelf::in_lobby())
+            continue;
+        // 镜中红夫人在循环后单独画(标「红夫人镜像」)，这里不重复(本体集合不可用时它会被当成普通红夫人画出来)
+        if (mirror_img != 0 && data[i].obj == mirror_img)
             continue;
         // 模仿者模式开着且身份簿有内容：按簿子过滤(只画簿子里的活人)。开会阶段 Python 页被换出，
         // 本体集合读不全甚至整个不可用，那时退回按类名画会把尸体、鬼魂、石像全画出来。
@@ -2376,8 +2811,7 @@ void Draw_Main(ImDrawList *Draw){
 		}
 		if (data[i].camp == 1 || data[i].camp == 2) char_count++;
 		// 本体是监管时，游戏自己就会显示监管者个体，这里不再重复画任何监管者。
-		// 只认 CPython 锚点给的阵营：兜底的相机深度启发式可能把求生者误判成监管，
-		// 那样会让求生者视角下的监管整个消失，代价远大于多画一个。
+		// 只认 CPython 锚点给的阵营(has_auth_self)：阵营判错会让求生者视角下的监管整个消失，代价远大于多画一个。
 		// 联合狩猎(2026-10-25)：队友监管照画，只跳过我自己和我这边的其它监管阵营对象
 		if (has_auth_self && self_camp == 1 && data[i].camp == 1 && !PySelf::is_teammate_butcher(data[i].obj)) continue;
 		// 本体是监管时，被自己扛在气球上的求生者会糊在自己身上(模型挂在气球挂点)，游戏自己也会显示，
@@ -2487,35 +2921,20 @@ void Draw_Main(ImDrawList *Draw){
     	        // 兜底：PyProgress 可用时密码机在实体循环前按 Python 侧列表画(见那里)，这里只在它不可用时走。
     	        // 判据见上面 is_real_generator() 的注释。
     	        if (show_draw_secret_mechine && !PyProgress::available() && is_real_generator(data[i].obj)){
-    	            // 进度来自 Python 侧的 GeneratorUnit，靠 model 指针身份配对(见 PyProgress.h)。
-    	            // 配不上时(model 为空/链路失效)退化成原来的 "[密码机] X.X 米"。
-    	            float progress = 0.f;
-    	            bool has_progress = PyProgress::lookup(data[i].obj, D.X, D.Y, progress);
-    	            if (!(has_progress && PyProgress::is_decoded(progress))){      // 破译完的机器本身和进度都不画
-    	                std::ostringstream oss;
-    	                oss << std::fixed << std::setprecision(1) << dist;
-    	                std::string dist_text = " " + oss.str() + T(" 米", " m");
-    	                char head[24];
-    	                if (has_progress) snprintf(head, sizeof(head), "[%.1f%%]", progress);
-    	                else        snprintf(head, sizeof(head), "%s", T("[密码机]", "[Cipher]"));
-
-    	                // 两段分开上色：头用进度色，距离在"我是蜡像师且最大仰角能附着"时变绿(WaxAim.h，替代原来 61~63 米)
-    	                auto hs = ImGui::CalcTextSize(head, 0, 25);
-    	                auto ds = ImGui::CalcTextSize(dist_text.c_str(), 0, 25);
-    	                float x0 = r_x - (hs.x + ds.x) / 2.0f;
-    	                Draw->AddText({x0, r_y}, has_progress ? progress_color(progress) : ImColor(255,255,255,255), head);
-    	                Draw->AddText({x0 + hs.x, r_y},
-    	                    WaxAim::gen_green(data[i].obj) ? color_green : ImColor(255, 255, 255, 255),
-    	                    dist_text.c_str());
-
-    	                // 进度条画在文字上方；进度为 0 时没有意义，不画
-    	                if (has_progress && progress > 0.05f){
-    	                    const float bar_w = 120.0f, bar_h = 10.0f;
-    	                    float bx = r_x - bar_w / 2.0f, by = r_y - bar_h - 3.0f;
-    	                    Draw->AddRectFilled({bx, by}, {bx + bar_w * (progress / 100.0f), by + bar_h}, progress_color(progress));
-    	                    Draw->AddRect({bx, by}, {bx + bar_w, by + bar_h}, ImColor(255,255,255,255));
-    	                }
-    	            }
+    	            // 走到这里说明 Python 层不可用，拿不到进度，只画 "[密码机] X.X 米"。
+    	            // (原来这里调 PyProgress::lookup 配进度，但它在不可用时恒返回 false，是死代码，2026-11-04 删)
+    	            std::ostringstream oss;
+    	            oss << std::fixed << std::setprecision(1) << dist;
+    	            std::string dist_text = " " + oss.str() + T(" 米", " m");
+    	            const char *head = T("[密码机]", "[Cipher]");
+    	            // 距离在"我是蜡像师且最大仰角能附着"时变绿(WaxAim.h，替代原来 61~63 米)
+    	            auto hs = ImGui::CalcTextSize(head, 0, 25);
+    	            auto ds = ImGui::CalcTextSize(dist_text.c_str(), 0, 25);
+    	            float x0 = r_x - (hs.x + ds.x) / 2.0f;
+    	            Draw->AddText({x0, r_y}, ImColor(255,255,255,255), head);
+    	            Draw->AddText({x0 + hs.x, r_y},
+    	                WaxAim::gen_green(data[i].obj) ? color_green : ImColor(255, 255, 255, 255),
+    	                dist_text.c_str());
     	        }
     	    }
     		}
@@ -2570,7 +2989,6 @@ void Draw_Main(ImDrawList *Draw){
                 }
             }
 
-            // 这里原本读一次 +0xaa(zy)，唯一用到它的是下面那段已停用的相机深度启发式，已删。
             if (!ShouldSkipEntity(data[i])){
                 if (show_draw_Role&&strstr(data[i].class_name, "chr") != NULL){
                     sprintf(objtext, "%lx", data[i].obj);   // objtext 原来只在调试分支里写，这里会显示别的对象的地址
@@ -2585,21 +3003,6 @@ void Draw_Main(ImDrawList *Draw){
                     Draw->AddText({r_x-(textSize.x/2),r_y}, ImColor(255,200,0,255), test.c_str());
                 }
                 			            
-                // 旧的自身判定：相机深度落在 10~40 + zy + 阵营是1或2。**已停用**(见下)。
-                // 原本只在 CPython 链路拿不到锚点时兜底，它的问题见 PySelf.h 文件头：
-                //   - 任何一个求生者走进 10~40 这条深度带都会被误判成自身
-                //   - zy 是 +0xaa，实测是通用状态位，**不区分是否自身**，挡不住
-                //   - 自身锚错 -> Z 锚错 -> 全场距离全错，而且那个人会被 continue 掉不再绘制
-                // 2026-09-22 停用：暂时只走 CPython 锚点(PySelf.h)，锚点拿不到时宁可没有自身也不猜。
-                // if (!有权威自身 && camera < 40 && camera > 10 && zy&&(data[i].阵营==1||data[i].阵营==2)){
-                //     自身 = data[i].obj;
-                //     Z.X = D.X;
-                //     Z.Z = D.Z;
-                //     Z.Y = D.Y;
-                //     自身阵营=对象阵营;
-                //        continue;
-                // }
-               
                 std::string s;
 
                 // 离自己 1 米以内的角色不画方框和附带数据(名字/距离/天赋/特质/射线)：
@@ -2609,6 +3012,14 @@ void Draw_Main(ImDrawList *Draw){
                 bool too_close = (self_obj != 0) && dist < 1.0f;
 
                 if (!too_close && (data[i].camp==1||data[i].camp==2)){
+                    if (g_diag_box_n < 64) g_diag_box[g_diag_box_n++] = data[i].obj;   // 【临时诊断】
+                    // 本帧画了骨骼就用骨骼包围盒当方框(名字/距离/天赋/射线都跟着它走)，没骨骼才用上面写死高度那套
+                    {
+                        float bx1, by1, bx2, by2;
+                        if (bone_box_get(data[i].obj, bx1, by1, bx2, by2)) {
+                            X1 = bx1; Y1 = by1; X2 = bx2; Y2 = by2; W = X2 - X1; H = Y2 - Y1;
+                        }
+                    }
                     // 模仿者模式：名字换成"N号 身份"，文字和方框按阵营着色(侦探团蓝/模仿者红/中立黄)。
                     // 身份进局约 2 秒后才赋值，之前只有号码、画白色；不是模仿者玩家本体的对象照旧画角色名
                     int cc_identity = 0, cc_seat = 0;
@@ -2639,17 +3050,17 @@ void Draw_Main(ImDrawList *Draw){
                         ImColor bc = echo ? BotBoneColor
                                    : (cc ? name_color
                                    : (data[i].camp==1 ? BoneColor : color_green));
-                        ImGui::GetForegroundDrawList()->AddRect({X1, Y1},{X2, Y2}, bc,3, 0,1.8f);
+                        corner_box({X1, Y1},{X2, Y2}, bc,3, 0,1.8f);
                     }
                     else if (show_draw_Rect){
         			    if (cc)
-        			        ImGui::GetForegroundDrawList()->AddRect({X1, Y1},{X2, Y2}, name_color,3, 0,1.8f);
+        			        corner_box({X1, Y1},{X2, Y2}, name_color,3, 0,1.8f);
         			    else if (IsGhostEntity(data[i]))
-        			        ImGui::GetForegroundDrawList()->AddRect({X1, Y1},{X2, Y2}, BotBoneColor,3, 0,1.8);
+        			        corner_box({X1, Y1},{X2, Y2}, BotBoneColor,3, 0,1.8);
         			    else if (data[i].camp==1)
-        			        ImGui::GetForegroundDrawList()->AddRect({X1, Y1},{X2, Y2}, BoneColor,3, 0,1.8f);
+        			        corner_box({X1, Y1},{X2, Y2}, BoneColor,3, 0,1.8f);
         			    else if (data[i].camp==2)
-        			        ImGui::GetForegroundDrawList()->AddRect({X1, Y1},{X2, Y2}, color_green,3, 0,1.8f);
+        			        corner_box({X1, Y1},{X2, Y2}, color_green,3, 0,1.8f);
         			}
                     float next_y = Y2 + 10;            // 距离、天赋、辅助特质依次往下排
                     const float line_h = ImGui::GetFontSize() + 2.0f;
@@ -2684,14 +3095,16 @@ void Draw_Main(ImDrawList *Draw){
                                 }
                                 // 飞轮就绪时"飞轮"两个字画红，优先于上面的整行配色
                                 ImColor flywheel_color = seg.flywheel_ready ? color_red : c;
-                                float w_pre = ImGui::CalcTextSize(seg.pre, 0, 25).x;
-                                float w_flywheel = ImGui::CalcTextSize(seg.flywheel, 0, 25).x;
-                                float w_post = ImGui::CalcTextSize(seg.post, 0, 25).x;
+                                // 求生者的天赋行小一号(约 85%，2026-11-05 用户要求)；监管那行照旧
+                                const float gfs = data[i].camp == 2 ? ImGui::GetFontSize() * 0.85f : ImGui::GetFontSize();
+                                float w_pre = fi_calc(gfs, seg.pre).x;
+                                float w_flywheel = fi_calc(gfs, seg.flywheel).x;
+                                float w_post = fi_calc(gfs, seg.post).x;
                                 float tx = X1 + W/2 - (w_pre + w_flywheel + w_post)/2;
-                                if (seg.pre[0])   Draw->AddText({tx, next_y}, c, seg.pre);
-                                if (seg.flywheel[0]) Draw->AddText({tx + w_pre, next_y}, flywheel_color, seg.flywheel);
-                                if (seg.post[0])   Draw->AddText({tx + w_pre + w_flywheel, next_y}, c, seg.post);
-                                next_y += line_h;
+                                if (seg.pre[0])   fi_text(Draw, tx, next_y, gfs, c, seg.pre);
+                                if (seg.flywheel[0]) fi_text(Draw, tx + w_pre, next_y, gfs, flywheel_color, seg.flywheel);
+                                if (seg.post[0])   fi_text(Draw, tx + w_pre + w_flywheel, next_y, gfs, c, seg.post);
+                                next_y += gfs + 2.0f;
                             }
                             // 监管再单独一行写当前辅助特质 + 剩余冷却
                             // (带底牌会局中换特质，所以读的是实时值；冷却来自 skill_mgr，见 PyGenius.h)
@@ -2718,103 +3131,141 @@ void Draw_Main(ImDrawList *Draw){
     	}//判断w    
 	     
 	                
-	   //红夫人镜像                                   
-	    if (mirror&&redqueenmod){
-            if (getFloat(data[i].obj+0x1a0)==450&&data[i].camp==2){
-                std::string ss;
-                // 镜线在 Draw_Main 开头算好(放下的镜子 / 准备阶段预览镜子二选一)，这里只做一次关于直线的对称
-                float orig_x = D.X, orig_y = D.Y;
-                calculate_line_reflection(mirror_line_x1, mirror_line_y1, mirror_line_x2, mirror_line_y2, orig_x, orig_y, &D.X, &D.Y);
-                camera = matrix[3] * D.X + matrix[7] * D.Z + matrix[11] * D.Y + matrix[15];
-                dist = sqrt(pow(D.X - Z.X, 2) + pow(D.Y - Z.Y, 2) + pow(D.Z - Z.Z, 2)) / dist_scale;
-                if (dist > 60) continue;   // 用户要求：过滤 60m 外的镜像求生者(镜像反射点到自身的距离)，别让远处镜像刷屏
-        		r_x = px + (matrix[0] * D.X + matrix[4] * D.Z + matrix[8] * D.Y + matrix[12]) / camera * px;
-                r_y = py - (matrix[1] * D.X + matrix[5] * (D.Z+ 8.5) + matrix[9] * (D.Y) + matrix[13]) / camera * py;
-                r_w = py - (matrix[1] * D.X + matrix[5] * (D.Z+ 28.5) + matrix[9] * (D.Y) + matrix[13]) / camera * py;
-												
-        		W = (r_y - r_w) / 2;	// 宽度
-        		H = r_y - r_w;		// 高度
-        		X1 = r_x - (r_y - r_w) / 4;	// X1
-        		Y1 = r_y - H / 2;	// Y1
-        		X2 = X1 + W;		// X2
-        		Y2 = Y1 + H;		// Y2
-        
-                if (W>0){
+	    if (mirror&&redqueenmod) draw_mirror_image(i);   // 红夫人镜像(见循环前的 draw_mirror_image)
+    }
 
-                    ss += data[i].str;
-                    auto textSize = ImGui::CalcTextSize(ss.c_str(), 0, 25);
-                    Draw->AddText({X1 + W/2-(textSize.x/2),Y1-45}, BotBoneColor, ss.c_str());
-                        
-                    if (true){   // 方框默认画(不受"方框绘制"开关影响，用户要求)
-                        ImGui::GetForegroundDrawList()->AddRect({X1, Y1},{X2, Y2}, BotBoneColor,3, 0,1.8f);
-    			    }
-    			        
-                    if (show_draw_Distance){
-                        std::string mirror_dist_str;
-                        mirror_dist_str += std::to_string((int) dist);
-                        mirror_dist_str += T(" 米", " m");
-                        auto textSize = ImGui::CalcTextSize(mirror_dist_str.c_str(), 0, 25);
-                        Draw->AddText({X1 + W/2-(textSize.x/2),Y2+10}, BotBoneColor, mirror_dist_str.c_str());
-                    }
-                        
-                    // 射线不画(用户要求)。
-                    // 骨骼默认画(不受"显示骨骼"开关影响)。
-                    // 【2026-10-19 重做】此前"方案B"把骨架当刚体整体平移到镜像落点(只反射根、其余骨骼
-                    //   保持真人世界偏移 delta=bone-root 原样搬过去)，数学上不是镜像：
-                    //   ① 朝向/手性不翻转 —— 真人侧身/背身时镜中姿态方向错；
-                    //   ② 平移后的点仍按各自深度投影 —— 镜像落点离相机近时(照镜子最常见)人体尺度被透视放大→变大变形。
-                    //   当年"逐根反射→忽大忽小"的归因是错的：镜面反射是等距变换、绝不改变骨架自身尺寸
-                    //   (主骨骼轮 1404-1412 同样逐骨骼各自深度投影却不变形)；真凶是旧镜线来源(本体+247/预览)
-                    //   每帧抖动。镜线已迁到稳定的 Python MaryMirrorUnit(246)，逐根反射现在安全。
-                    //   所以改回"对每根骨骼的水平两轴做真·镜面反射(高度不动)+ 正常投影"：反射后整副骨架落在
-                    //   镜面另一侧(照镜子时在相机前方、投得出)，大小/透视天然=真人站在镜像位置，方向自动翻成真镜像。
-                    // swap_yz 只在主骨骼轮读自身时校准；若"显示骨骼"关着主轮没跑，这里先拿自身补一次。
-                    if (NativeBones::g_swap_yz.load() < 0) {
-                        uint64_t self_cal = 0;
-                        if (PySelf::anchor(self_cal)) { NativeBones::Skeleton tmp; NativeBones::read_unit(self_cal, true, tmp); }
-                    }
+    // ---- 红夫人镜像(镜中红夫人 MaryMirrorImageUnit，键 247)：我是求生者时画，不看「夫人模式」(2026-11-05 用户要求) ----
+    // 它的类名跟本体一样是 redqueen.gim、归监管，但不在本体集合([1]/[2]/[236]/[1065])里，原来被本体过滤挡掉，一直没画过。
+    // 镜子没放出时它停在地下(y≈-1000)，高度 <= -300 不画。方框/距离跟着各自的开关
+    float mi_c[3] = {0, 0, 0};
+    uint64_t mi_coor = mirror_img ? getPtr64(mirror_img + 0x28) : 0;
+    bool mi_read = mi_coor && vm_readv(mi_coor + 0xa0, mi_c, 12);
+    {   // 【临时诊断】镜中红夫人：对象换了 / 升到地面或沉回地下时打一行
+        static uint64_t last_mi = 0; static int last_up = -1;
+        int up = (mi_read && mi_c[1] > -300) ? 1 : 0;
+        if (mirror_img != last_mi || up != last_up)
+            diag_log("[框诊断] 镜中红夫人 obj=0x%llx 来源=%s 坐标=(%.1f,%.1f,%.1f) 在地面=%d 我的阵营=%d 有锚点=%d\n",
+                     (unsigned long long)mirror_img, PyProgress::mirror_image_obj() ? "Python247" : (mirror_img ? "场景+0x6D" : "无"),
+                     mi_c[0], mi_c[1], mi_c[2], up, (int)self_camp, (int)has_auth_self);
+        last_mi = mirror_img; last_up = up;
+    }
+    if (mi_read && mi_c[0] != 0 && mi_c[2] != 0 && mi_c[1] > -300
+        && has_auth_self && self_camp == 2) {
+        float qx = mi_c[0], qh = mi_c[1], qy = mi_c[2];
+        float cam = matrix[3]*qx + matrix[7]*qh + matrix[11]*qy + matrix[15];
+        float d = sqrt(pow(qx - Z.X, 2) + pow(qy - Z.Y, 2) + pow(qh - Z.Z, 2)) / dist_scale;
+        if (cam > 0.01f && d < 300) {
+            float cx = px + (matrix[0]*qx + matrix[4]*qh + matrix[8]*qy + matrix[12]) / cam * px;
+            float cy = py - (matrix[1]*qx + matrix[5]*(qh + 8.5f) + matrix[9]*qy + matrix[13]) / cam * py;
+            float cw = py - (matrix[1]*qx + matrix[5]*(qh + 28.5f) + matrix[9]*qy + matrix[13]) / cam * py;
+            float bh = cy - cw, bw = bh / 2;
+            if (bw > 0) {
+                float bx1 = cx - bh / 4, by1 = cy - bh / 2;
+                {   // 方框按它自己的骨骼算(跟普通人物一致)，骨骼读不到才用上面写死高度那套
                     NativeBones::Skeleton msk;
-                    if (NativeBones::read_unit(data[i].obj, false, msk) && msk.valid) {
-                        ImVec2 bp[NativeBones::NUM_TARGET];
-                        bool bok[NativeBones::NUM_TARGET];
-                        for (int t = 0; t < NativeBones::NUM_TARGET; t++) {
-                            bok[t] = false;
-                            if (!msk.ok[t]) continue;
-                            // 每根骨骼的水平坐标(X, Y)关于镜线做真·镜面反射，高度(oy)不反射。
-                            float ox, oz;
-                            calculate_line_reflection(mirror_line_x1, mirror_line_y1,
-                                                      mirror_line_x2, mirror_line_y2,
-                                                      msk.x[t], msk.z[t], &ox, &oz);
-                            float oy = msk.y[t];                    // 高度不反射
-                            float cam = matrix[3]*ox + matrix[7]*oy + matrix[11]*oz + matrix[15];
-                            if (cam <= 0.01f) continue;
-                            float sx = px + (matrix[0]*ox + matrix[4]*oy + matrix[8]*oz + matrix[12]) / cam * px;
-                            float sy = py - (matrix[1]*ox + matrix[5]*oy + matrix[9]*oz + matrix[13]) / cam * py;
-                            bp[t] = ImVec2(sx, sy); bok[t] = true;
-                        }
-                        for (int e = 0; e < NativeBones::NUM_EDGE; e++) {
-                            int a = NativeBones::EDGES[e][0], b = NativeBones::EDGES[e][1];
-                            if (a == 0 || b == 0) continue;           // 头单独画
-                            if (bok[a] && bok[b]) Draw->AddLine(bp[a], bp[b], BotBoneColor, 2.2f);
-                        }
-                        if (bok[0]) {                                  // 头圆，抄主骨骼轮的画法
-                            ImVec2 up(0.f, -1.f);
-                            float r = 6.0f;
-                            if (bok[1] && bok[2]) {
-                                float dx = bp[1].x - bp[2].x, dy = bp[1].y - bp[2].y;
-                                float L = sqrtf(dx*dx + dy*dy);
-                                if (L > 0.5f) { up.x = dx / L; up.y = dy / L; r = L * 0.28f; }
-                            }
-                            if (r < 3.0f) r = 3.0f;
-                            if (r > 26.0f) r = 26.0f;
-                            ImVec2 base = bok[1] ? bp[1] : bp[0];
-                            ImVec2 hc(base.x + up.x * (r + 3.0f), base.y + up.y * (r + 3.0f));
-                            if (bok[1]) Draw->AddLine(bp[1], ImVec2(hc.x - up.x * r, hc.y - up.y * r), BotBoneColor, 2.2f);
-                            Draw->AddCircleFilled(hc, r, BotBoneColor, 16);
-                        }
+                    float sx1, sy1, sx2, sy2;
+                    if (NativeBones::read_unit(mirror_img, false, msk) && msk.valid && skeleton_screen_box(msk, false, sx1, sy1, sx2, sy2)) {
+                        bx1 = sx1; by1 = sy1; bw = sx2 - sx1; bh = sy2 - sy1;
                     }
-                }//判断W
-            }                
+                }
+                const char *nm = T("红夫人镜像", "Queen's Mirror Image");
+                auto ts = ImGui::CalcTextSize(nm, 0, 25);
+                Draw->AddText({bx1 + bw/2 - ts.x/2, by1 - 45}, ImColor(255,200,0,255), nm);
+                if (show_draw_Rect) corner_box({bx1, by1}, {bx1 + bw, by1 + bh}, BoneColor, 3, 0, 1.8f);
+                if (show_draw_Distance) {
+                    char dt[24];
+                    snprintf(dt, sizeof(dt), T("%d 米", "%d m"), (int)d);
+                    auto ds = ImGui::CalcTextSize(dt, 0, 25);
+                    Draw->AddText({bx1 + bw/2 - ds.x/2, by1 + bh + 10}, ImColor(255,200,0,255), dt);
+                }
+            }
+        }
+    }
+
+    // ---- 【临时诊断】骨骼画了、方框那段却没走到的本体 ----
+    // 原因按主循环的过滤顺序重查一遍(-1 = 设计上就不画框，不记)。一个"缺框片段"结束时打一行：
+    // 持续帧数 / 开始那帧的原因 / 片段内有没有撞上读线程改写 data[](撕裂窗口) / objcoor 跟 [M+0x28] 对不对得上
+    {
+        static uint64_t frame_no = 0;
+        frame_no++;
+        const bool tear = diag_busy0 || g_scan_busy.load() || diag_gen0 != g_scan_gen.load();
+        auto reason_of = [&](uint64_t M, int &idx, int &extra, bool &coor_bad) -> int {
+            idx = -1; extra = 0; coor_bad = false;
+            for (int i = 0; i < data_count; i++) if (data[i].obj == M) { idx = i; break; }
+            if (idx < 0) { extra = data_count; return 1; }                                   // 不在 data[]
+            const DataStruct &e = data[idx];
+            uint64_t fresh = getPtr64(M + 0x28);
+            coor_bad = fresh != (uint64_t)e.objcoor;
+            if (strstr(e.class_name, "buzz") || strstr(e.class_name, "nvyao.gim")) return 12;
+            if (self_obj != 0 && M == self_obj) return -1;
+            if ((e.camp == 1 || e.camp == 2) && PySelf::in_lobby()) return 3;
+            if (copycat_mode) return -1;
+            if ((e.camp == 1 || e.camp == 2) && PySelf::body_set_ready()
+                && (strstr(e.class_name, "player") || strstr(e.class_name, "boss")) && !PySelf::is_body(M)) return 5;
+            float c[3] = {0, 0, 0};
+            vm_readv(e.objcoor + 0xa0, c, 12);
+            if (c[0] == 0 || c[2] == 0) return 7;
+            if (c[1] <= -300) { extra = 1; return 7; }
+            if (has_auth_self && self_camp == 1 && e.camp == 1 && !PySelf::is_teammate_butcher(M)) return -1;
+            if (has_auth_self && self_camp == 1 && e.camp == 2 && PySelf::is_carried(M)) return -1;
+            float cam = matrix[3]*c[0] + matrix[7]*c[1] + matrix[11]*c[2] + matrix[15];
+            float d = sqrt(pow(c[0]-Z.X,2) + pow(c[2]-Z.Y,2) + pow(c[1]-Z.Z,2)) / dist_scale;
+            if (d >= 300) return 9;
+            float ry = py - (matrix[1]*c[0] + matrix[5]*(c[1]+8.5f) + matrix[9]*c[2] + matrix[13]) / cam * py;
+            float rw = py - (matrix[1]*c[0] + matrix[5]*(c[1]+28.5f) + matrix[9]*c[2] + matrix[13]) / cam * py;
+            if ((ry - rw) / 2 <= 0) return 8;
+            if (ShouldSkipEntity(e)) { extra = PySelf::is_stale_model(M) ? 1 : (IsGhostEntity(e) ? 2 : 3); return 4; }
+            if (self_obj != 0 && d < 1.0f) return 10;
+            if (e.camp != 1 && e.camp != 2) { extra = e.camp; return 2; }
+            return 0;                                                                        // 全部过滤都过得去
+        };
+        static const char *const RN[] = {"过滤都通过(本帧读到的 data[] 跟循环时不一样?)", "不在data[]", "camp不是1/2",
+                                         "判成局外(in_lobby)", "ShouldSkip(1废弃模型/2幽灵/3类名黑名单)", "不在本体集合",
+                                         "", "坐标为0或在地下(extra=1地下)", "W<=0(相机背后)", "距离>=300", "离自己<1m",
+                                         "", "类名buzz/nvyao"};
+        struct Ep { uint64_t start; int frames; int reason; int extra; int idx; bool tear; bool coor_bad; int count0; };
+        static std::unordered_map<uint64_t, Ep> eps;
+        uint64_t miss[32]; int nmiss = 0;
+        for (int u = 0; u < g_diag_bone_n; u++) {
+            uint64_t M = g_diag_bone[u];
+            bool boxed = false;
+            for (int k = 0; k < g_diag_box_n; k++) if (g_diag_box[k] == M) { boxed = true; break; }
+            if (boxed) continue;
+            int idx, extra; bool coor_bad;
+            int r = reason_of(M, idx, extra, coor_bad);
+            if (r < 0) continue;
+            miss[nmiss++] = M;
+            auto it = eps.find(M);
+            if (it == eps.end()) {
+                eps[M] = {frame_no, 1, r, extra, idx, tear, coor_bad, diag_count0};
+                if (r == 7) {   // 位置字段说在地下/原点，骨骼却画出来了：把两份坐标都打出来，看哪份过期
+                    uint64_t oc = getPtr64(M + 0x28);
+                    float pos[3] = {0, 0, 0}, wm[16] = {0};
+                    if (oc) { vm_readv(oc + 0xa0, pos, 12); vm_readv(oc + 0x1C0, wm, 64); }
+                    diag_log("[框诊断] 缺框开始 本体0x%llx 类名=%s 位置+0xa0=(%.1f,%.1f,%.1f) 世界矩阵平移=(%.1f,%.1f,%.1f) 自身=(%.1f,%.1f,%.1f)\n",
+                             (unsigned long long)M, idx >= 0 ? data[idx].class_name : "?", pos[0], pos[1], pos[2],
+                             wm[12], wm[13], wm[14], Z.X, Z.Z, Z.Y);
+                }
+            }
+            else {
+                Ep &ep = it->second;
+                ep.frames++; ep.tear |= tear; ep.coor_bad |= coor_bad;
+                if (ep.frames == 120)
+                    diag_log("[框诊断] 缺框持续中 本体0x%llx 已 %d 帧 原因=%s extra=%d idx=%d objcoor不一致=%d data_count=%d\n",
+                             (unsigned long long)M, ep.frames, RN[ep.reason], ep.extra, ep.idx, (int)ep.coor_bad, data_count);
+            }
+        }
+        for (auto it = eps.begin(); it != eps.end();) {
+            bool still = false;
+            for (int k = 0; k < nmiss; k++) if (miss[k] == it->first) { still = true; break; }
+            if (still) { ++it; continue; }
+            bool bones_now = false;
+            for (int u = 0; u < g_diag_bone_n; u++) if (g_diag_bone[u] == it->first) { bones_now = true; break; }
+            const Ep &ep = it->second;
+            diag_log("[框诊断] 缺框 本体0x%llx 持续 %d 帧 原因=%s extra=%d idx=%d 撕裂窗口=%d objcoor不一致=%d data_count(开始)=%d 结束方式=%s\n",
+                     (unsigned long long)it->first, ep.frames, RN[ep.reason], ep.extra, ep.idx, (int)ep.tear, (int)ep.coor_bad,
+                     ep.count0, bones_now ? "框回来了" : "骨骼也不画了");
+            it = eps.erase(it);
         }
     }
     // 发布版本: 注入功能已停用
@@ -2976,12 +3427,27 @@ static void shot_tick()
     }
 }
 
+// 选项后面的灰色 (?)：手指按住显示说明(触屏松手后提示会留着，点别处消失)
+static void help_marker(const char *zh, const char *en)
+{
+    ImGui::SameLine();
+    ImGui::TextDisabled("(?)");
+    if (ImGui::IsItemHovered()) {
+        ImGui::BeginTooltip();
+        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 18.0f);
+        ImGui::TextUnformatted(T(zh, en));
+        ImGui::PopTextWrapPos();
+        ImGui::EndTooltip();
+    }
+}
+
 void Layout_tick_UI(bool *main_thread_flag) {
     // 启动后第一帧：先记默认值，再读 /data 下的配置(要在 ImGui 上下文建好之后，cfg_set_msg 用到 GetTime)
     static bool cfg_autoloaded = false;
     if (!cfg_autoloaded) {
         cfg_autoloaded = true;
         config_snapshot_defaults();
+        cfg_mark_saved();          // 没有配置文件时以默认值为基准；读到文件时 config_load 里会再记一次
         config_load(true);
     }
 
@@ -3012,11 +3478,9 @@ void Layout_tick_UI(bool *main_thread_flag) {
             permeate_record_ini = false;
         }
 
-        // 运行状态 + 结束进程放一个带边框的框里，不用展开折叠框就能退出
+        // 状态框：只放每次都要看的(数据状态/帧率/内存总数)和常用按钮；渲染模式、内存明细在「基础信息」里
         ImGui::BeginChild("##status_box", ImVec2(0, 0),
                           ImGuiChildFlags_Border | ImGuiChildFlags_AutoResizeX | ImGuiChildFlags_AutoResizeY);
-        ImTextT("渲染模式 : %s, gui版本 : %s", "Render: %s  gui: %s", graphics->RenderName, IMGUI_VERSION);
-        ImTextColoredT(ImVec4(1.0f, 0.0f, 1.0f, 1.0f), "帧率 %.1f FPS", "%.1f FPS", ImGui::GetIO().Framerate);
 
         // 读 smaps_rollup 要遍历页表，没必要每帧读，1 秒刷新一次
         static MemUsage mem;
@@ -3025,27 +3489,22 @@ void Layout_tick_UI(bool *main_thread_flag) {
             mem = read_memory_usage();
             mem_time = ImGui::GetTime();
         }
-        ImTextT("内存占用: %.1f MB", "Memory: %.1f MB", mem.total_kb() / 1024.0f);
-        if (mem.gpu_ok)
-            ImTextT("  进程 %.1f + 换出 %.1f + 显存 %.1f + 画面缓冲 %.1f",
-                    "  proc %.1f + swap %.1f + vram %.1f + surface %.1f",
-                    mem.pss_kb / 1024.0f, mem.swap_kb / 1024.0f, mem.gpu_kb / 1024.0f, mem.buffer_kb / 1024.0f);
-        else
-            ImTextT("  进程 %.1f + 换出 %.1f + 画面缓冲 %.1f (显存未计)",
-                    "  proc %.1f + swap %.1f + surface %.1f (vram n/a)",
-                    mem.pss_kb / 1024.0f, mem.swap_kb / 1024.0f, mem.buffer_kb / 1024.0f);
 
-        ImTextT("数据状态:", "Data status:");
+        // read_state: 0 = 还在 bss 里扫签名(此时什么都不画)，1 = 数组失效重试中，2 = 正常
         if (read_state == 2)
-            ImTextColoredT(ImVec4(0.0f, 205.0f, 0.0f, 100.0f), "已获取到游戏数据", "Game data acquired");
+            ImGui::TextColored(ImVec4(0.0f, 0.6f, 0.0f, 1.0f), "%s", T("已获取游戏数据", "Game data acquired"));
         else if (read_state == 1)
-            ImTextColoredT(ImVec4(255.0f, 0.0f, 0.0f, 100.0f), "正在获取游戏数据", "Acquiring game data");
-        if (ImGui::Button(T("结束进程", "Exit")))
-            exit(0);
+            ImGui::TextColored(ImVec4(0.85f, 0.2f, 0.2f, 1.0f), "%s", T("正在获取游戏数据", "Acquiring game data"));
+        else
+            ImGui::TextDisabled("%s", T("正在定位游戏数据(扫描签名)", "Locating game data (scanning)"));
+        ImGui::SameLine();
+        ImGui::TextDisabled("|");
+        ImGui::SameLine();
+        ImTextT("%.0f FPS  内存 %.0f MB", "%.0f FPS  Mem %.0f MB", ImGui::GetIO().Framerate, mem.total_kb() / 1024.0f);
+
         // 语言切换：点击在 中文/英文 间切换(g_english 定义在 Name.h)。
         // 按钮文字显示「点击后会切到的语言」：当前中文时显示 English,当前英文时显示 中文。
         // pick() 实时读 g_english,缓存存的是映射项指针,所以切换即时生效、无需清缓存。
-        ImGui::SameLine();
         if (ImGui::Button(g_english ? "中文" : "English"))
             g_english = !g_english;
         ImGui::SameLine();
@@ -3057,58 +3516,101 @@ void Layout_tick_UI(bool *main_thread_flag) {
         ImGui::Checkbox(T("截图时隐藏菜单", "Hide menu in shot"), &shot_hide_menu);
         ImGui::SetNextItemWidth(ImGui::GetFontSize() * 8);
         ImGui::SliderFloat(T("透明度###panel_alpha", "Opacity###panel_alpha"), &panel_alpha, 0.10f, 1.0f, "%.2f");
-        if (ImGui::Button(T("保存配置###cfg_save", "Save Config###cfg_save"))) config_save();
+        // 有改动还没写进文件时按钮带 *(### 后面是固定 ID，文字变了也是同一个按钮)
+        bool dirty = cfg_dirty();
+        if (ImGui::Button(dirty ? T("保存配置 *###cfg_save", "Save Config *###cfg_save")
+                                : T("保存配置###cfg_save", "Save Config###cfg_save"))) config_save();
         ImGui::SameLine();
         if (ImGui::Button(T("恢复默认配置###cfg_reset", "Reset to Defaults###cfg_reset"))) config_restore_defaults();
         if (cfg_msg[0] && ImGui::GetTime() - cfg_msg_time < 4.0)   // 结果提示停留 4 秒
             ImGui::TextColored(strstr(cfg_msg, "失败") || strstr(cfg_msg, "failed") ? ImVec4(1, 0.35f, 0.35f, 1) : ImVec4(0.4f, 1, 0.4f, 1), "%s", cfg_msg);
+
+        // 结束进程：单独放最后一行、红色，点两次才退出(第一次点后 3 秒内再点一次)，防触屏误触
+        static double exit_armed_at = -100.0;
+        bool exit_armed = ImGui::GetTime() - exit_armed_at < 3.0;
+        ImGui::Spacing();
+        ImGui::PushStyleColor(ImGuiCol_Button,        exit_armed ? ImVec4(0.85f, 0.15f, 0.15f, 1) : ImVec4(0.75f, 0.30f, 0.30f, 1));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.85f, 0.20f, 0.20f, 1));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.65f, 0.10f, 0.10f, 1));
+        ImGui::PushStyleColor(ImGuiCol_Text,          ImVec4(1, 1, 1, 1));
+        if (ImGui::Button(exit_armed ? T("再点一次确认退出###exit", "Tap again to exit###exit")
+                                     : T("结束进程###exit", "Exit###exit"))) {
+            if (exit_armed) exit(0);
+            exit_armed_at = ImGui::GetTime();
+        }
+        ImGui::PopStyleColor(4);
         ImGui::EndChild();
 
         if (ImGui::CollapsingHeader(T("基础信息###base", "Basic Info###base"))) {
+            ImTextT("渲染模式 : %s, gui版本 : %s", "Render: %s  gui: %s", graphics->RenderName, IMGUI_VERSION);
+            if (mem.gpu_ok)
+                ImTextT("内存 %.1f MB = 进程 %.1f + 换出 %.1f + 显存 %.1f + 画面缓冲 %.1f",
+                        "Mem %.1f MB = proc %.1f + swap %.1f + vram %.1f + surface %.1f",
+                        mem.total_kb() / 1024.0f, mem.pss_kb / 1024.0f, mem.swap_kb / 1024.0f, mem.gpu_kb / 1024.0f, mem.buffer_kb / 1024.0f);
+            else
+                ImTextT("内存 %.1f MB = 进程 %.1f + 换出 %.1f + 画面缓冲 %.1f (显存未计)",
+                        "Mem %.1f MB = proc %.1f + swap %.1f + surface %.1f (vram n/a)",
+                        mem.total_kb() / 1024.0f, mem.pss_kb / 1024.0f, mem.swap_kb / 1024.0f, mem.buffer_kb / 1024.0f);
+            ImGui::Separator();
             ImTextT("游戏进程:%d", "PID:%d", pid);
             ImTextT("模块入口:%lx", "Module base:%lx", libbase);
             ImTextT("游戏包名:%s", "Package:%s", extractedString);
             ImTextT("矩阵地址:%lx", "Matrix:%lx", Matrix);
             ImTextT("数组地址:%lx", "Array:%lx", Arrayaddr);
             ImTextT("矩阵偏移:%lx", "Matrix off:%lx", MatrixOffset);
-            ImTextT("模块页数:%d", "Pages:%d", c);
             ImTextT("数组偏移:%lx", "Array off:%lx", ArrayaddrOffset);
             ImTextT("监管者:%s (房间监管%d)", "Hunter:%s (room hunters %d)", prophet_text, g_room_hunter_n);
             ImTextT("Py根:%s", "PyRoot:%s", PyRoot::status_text());
             ImTextT("密码机进度:%s (已破译%d)", "Ciphers:%s (decoded %d)", PyProgress::status_text(), PyProgress::decoded_count());
             ImTextT("天赋:%s", "Talents:%s", PyGenius::status_text());
             ImTextT("阶段:%s", "Phase:%s", PyScene::status_text());
-            // 自身锚点：链路一旦失效这里会写明原因，绘制自动退回相机深度启发式
+            // 自身锚点：链路一旦失效这里会写明原因；拿不到锚点时没有自身(不猜)
             ImTextT("自身:%s", "Self:%s", PySelf::status_text());
             ImTextT("镜世界:%s", "Mirror:%s", PySelf::photo_diag_text());   // 约瑟夫 PhotoUnit 激活状态(_time/_players)
         }
 
         ImGui::SetNextItemOpen(true, ImGuiCond_Once);
         if (ImGui::CollapsingHeader(T("绘制设置###draw", "Drawing###draw"))) {
-            ImGui::Checkbox(T("显示鬼魂", "Show Ghosts"), &inform_ghost);
-            ImGui::SameLine();
-            // 预知监管和模仿者模式互斥(模仿者局没有监管)
-            if (ImGui::Checkbox(T("预知监管", "Hunter Prophet"), &show_draw_prophet) && show_draw_prophet) { copycat_mode = false; waterfight_mode = false; }
+            // 两列表格：复选框按列对齐(SameLine 排的话标签长短不一，第二列对不齐)
+            if (ImGui::BeginTable("##draw_tbl", 2, ImGuiTableFlags_SizingFixedFit)) {
+                ImGui::TableNextColumn();
+                ImGui::Checkbox(T("显示鬼魂", "Show Ghosts"), &inform_ghost);
+                help_marker("鬼魂视角/幽灵态的角色也画出来(白框)", "Also draw characters in ghost state (white box)");
+                ImGui::TableNextColumn();
+                // 预知监管和模仿者模式互斥(模仿者局没有监管)
+                if (ImGui::Checkbox(T("预知监管", "Hunter Prophet"), &show_draw_prophet) && show_draw_prophet) { copycat_mode = false; waterfight_mode = false; }
+                help_marker("屏幕顶部显示本局监管名字，准备阶段就能看到。打开会关掉模仿者/林中童话",
+                            "Show this match's hunter at the top, already in the lobby. Turns off Copycat / Forest's Fable");
 
-            ImGui::Checkbox(T("绘制道具", "Draw Items"), &show_draw_Prop);
-            ImGui::SameLine();
-            ImGui::Checkbox(T("夫人模式", "Queen Mode"), &redqueenmod);
+                ImGui::TableNextColumn();
+                ImGui::Checkbox(T("绘制道具", "Draw Items"), &show_draw_Prop);
+                ImGui::TableNextColumn();
+                ImGui::Checkbox(T("夫人模式", "Queen Mode"), &redqueenmod);
+                help_marker("红夫人瞄准或放下镜子时，画出求生者在镜中的位置(方框+骨骼)",
+                            "When Bloody Queen aims or places a mirror, draw survivors' mirror images (box + bones)");
 
-            ImGui::Checkbox(T("绘制调试", "Draw Debug"), &Debugging);
-            ImGui::SameLine();
-            ImGui::Checkbox(T("显示密码机", "Show Ciphers"), &show_draw_secret_mechine);   // 局内进度/进度条 跟着它
+                ImGui::TableNextColumn();
+                ImGui::Checkbox(T("绘制调试", "Draw Debug"), &Debugging);
+                help_marker("给每个场景对象标地址和类名，排查用，画面会很乱", "Label every scene object with address and class name (for troubleshooting, very noisy)");
+                ImGui::TableNextColumn();
+                ImGui::Checkbox(T("显示密码机", "Show Ciphers"), &show_draw_secret_mechine);   // 局内进度/进度条 跟着它
 
-            // 「显示天赋」「显示大门」已移到「固定信息」折叠框(用户要求)
+                // 「显示天赋」「显示大门」已移到「固定信息」折叠框(用户要求)
 
-            // 发布版本: 注入功能已停用
-            // ImGui::Checkbox("骨骼与进度", &show_sohook);
-            ImGui::Checkbox(T("显示骨骼", "Show Bones"), &show_draw_Bones);   // 原生骨骼,抄若辰链驱动读
-            ImGui::SameLine();
-            ImGui::Checkbox(T("显示方框", "Show Box"), &show_draw_Rect);
+                // 发布版本: 注入功能已停用
+                // ImGui::Checkbox("骨骼与进度", &show_sohook);
+                ImGui::TableNextColumn();
+                ImGui::Checkbox(T("显示骨骼", "Show Bones"), &show_draw_Bones);   // 原生骨骼,抄若辰链驱动读
+                ImGui::TableNextColumn();
+                ImGui::Checkbox(T("显示方框", "Show Box"), &show_draw_Rect);
 
-            ImGui::Checkbox(T("显示射线", "Show Lines"), &show_draw_Line);   // 默认开(变量初值 true)
-            ImGui::SameLine();
-            ImGui::Checkbox(T("监管天赋树", "Hunter Talent Tree"), &show_genius_tree);   // 径向图，独立可拖动窗口
+                ImGui::TableNextColumn();
+                ImGui::Checkbox(T("显示射线", "Show Lines"), &show_draw_Line);   // 默认开(变量初值 true)
+                ImGui::TableNextColumn();
+                ImGui::Checkbox(T("监管天赋树", "Hunter Talent Tree"), &show_genius_tree);   // 径向图，独立可拖动窗口
+                help_marker("单独的窗口，显示监管点了哪些天赋", "Separate window showing the hunter's talent picks");
+                ImGui::EndTable();
+            }
         }
 
         // 准星：所有角色通用，默认关。位置/样式/大小/粗细整套按角色记(保存配置时写进去)；
@@ -3144,7 +3646,6 @@ void Layout_tick_UI(bool *main_thread_flag) {
             if (g_xhair_pid > 0)
                 ImGui::TextColored(ImVec4(0.65f, 0.65f, 0.65f, 1), T("当前角色 pid %d：%s", "Role pid %d: %s"), g_xhair_pid,
                                    g_xhair.count(g_xhair_pid) ? T("用本角色的设置", "own settings") : T("沿用蜡像师/默认", "from Waxwork/default"));
-            ImGui::TextColored(ImVec4(0.65f, 0.65f, 0.65f, 1), "%s", T("改完点「保存配置」才会写进文件", "Click Save Config to keep changes"));
         }
 
         // 固定信息(屏幕 HUD 汇总)：每块独立开关 + 独立 X/Y/大小。调好位置后把初值固化即可
@@ -3232,15 +3733,23 @@ void Layout_tick_UI(bool *main_thread_flag) {
 
         // 自动盖板(若辰同款判定)：监管走进板子判定区、自己站在板边、两人相距 ≤3 米时点一下交互键
         if (ImGui::CollapsingHeader(T("自动盖板###pallet", "Auto Pallet###pallet"))) {
-            ImGui::Checkbox(T("开启##auto_pallet", "Enable##auto_pallet"), &AutoPallet::enabled);   // 不能跟折叠框同名，同名 ID 冲突会点不动
-            ImGui::SameLine();
-            ImGui::Checkbox(T("显示判定范围", "Show Range"), &AutoPallet::show_range);
-            ImGui::Checkbox(T("显示触摸点", "Show Touch Point"), &AutoPallet::show_touch_point);
-            ImGui::SameLine();
-            if (ImGui::Button(T("测试点击", "Test Tap"))) AutoPallet::request_test_tap();
+            if (ImGui::BeginTable("##pallet_tbl", 2, ImGuiTableFlags_SizingFixedFit)) {
+                ImGui::TableNextColumn();
+                ImGui::Checkbox(T("开启##auto_pallet", "Enable##auto_pallet"), &AutoPallet::enabled);   // 不能跟折叠框同名，同名 ID 冲突会点不动
+                ImGui::TableNextColumn();
+                ImGui::Checkbox(T("显示判定范围", "Show Range"), &AutoPallet::show_range);
+                ImGui::TableNextColumn();
+                ImGui::Checkbox(T("显示触摸点", "Show Touch Point"), &AutoPallet::show_touch_point);
+                ImGui::TableNextColumn();
+                if (ImGui::Button(T("测试点击", "Test Tap"))) AutoPallet::request_test_tap();
+                help_marker("站在板子旁边按，游戏里有反应说明触摸点对准了放板按钮",
+                            "Stand next to a pallet and press it; if the game reacts, the touch point is on the pallet button");
+                ImGui::EndTable();
+            }
 
             // 触发宽度(游戏单位，判定矩形的全宽)：固定 / 随机(每次点完在上下限之间重抽)，范围都是 5~15
             ImGui::Checkbox(T("随机宽度##pallet_rand", "Random width##pallet_rand"), &AutoPallet::random_width);
+            help_marker("每次点完在上下限之间重新抽一个触发宽度", "Re-roll the trigger width between Min and Max after every tap");
             if (!AutoPallet::random_width) {
                 ImGui::SliderFloat(T("触发宽度##pallet_w", "Trigger width##pallet_w"), &AutoPallet::width,
                                    AutoPallet::WIDTH_MIN, AutoPallet::WIDTH_MAX, "%.1f");
@@ -3255,14 +3764,32 @@ void Layout_tick_UI(bool *main_thread_flag) {
             ImGui::SliderFloat(T("触摸点 Y", "Touch Y"), &AutoPallet::touch_y, 0.0f, (float)displayInfo.height, "%.0f");
             ImGui::SliderInt(T("按住(ms)", "Hold (ms)"), &AutoPallet::hold_ms, 10, 120);
             ImGui::SliderInt(T("位置随机(px)", "Jitter (px)"), &AutoPallet::jitter_px, 0, 60);   // 只作用于自动点击，测试点击不随机
+            help_marker("自动点击落在触摸点周围这么多像素内的随机位置(测试点击不随机)",
+                        "Auto taps land randomly within this many pixels of the touch point (test tap is exact)");
             ImGui::SliderInt(T("时长随机(±ms)", "Hold jitter (ms)"), &AutoPallet::jitter_ms, 0, 30);
             // 快速监管预判：实测速度 > 门槛时把监管位置往前推「提前量」再判(多数监管配表移速 4.54~4.71 m/s)
             ImGui::Checkbox(T("快速监管预判##pallet_pred", "Predict fast hunters##pallet_pred"), &AutoPallet::predict_fast);
+            help_marker("监管实测速度超过门槛时，按「提前量」把它的位置往前推再判断(多数监管正常移速 4.5~4.7 m/s)",
+                        "When a hunter moves faster than the threshold, project it forward by Lead before checking (normal speed is 4.5-4.7 m/s)");
             if (AutoPallet::predict_fast) {
                 ImGui::SliderFloat(T("预判速度门槛(m/s)##pallet_pv", "Predict speed (m/s)##pallet_pv"), &AutoPallet::fast_mps, 4.0f, 10.0f, "%.1f");
                 ImGui::SliderInt(T("提前量(ms)##pallet_lead", "Lead (ms)##pallet_lead"), &AutoPallet::lead_ms, 40, 800);
             }
 
+            // 监管当前速度(按坐标实测，300ms 平滑)：联合狩猎每个监管一行
+            {
+                AutoPallet::HunterSpeed sp[PySelf::MAX_HUNTERS];
+                int sn = AutoPallet::hunter_speeds(sp, PySelf::MAX_HUNTERS);
+                if (sn == 0) ImGui::TextDisabled("%s", T("监管速度: —(开启自动或显示判定范围、我是求生者时测)",
+                                                          "Hunter speed: - (measured when Enable or Show Range is on and you are a survivor)"));
+                for (int k = 0; k < sn; k++) {
+                    const char *name = "";
+                    for (int i = 0; i < data_count; i++) if (data[i].obj == sp[k].obj) { name = data[i].str; break; }
+                    if (!name[0]) name = T("监管", "Hunter");
+                    if (sp[k].ok) ImTextT("监管速度: %s %.1f m/s", "Hunter speed: %s %.1f m/s", name, sp[k].mps);
+                    else          ImTextT("监管速度: %s 测量中", "Hunter speed: %s measuring", name);
+                }
+            }
             ImTextT("状态: %s", "Status: %s", AutoPallet::status_text());
             ImTextT("点击 成功%d 失败%d  确认放下%d", "Tap ok%d fail%d confirmed%d",
                     AutoPallet::g_tap_ok.load(), AutoPallet::g_tap_fail.load(), AutoPallet::g_confirmed.load());

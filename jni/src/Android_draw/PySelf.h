@@ -959,7 +959,7 @@ static void start(uintptr_t libbase)
 static inline bool available() { return g_available; }
 static inline const char *status_text() { return g_status[0] ? g_status : T("未启动", "not started"); }
 
-// 当前操控单位的场景对象。返回 false 时绘制侧要退回相机深度启发式
+// 当前操控单位的场景对象。返回 false 时绘制侧就当没有自身(不猜)
 static bool anchor(uint64_t &obj)
 {
     if (!g_available) return false;

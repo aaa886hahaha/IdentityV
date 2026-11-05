@@ -254,6 +254,16 @@ namespace Touch {
     }
 
     static bool checkDeviceIsTouch(int fd) {
+        // 2026-11-05：触控板(键盘套，如小米平板 "Xiaomi Touch")也有 MT slot，但它是 POINTER 不是 DIRECT。
+        // 编号又比真屏小，会排到 devices[0]，注入就写进了触控板(写入成功、游戏没反应)。这里排除掉。
+        {
+            uint8_t props[INPUT_PROP_CNT / 8 + 1]{};
+            if (ioctl(fd, EVIOCGPROP(sizeof(props)), props) >= 0) {
+                bool is_pointer = props[INPUT_PROP_POINTER / 8] & (1 << (INPUT_PROP_POINTER % 8));
+                bool is_direct  = props[INPUT_PROP_DIRECT / 8] & (1 << (INPUT_PROP_DIRECT % 8));
+                if (is_pointer && !is_direct) return false;
+            }
+        }
         uint8_t *bits = NULL;
         ssize_t bits_size = 0;
         int res, j, k;

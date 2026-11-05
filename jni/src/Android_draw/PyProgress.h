@@ -106,6 +106,12 @@ static volatile int g_door_count[2] = {0, 0};
 // 镜面也在同一次刷新里填、共用 g_active 翻转
 static MirrorPlane g_mirror_buf[2] = {};
 
+// 镜中红夫人：units_by_type[247] = MaryMirrorImageUnit 的 model+0x20 场景对象(2026-11-05)。
+// 原来靠场景侧 +0x6D 位(0x80 无 0x40)认，用户实测认不出来(那个字节会跳，镜像也可能带 0x40)，改成直接问 Python
+static const int MARY_MIRROR_IMAGE_UNIT_TYPE = 247;
+static uint64_t g_mirror_img_buf[2] = {0, 0};
+static int64_t  g_i_mi_model = -1;
+
 static uintptr_t g_libbase = 0;
 static uint64_t  g_module_dict = 0;                 // game_kernel 的 md_dict，进程内稳定
 static int64_t   g_i_unit_mgr = -1, g_i_ubt = -1, g_i_fix = -1, g_i_pos = -1, g_i_model = -1;
@@ -248,6 +254,29 @@ static void collect_mirror(uint64_t ubt, int write_idx)
     g_mirror_buf[write_idx].valid = true;
 }
 
+// 镜中红夫人的场景对象(只取第 0 个)。坐标由绘制侧每帧从场景对象读，这里只给身份
+static void collect_mirror_image(uint64_t ubt, int write_idx)
+{
+    g_mirror_img_buf[write_idx] = 0;
+    uint64_t lst = get_type_list(ubt, MARY_MIRROR_IMAGE_UNIT_TYPE);
+    if (!is_obj(lst)) return;
+    int64_t n = 0;
+    vm_readv(lst + 0x10, &n, 8);
+    uint64_t items = getPtr64(lst + 0x18);
+    if (n <= 0 || n > 8 || !is_obj(items)) return;
+    uint64_t inst = getPtr64(items);
+    if (!is_obj(inst)) return;
+    uint64_t d = getPtr64(inst - 0x18);
+    Dict dk;
+    if (!read_dict(d, dk)) return;
+    g_i_mi_model = resolve_index(d, dk, g_i_mi_model, "model");
+    if (g_i_mi_model < 0) return;
+    uint64_t mo = getPtr64(value_slot(dk, g_i_mi_model));
+    if (!is_obj(mo)) return;
+    uint64_t sp = getPtr64(mo + 0x20);
+    if (is_obj(sp)) g_mirror_img_buf[write_idx] = sp;
+}
+
 static bool try_refresh()
 {
     if (g_module_dict == 0 && !resolve_module()) return false;
@@ -265,6 +294,7 @@ static bool try_refresh()
     int write_idx = 1 - g_active;
     collect_doors(ubt, write_idx);
     collect_mirror(ubt, write_idx);
+    collect_mirror_image(ubt, write_idx);
 
     // 在 int->list 的表里找键 3
     Dict k;
@@ -380,28 +410,6 @@ static void start(uintptr_t libbase)
 static inline bool available() { return g_available; }
 static inline const char *status_text() { return g_status[0] ? g_status : T("未启动", "not started"); }
 
-// 把场景对象配到对应的 GeneratorUnit。
-// 首选指针身份(model+0x20 就是场景对象本身)；model 为空时才退回坐标近邻。
-// 坐标兜底不能单独用: 实测一局 7 台里有 4 台的 position 读不出，那几台会一直配不上。
-static bool lookup(uintptr_t obj, float x, float y, float &progress)
-{
-    if (!g_available) return false;
-    int b = g_active, n = g_count[b];
-    for (int i = 0; i < n; i++) {
-        if (g_buf[b][i].scene_obj == (uint64_t)obj) { progress = g_buf[b][i].progress; return true; }
-    }
-    int nearest = -1; float min_dist = 2.0f;
-    for (int i = 0; i < n; i++) {
-        if (g_buf[b][i].scene_obj != 0) continue;                        // 有身份的已经在上面比过了
-        if (g_buf[b][i].x == 0.f && g_buf[b][i].y == 0.f) continue;    // 坐标没写入的跳过，避免误配
-        float d = fabsf(g_buf[b][i].x - x) + fabsf(g_buf[b][i].y - y);
-        if (d < min_dist) { min_dist = d; nearest = i; }
-    }
-    if (nearest < 0) return false;
-    progress = g_buf[b][nearest].progress;
-    return true;
-}
-
 static inline bool is_decoded(float progress) { return progress >= 99.95f; }
 
 // 枚举本局全部密码机(含 0%、含已破译)，给左侧汇总面板用。
@@ -452,6 +460,13 @@ static bool mirror_plane(float &px, float &pz, float &nx, float &nz)
     px = g_mirror_buf[b].px; pz = g_mirror_buf[b].pz;
     nx = g_mirror_buf[b].nx; nz = g_mirror_buf[b].nz;
     return true;
+}
+
+// 镜中红夫人的场景对象，没有/读不到返回 0
+static inline uint64_t mirror_image_obj()
+{
+    if (!g_available) return 0;
+    return g_mirror_img_buf[g_active];
 }
 
 // 大门开启完成。hack_process 是 0~100 的百分比(跟 fix_process 同构，

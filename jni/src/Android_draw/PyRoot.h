@@ -23,7 +23,7 @@
 //   3. 其余 4 个不推算，直接去 sys.modules["builtins"].md_dict 里按名字取
 //      "int" / "float" / "True" / "False" —— 那就是 CPython 定义里的对象本身，
 //      不存在 True/False 顺序弄反的问题
-//   4. 第 1 步失败(读不到文件、段表被剥掉)才退回旧的写死值，同样要过第 2 步的校验
+//   4. 第 1 步失败(读不到文件、段表被剥掉)就报错，不再退回写死值(2026-11-04 删了 0917 版的 0xA7029E8 兜底)
 //
 // 仍然依赖的常数只有 CPython 自己的布局(+0xE9B0 / tp_name +0x18 / md_dict +0x10 / dict 布局)，
 // 它们随解释器版本变，不随游戏热更变。游戏哪天升级 CPython，这里会校验失败并在状态里报出来，
@@ -41,7 +41,6 @@
 namespace PyRoot {
 
 static const uint64_t PYRUNTIME_MODULES_OFF = 0xE9B0;      // _PyRuntime 内主解释器 modules 字段
-static const uint64_t LEGACY_MODULES_SLOT       = 0xA7029E8;   // 0917 版写死值，只作兜底
 
 static uintptr_t g_libbase = 0;
 static uint64_t  g_elf_slot = 0;                         // 从 ELF 段表算出来的，0 = 没算出来
@@ -201,13 +200,13 @@ static bool ensure()
     if (now == g_last_try) return false;
     g_last_try = now;
 
+    // 只认 ELF 段表算出的槽。原来还有 0917 版写死的 0xA7029E8 兜底，2026-11-04 删：
+    // 两个版本 ELF 都成功，而新版的真实值(+0xA786CD0)早就不是它，留着没有意义
     const char *source = nullptr;
-    if (g_elf_slot && validate(g_elf_slot))                           source = "ELF .PyRuntime";
-    else if (g_elf_slot != g_libbase + LEGACY_MODULES_SLOT &&
-             validate(g_libbase + LEGACY_MODULES_SLOT))                   source = T("旧写死值(兜底)", "legacy hardcoded (fallback)");
+    if (g_elf_slot && validate(g_elf_slot)) source = "ELF .PyRuntime";
     if (!source) {
         if (g_elf_slot) snprintf(g_status, sizeof(g_status), T("等待解释器(ELF槽 +0x%llx)", "waiting for interpreter (ELF slot +0x%llx)"), (unsigned long long)(g_elf_slot - g_libbase));
-        else         snprintf(g_status, sizeof(g_status), "%s", T("ELF 没读到，旧值也不对", "ELF not read, legacy value invalid"));
+        else         snprintf(g_status, sizeof(g_status), "%s", T("ELF 段表没读到", "ELF section table not read"));
         return false;
     }
     snprintf(g_status, sizeof(g_status), T("就绪 %s 槽+0x%llx", "ready %s slot+0x%llx"), source, (unsigned long long)(g_modules_slot - g_libbase));

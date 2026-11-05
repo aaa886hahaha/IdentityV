@@ -246,6 +246,31 @@ static const float TELEPORT_JUMP_M = 5.0f;
 struct Track { uint64_t obj; HunterSample hist[HIST_CAP]; int n; int64_t seen_ms; };
 static Track g_tracks[PySelf::MAX_HUNTERS];
 
+// ---- 菜单显示用的监管速度(双缓冲，盖板线程写、渲染线程读) ----
+// 判定用的 80ms 窗口跟得紧但会跳(远端位置按网络包阶梯更新)，显示另用 300ms 窗口平滑；
+// 历史最多 32 个样本 × 10ms ≈ 320ms，够用。只在盖板线程跑到监管那一步时有数(开启自动或显示判定范围、我是求生者)
+static const int64_t SPEED_SHOW_WINDOW_MS = 300;
+struct HunterSpeed { uint64_t obj; float mps; bool ok; };
+static HunterSpeed g_speeds[2][PySelf::MAX_HUNTERS];
+static int g_speed_n[2] = {0, 0};
+static std::atomic<int> g_speed_active{0};
+
+static void publish_speeds(const HunterSpeed *s, int n)
+{
+    int w = 1 - g_speed_active.load();
+    if (n > 0) memcpy(g_speeds[w], s, sizeof(HunterSpeed) * n);
+    g_speed_n[w] = n;
+    g_speed_active.store(w);
+}
+
+static int hunter_speeds(HunterSpeed *out, int cap)
+{
+    int a = g_speed_active.load();
+    int n = g_speed_n[a] < cap ? g_speed_n[a] : cap;
+    memcpy(out, g_speeds[a], sizeof(HunterSpeed) * n);
+    return n;
+}
+
 // 按监管对象取它的历史；没有就占用最久没见到的那格(换局/换人自然顶掉)
 static Track &track_of(uint64_t obj, int64_t t)
 {
@@ -272,12 +297,13 @@ static void hunter_track(Track &k, int64_t t, const float *H)
 }
 
 // 返回 false = 样本不够(少于 3 个或跨度不到 30ms，冲刺刚起步也要尽快出结果)。
-// decel = 后半段速度不到前半段 50%(在刹车)；两半各自不到 30ms 时阶梯式更新会让端点速度乱跳，不做判断
-static bool hunter_velocity(const Track &k, int64_t now, float &vx, float &vy, bool &decel)
+// 2026-11-05 删了"刹车"判断(后半段速度 < 前半段 50% 就不预判)：远端位置随网络包阶梯更新，半个窗口(~40ms)里
+// 有没有包是随机的，那个标志主要看包落在哪一半，冲刺中会被随机关掉预判；而急停是瞬间的，整体速度掉到门槛下就自然不预判了
+static bool hunter_velocity(const Track &k, int64_t now, float &vx, float &vy, int64_t window_ms = VEL_WINDOW_MS)
 {
     const HunterSample *h = k.hist;
     int first = k.n;
-    while (first > 0 && now - h[first - 1].t <= VEL_WINDOW_MS) first--;
+    while (first > 0 && now - h[first - 1].t <= window_ms) first--;
     int n = k.n - first;
     if (n < 3 || h[k.n - 1].t - h[first].t < 30) return false;
     double st = 0, sx = 0, sy = 0, stt = 0, stx = 0, sty = 0;
@@ -289,19 +315,6 @@ static bool hunter_velocity(const Track &k, int64_t now, float &vx, float &vy, b
     if (den <= 1e-9) return false;
     vx = (float)((n * stx - st * sx) / den);
     vy = (float)((n * sty - st * sy) / den);
-    // 前后两半各用端点算平均速度
-    int mid = first + n / 2;
-    auto seg_speed = [](const HunterSample &a, const HunterSample &b) {
-        float dt = (float)(b.t - a.t) / 1000.f;
-        if (dt <= 0.f) return 0.f;
-        float dx = b.x - a.x, dy = b.y - a.y;
-        return sqrtf(dx * dx + dy * dy) / dt;
-    };
-    decel = false;
-    if (h[mid].t - h[first].t >= 30 && h[k.n - 1].t - h[mid].t >= 30) {
-        float early = seg_speed(h[first], h[mid]), late = seg_speed(h[mid], h[k.n - 1]);
-        decel = early > 0.f && late < early * 0.5f;
-    }
     return true;
 }
 
@@ -371,6 +384,7 @@ static void thread_main()
         if (!enabled && !show_range) {
             snprintf(g_status, sizeof(g_status), "%s", T("未开启", "off"));
             g_rect_n[w] = 0; g_rect_active.store(w);
+            publish_speeds(nullptr, 0);
             usleep(20000);
             continue;
         }
@@ -397,6 +411,7 @@ static void thread_main()
         if (!PySelf::anchor(self) || PySelf::camp() != 2) {
             snprintf(g_status, sizeof(g_status), "%s", T("自身不是求生者/未就绪", "self not survivor / not ready"));
             g_rect_active.store(w);
+            publish_speeds(nullptr, 0);
             usleep(20000);
             continue;
         }
@@ -404,6 +419,7 @@ static void thread_main()
         if (!read_pos(self, S)) {
             snprintf(g_status, sizeof(g_status), "%s", T("自身坐标读不到", "self position unreadable"));
             g_rect_active.store(w);
+            publish_speeds(nullptr, 0);
             continue;
         }
 
@@ -415,7 +431,8 @@ static void thread_main()
         int nbody = PySelf::hunter_targets(tgs, PySelf::MAX_HUNTERS);
         for (int i = 0; i < nbody; i++) bodies[i] = tgs[i].obj;
         Hunter hs[PySelf::MAX_HUNTERS];
-        int nh = 0, nearest = -1;
+        HunterSpeed spd[PySelf::MAX_HUNTERS];
+        int nh = 0, nearest = -1, nspd = 0;
         bool wheel_form = false;
         for (int i = 0; i < nbody; i++) {
             Hunter &h = hs[nh];
@@ -426,15 +443,21 @@ static void thread_main()
             std::string cn = class_name_of(bodies[i]);
             if (cn.find("polun") != std::string::npos && cn.find("wheel") != std::string::npos
                 && cn.find("dingzi") == std::string::npos) { wheel_form = true; continue; }
-            // 快速监管预判：速度过门槛、没在刹车，才把位置往前推(见 predict_fast 的说明)
+            // 快速监管预判：速度过门槛才把位置往前推(见 predict_fast 的说明)
             Track &k = track_of(bodies[i], t);
             hunter_track(k, t, h.H);
             h.vx = h.vy = h.mps = 0.f;
             h.pred_on = false;
-            bool decel = false;
-            if (hunter_velocity(k, t, h.vx, h.vy, decel)) {
+            if (hunter_velocity(k, t, h.vx, h.vy)) {
                 h.mps = sqrtf(h.vx * h.vx + h.vy * h.vy) / dist_scale;
-                h.pred_on = predict_fast && !decel && h.mps > fast_mps;
+                h.pred_on = predict_fast && h.mps > fast_mps;
+            }
+            {   // 菜单显示用的平滑速度(不参与判定)
+                float sx = 0.f, sy = 0.f;
+                HunterSpeed &sp = spd[nspd++];
+                sp.obj = bodies[i];
+                sp.ok = hunter_velocity(k, t, sx, sy, SPEED_SHOW_WINDOW_MS);
+                sp.mps = sp.ok ? sqrtf(sx * sx + sy * sy) / dist_scale : 0.f;
             }
             // 小丑拉锯改圆形判定
             int action = 0;
@@ -443,6 +466,7 @@ static void thread_main()
             if (nearest < 0 || hdist(S, h.H) < hdist(S, hs[nearest].H)) nearest = nh;
             nh++;
         }
+        publish_speeds(spd, nspd);
         bool any_circle = false, any_pred = false;
         for (int i = 0; i < nh; i++) { any_circle |= hs[i].circle; any_pred |= hs[i].pred_on; }
 

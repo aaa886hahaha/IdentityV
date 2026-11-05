@@ -59,15 +59,24 @@ static inline const char *log_text() { return g_log; }
 
 // 一个骨骼名拆成 前缀("biped"/"biped01"/"biped03"...) + 目标后缀，返回前缀组号(0~MAX_GROUP-1)、
 // 不是 "biped<两位数字> <目标>" 形式返回 -1。组 0 = 无前缀 "biped"，组 k = "biped%02d"(k 取数字+1，冲突时并到最后一组)
-static const int MAX_GROUP = 8;
+// 另有一组 BIP_GROUP = 3ds Max 默认命名 "bip001 head"/"bip001 l hand"…：疯眼 burke.skeleton 整套都是这种，
+// 17 个目标全有(2026-11-05 离线普查 chr_boss 动画 NAME 块)，原来一个都认不出、骨骼不画
+static const int MAX_GROUP = 9;
+static const int BIP_GROUP = MAX_GROUP - 1;
 static int split_biped(const char *name, int &target)
 {
+    if (strncmp(name, "bip", 3) == 0 && name[3] >= '0' && name[3] <= '9' && name[4] >= '0' && name[4] <= '9'
+        && name[5] >= '0' && name[5] <= '9' && name[6] == ' ') {
+        for (int t = 0; t < NUM_TARGET; t++)
+            if (strcmp(name + 6, TARGET[t] + 5) == 0) { target = t; return BIP_GROUP; }
+        return -1;
+    }
     if (strncmp(name, "biped", 5) != 0) return -1;
     const char *p = name + 5;
     int group = 0;
     if (p[0] >= '0' && p[0] <= '9' && p[1] >= '0' && p[1] <= '9') {
         group = (p[0] - '0') * 10 + (p[1] - '0') + 1;
-        if (group >= MAX_GROUP) group = MAX_GROUP - 1;
+        if (group >= BIP_GROUP) group = BIP_GROUP - 1;   // biped 带编号的溢出并到最后一个 biped 组，不占 bip 组
         p += 2;
     }
     if (p[0] != ' ') return -1;
