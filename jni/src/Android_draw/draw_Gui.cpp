@@ -200,6 +200,7 @@ static bool  fi_hunter_on = true;                                        // 监�
 static float fi_hunter_x  = 0.0f,    fi_hunter_y = 173.0f, fi_hunter_size = 30.0f;
 static bool  fi_civ_on    = true;                                        // 求生者天赋(右上横排，只在我是监管时显示)
 static float fi_civ_x     = 1894.0f, fi_civ_y    = 328.0f, fi_civ_size    = 28.0f, fi_civ_gap = 80.0f;
+static float fi_cc_x      = 40.0f,   fi_cc_y     = 320.0f, fi_cc_size     = 25.0f;   // 模仿者会议阶段的身份列表(左中)
 
 // ===== 配置保存/读取：/data/IdentityV_config.txt，一行一个 key=value(# 开头是注释，可手改) =====
 // 读取时未知键忽略、缺的键保持当前值，所以加了新选项旧文件照样能读。
@@ -237,6 +238,7 @@ static const CfgItem CFG_ITEMS[] = {
     {"fi_hunter_on", CFG_BOOL, &fi_hunter_on}, {"fi_hunter_x", CFG_FLOAT, &fi_hunter_x}, {"fi_hunter_y", CFG_FLOAT, &fi_hunter_y}, {"fi_hunter_size", CFG_FLOAT, &fi_hunter_size},
     {"fi_civ_on", CFG_BOOL, &fi_civ_on},     {"fi_civ_x", CFG_FLOAT, &fi_civ_x},     {"fi_civ_y", CFG_FLOAT, &fi_civ_y},     {"fi_civ_size", CFG_FLOAT, &fi_civ_size},
     {"fi_civ_gap", CFG_FLOAT, &fi_civ_gap},
+    {"fi_cc_x", CFG_FLOAT, &fi_cc_x},       {"fi_cc_y", CFG_FLOAT, &fi_cc_y},       {"fi_cc_size", CFG_FLOAT, &fi_cc_size},
     // 蜡像师
     {"wax_on", CFG_BOOL, &WaxAim::enabled},      {"wax_traj", CFG_BOOL, &WaxAim::show_traj},
     {"wax_always", CFG_BOOL, &WaxAim::show_always}, {"show_crosshair", CFG_BOOL, &show_crosshair},
@@ -1691,6 +1693,37 @@ static void copycat_label(int identity, int seat, char *out, size_t cap)
     else snprintf(out + len, cap - len, "?");
 }
 
+// 名字后面的状态字(2026-11-10)：
+//   灵体(降灵师第一次死后：等下一轮的 changing2soul + 之后的灵魂形态 is_soul；第二次死才是 _is_dead 真死)
+//   隐身(神偷、降灵师灵魂隐身) —— 活人，照画
+//   扮M号 —— 千面人变身中，M = 它扮成的号码
+//   装了 N号、M号 —— 送货员(302)身上装着的人(被装的人自己不画，位置本来就贴在送货员身上)
+static void copycat_append_tags(int seat, char *out, size_t cap)
+{
+    if (seat < 1 || seat > PySelf::MAX_COPYCAT) return;
+    PySelf::CopycatBook book = PySelf::copycat_book();
+    const PySelf::CopycatSeat &st = book.seat[seat - 1];
+    size_t len = strlen(out);
+    auto add = [&](const char *fmt, int v) {
+        if (len >= cap) return;
+        int n = snprintf(out + len, cap - len, fmt, v);
+        if (n > 0) len += (size_t)n;
+    };
+    if (!st.dead && (st.soul || st.changing)) add(T(" 灵体", " Spirit"), 0);
+    if (st.stealth) add(T(" 隐身", " Stealth"), 0);
+    if (st.face_as > 0) add(T(" 扮%d号", " as #%d"), st.face_as);
+    if (st.identity == 302 && !st.dead) {
+        bool first = true;
+        for (int k = 0; k < PySelf::MAX_COPYCAT; k++) {
+            const PySelf::CopycatSeat &o = book.seat[k];
+            if (!o.known || !o.boxed || o.dead) continue;
+            add(first ? T(" 装了 %d号", " boxed #%d") : T("、%d号", ", #%d"), k + 1);
+            first = false;
+        }
+    }
+    if (len >= cap && cap > 0) out[cap - 1] = 0;
+}
+
 // 林中童话配色按 water_fight_team(1~8，"八个阵营两两组队"指的就是它)：同队两人同色；0=未读到 白
 static ImColor waterfight_color(int team)
 {
@@ -1880,6 +1913,16 @@ static void draw_crosshair(ImDrawList *Draw)
 }
 
 void Draw_Main(ImDrawList *Draw){
+    // 进模仿者局自动打开「模仿者」(同手动勾选：关掉预知监管/林中童话)。每局只开一次，回大厅才复位 ——
+    // copycat_active() 开会时锚点读不到会短暂变 false，按上升沿判会把局中手动关掉的开关又打开
+    {
+        static bool cc_auto_done = false;
+        if (PySelf::in_lobby()) cc_auto_done = false;
+        else if (!cc_auto_done && PySelf::copycat_active()) {
+            copycat_mode = true; show_draw_prophet = false; waterfight_mode = false;
+            cc_auto_done = true;
+        }
+    }
     PySelf::set_copycat_book(copycat_mode);        // 身份簿只在开关打开时记，见 PySelf.h
     PyWaterFight::set_enabled(waterfight_mode);    // 林中童话关着时它的线程不读内存，见 PyWaterFight.h
     PyItems::set_enabled(show_draw_Prop);          // 道具白名单同理，见 PyItems.h
@@ -2188,11 +2231,12 @@ void Draw_Main(ImDrawList *Draw){
         if (decoded < need){
             int gn = PyProgress::gen_total();
             for (int i = 0; i < gn; i++){
-                float p = 0.f;
-                if (!PyProgress::get_gen(i, p)) continue;
+                PyProgress::Entry ge;
+                if (!PyProgress::get_gen_entry(i, ge)) continue;
+                float p = ge.progress;
                 if (p <= 0.05f) continue;                    // 没进度的不显示
                 if (PyProgress::is_decoded(p)) continue;      // 破译满的消失
-                ImColor c = progress_color(p);
+                ImColor c = ge.locked ? ImColor(255,255,255,255) : progress_color(p);   // 被封锁(封禁/蜡像等)画白色
                 float fill = bar_w * (p / 100.0f);
                 if (fill > 0.f) Draw->AddRectFilled({x, y}, {x + fill, y + bar_h}, c);
                 Draw->AddRect({x, y}, {x + bar_w, y + bar_h}, ImColor(255,255,255,255));
@@ -2442,7 +2486,8 @@ void Draw_Main(ImDrawList *Draw){
             auto hs = ImGui::CalcTextSize(head, 0, 25);
             auto ds = ImGui::CalcTextSize(dist_text.c_str(), 0, 25);
             float x0 = sx - (hs.x + ds.x) / 2.0f;
-            Draw->AddText({x0, sy}, progress_color(g.progress), head);
+            ImColor gc = g.locked ? ImColor(255, 255, 255, 255) : progress_color(g.progress);   // 被封锁(封禁/蜡像等)画白色
+            Draw->AddText({x0, sy}, gc, head);
             Draw->AddText({x0 + hs.x, sy},
                 WaxAim::gen_green(g.scene_obj) ? color_green : ImColor(255, 255, 255, 255),
                 dist_text.c_str());
@@ -2450,7 +2495,7 @@ void Draw_Main(ImDrawList *Draw){
             if (g.progress > 0.05f){
                 const float bar_w = 120.0f, bar_h = 10.0f;
                 float bx = sx - bar_w / 2.0f, by = sy - bar_h - 3.0f;
-                Draw->AddRectFilled({bx, by}, {bx + bar_w * (g.progress / 100.0f), by + bar_h}, progress_color(g.progress));
+                Draw->AddRectFilled({bx, by}, {bx + bar_w * (g.progress / 100.0f), by + bar_h}, gc);
                 Draw->AddRect({bx, by}, {bx + bar_w, by + bar_h}, ImColor(255,255,255,255));
             }
         }
@@ -2489,11 +2534,71 @@ void Draw_Main(ImDrawList *Draw){
     // 不走下面的实体循环：假面舞会时模型换成石像，按 model+0x20 配对会整个配不上。
     // 位置从 Python 单位上读，换不换模型都一样。坐标拿不到的人(没校准/这轮读失败超过 300ms)
     // 不在这里画，由实体循环按场景对象画(旧行为)，两边不会重复
-    if (copycat_mode) {
+    // 会议阶段(2026-11-10)：人全挤在桌边、相机贴脸，不画 in-world，改画固定列表(位置/字号 fi_cc_*，在「固定信息」里调)。
+    // 列表 = 身份簿：号码 身份 状态，阵营配色，死人灰色
+    const bool cc_meeting = PySelf::copycat_meeting();
+    if (copycat_mode && cc_meeting) {
+        PySelf::CopycatBook book = PySelf::copycat_book();
+        float x = fi_cc_x, y = fi_cc_y, sz = fi_cc_size;
+        for (int k = 0; k < PySelf::MAX_COPYCAT; k++) {
+            const PySelf::CopycatSeat &st = book.seat[k];
+            if (!st.known) continue;
+            char row[160];
+            copycat_label(st.identity, k + 1, row, sizeof(row));
+            copycat_append_tags(k + 1, row, sizeof(row));
+            size_t len = strlen(row);
+            if (book.self_seat == k + 1 && len < sizeof(row)) len += snprintf(row + len, sizeof(row) - len, "%s", T(" (我)", " (me)"));
+            // 只有真死(_is_dead)写「已死」、灰色；降灵师第一次死后是「灵体」(标记已由 copycat_append_tags 加上)
+            if (st.dead && len < sizeof(row)) snprintf(row + len, sizeof(row) - len, "%s", T(" 已死", " dead"));
+            ImColor c = st.dead ? ImColor(140,140,140,255) : copycat_color(st.identity);
+            fi_text(Draw, x, y, sz, c, row);
+            y += sz + 6.0f;
+        }
+    }
+    // 导演操控傀儡(2026-11-10)：会议中"离开会议"去原地图刀分身。会议桌边的真人不画，画已摆出的 [1210] 分身，
+    // 标被复制那个人的「N号 身份」(阵营配色)，距离按傀儡位置算；本轮刀人目标身份的分身加红色射线
+    const bool cc_director = PySelf::director_puppet_mode();
+    if (copycat_mode && cc_director && !cc_meeting) {
+        PySelf::CopycatBook book = PySelf::copycat_book();
+        PySelf::DirectorView dv = PySelf::director_view();
+        for (int k = 0; k < PySelf::MAX_COPYCAT; k++) {
+            const PySelf::CopycatSeat &st = book.seat[k];
+            if (!dv.clone_ok[k] || !st.known || st.dead || st.changing) continue;
+            if (book.self_seat == k + 1) continue;
+            float qx = dv.cx[k], qz = dv.cz[k], qy = dv.cy[k];
+            float cam = matrix[3]*qx + matrix[7]*qz + matrix[11]*qy + matrix[15];
+            if (cam <= 0.01f) continue;
+            float cx = px + (matrix[0]*qx + matrix[4]*qz + matrix[8]*qy + matrix[12]) / cam * px;
+            float cy = py - (matrix[1]*qx + matrix[5]*(qz + 8.5f) + matrix[9]*qy + matrix[13]) / cam * py;
+            float cw = py - (matrix[1]*qx + matrix[5]*(qz + 28.5f) + matrix[9]*qy + matrix[13]) / cam * py;
+            float bw = (cy - cw) / 2, bh = cy - cw;
+            if (bw <= 0) continue;
+            float bx1 = cx - bh / 4, by1 = cy - bh / 2;
+            char_count++;
+            char text[160];
+            copycat_label(st.identity, k + 1, text, sizeof(text));
+            ImColor c = copycat_color(st.identity);
+            auto ts = ImGui::CalcTextSize(text, 0, 25);
+            Draw->AddText({bx1 + bw/2 - ts.x/2, by1 - 45}, c, text);
+            if (show_draw_Rect)
+                corner_box({bx1, by1}, {bx1 + bw, by1 + bh}, c, 3, 0, 1.8f);
+            if (show_draw_Distance && dv.puppet_ok) {
+                float d = sqrt(pow(qx - dv.px, 2) + pow(qy - dv.py, 2) + pow(qz - dv.pz, 2)) / dist_scale;
+                char dt[24];
+                snprintf(dt, sizeof(dt), T("%d 米", "%d m"), (int)d);
+                auto ds = ImGui::CalcTextSize(dt, 0, 25);
+                Draw->AddText({bx1 + bw/2 - ds.x/2, by1 + bh + 10}, ImColor(255,200,0,255), dt);
+            }
+            if (dv.target_identity && st.identity == dv.target_identity)       // 刀人目标：射线(不受「显示射线」开关影响)
+                ImGui::GetForegroundDrawList()->AddLine({px, 160}, {bx1 + bw/2, by1}, ImColor(255, 40, 40, 255), 3);
+        }
+    }
+    if (copycat_mode && !cc_meeting && !cc_director) {
         PySelf::CopycatBook book = PySelf::copycat_book();
         for (int k = 0; k < PySelf::MAX_COPYCAT; k++) {
             const PySelf::CopycatSeat &st = book.seat[k];
-            if (!st.known || st.dead) continue;
+            // 死人、被投出等变灵魂的降灵师(鬼魂世界)、被送货员装着的人(列在送货员名字后)不画
+            if (!st.known || st.dead || st.changing || st.boxed) continue;
             if (book.self_seat == k + 1) continue;                      // 自己不画
             float qx = 0, qz = 0, qy = 0;
             if (!PySelf::copycat_seat_pos(k + 1, qx, qz, qy)) continue;
@@ -2511,8 +2616,9 @@ void Draw_Main(ImDrawList *Draw){
             float bx1 = cx - bh / 4, by1 = cy - bh / 2;
             char_count++;
 
-            char text[48];
+            char text[160];
             copycat_label(st.identity, k + 1, text, sizeof(text));
+            copycat_append_tags(k + 1, text, sizeof(text));
             ImColor c = copycat_color(st.identity);
             auto ts = ImGui::CalcTextSize(text, 0, 25);
             Draw->AddText({bx1 + bw/2 - ts.x/2, by1 - 45}, c, text);
@@ -2557,6 +2663,37 @@ void Draw_Main(ImDrawList *Draw){
                 Draw->AddText({bx1 + bw/2 - ds.x/2, by1 + bh + 10}, ImColor(255,200,0,255), dt);
             }
         }
+
+        // 尸体：灰框 +「N号 尸体」(号码没对上就只写「尸体」)。游戏每轮开始/每次开会会清空尸体，标记跟着消失
+        PySelf::CorpseUnit corpses[PySelf::MAX_CORPSE];
+        int cpn = PySelf::copycat_corpses(corpses, PySelf::MAX_CORPSE);
+        for (int k = 0; k < cpn; k++) {
+            float qx = corpses[k].x, qz = corpses[k].z, qy = corpses[k].y;
+            float cam = matrix[3]*qx + matrix[7]*qz + matrix[11]*qy + matrix[15];
+            if (cam <= 0.01f) continue;
+            float d = sqrt(pow(qx - Z.X, 2) + pow(qy - Z.Y, 2) + pow(qz - Z.Z, 2)) / dist_scale;
+            if (d >= 300) continue;
+            float cx = px + (matrix[0]*qx + matrix[4]*qz + matrix[8]*qy + matrix[12]) / cam * px;
+            float cy = py - (matrix[1]*qx + matrix[5]*(qz + 8.5f) + matrix[9]*qy + matrix[13]) / cam * py;
+            float cw = py - (matrix[1]*qx + matrix[5]*(qz + 28.5f) + matrix[9]*qy + matrix[13]) / cam * py;
+            float bw = (cy - cw) / 2, bh = cy - cw;
+            if (bw <= 0) continue;
+            float bx1 = cx - bh / 4, by1 = cy - bh / 2;
+            const ImColor c(160,160,160,255);
+            char lbl[32];
+            if (corpses[k].seat > 0) snprintf(lbl, sizeof(lbl), T("%d号 尸体", "#%d Body"), corpses[k].seat);
+            else snprintf(lbl, sizeof(lbl), "%s", T("尸体", "Body"));
+            auto ts = ImGui::CalcTextSize(lbl, 0, 25);
+            Draw->AddText({bx1 + bw/2 - ts.x/2, by1 - 45}, c, lbl);
+            if (show_draw_Rect)
+                corner_box({bx1, by1}, {bx1 + bw, by1 + bh}, c, 3, 0, 1.8f);
+            if (show_draw_Distance) {
+                char dt[24];
+                snprintf(dt, sizeof(dt), T("%d 米", "%d m"), (int)d);
+                auto ds = ImGui::CalcTextSize(dt, 0, 25);
+                Draw->AddText({bx1 + bw/2 - ds.x/2, by1 + bh + 10}, ImColor(255,200,0,255), dt);
+            }
+        }
     }
 
     // ---- 原生骨骼(抄若辰 sob_3A6074/39F0CC 偏移链,驱动读,零注入;见 NativeBones.h) ----
@@ -2564,7 +2701,8 @@ void Draw_Main(ImDrawList *Draw){
     // 原来方框是写死的世界高度(脚底 -1.5~+18.5 单位)，头圆最小半径/上顶量/线宽又是固定像素，远处骨骼会冒出框顶
     g_bone_box_n = 0;
     g_diag_bone_n = 0;
-    if (show_draw_Bones && PySelf::available() && !PySelf::is_joseph_match()) {   // 约瑟夫局永远不画骨骼(用户要求,无视开关)
+    // 约瑟夫局永远不画骨骼(用户要求,无视开关)；模仿者会议阶段、导演操控傀儡时也不画(同方框)
+    if (show_draw_Bones && PySelf::available() && !PySelf::is_joseph_match() && !cc_meeting && !cc_director) {
         uint64_t self_m = 0; PySelf::anchor(self_m);
         uint64_t Ms[32];
         int bn = PySelf::copy_bodies(Ms, 32);
@@ -2572,6 +2710,12 @@ void Draw_Main(ImDrawList *Draw){
         for (int u = 0; u < bn; u++) {
             bool is_self = (Ms[u] == self_m);
             if (!is_self && hunter_view && PySelf::is_carried(Ms[u])) continue;
+            // 指挥家舞台：台上的人模型被游戏挪到假位置，骨骼跟着歪，不画。按真实坐标(unit.position)判在不在台上
+            if (!is_self) {
+                int st_id = 0, st_seat = 0; float rx, rz, ry;
+                if (PySelf::copycat_identity(Ms[u], st_id, st_seat) && PySelf::copycat_seat_pos(st_seat, rx, rz, ry)
+                    && PySelf::in_fake_stage(rx, rz, ry)) continue;
+            }
             NativeBones::Skeleton sk;
             if (!NativeBones::read_unit(Ms[u], is_self, sk) || !sk.valid) continue;
             if (is_self) continue;                                // 自身只用于 swap 校准,不画(若辰 ignoreSelfBones)
@@ -2670,8 +2814,9 @@ void Draw_Main(ImDrawList *Draw){
                     }
 
                     ss += data[i].str;
-                    auto textSize = ImGui::CalcTextSize(ss.c_str(), 0, 25);
-                    Draw->AddText({X1 + W/2-(textSize.x/2),Y1-45}, BotBoneColor, ss.c_str());
+                    const float mfs = ImGui::GetFontSize() * 0.8f;   // 求生者镜像的名字/距离 0.8(2026-11-06 用户定)
+                    ImVec2 mns = fi_calc(mfs, ss.c_str());
+                    fi_text(Draw, X1 + W/2 - mns.x/2, Y1 - mfs - 12.0f, mfs, BotBoneColor, ss.c_str());
                         
                     if (true){   // 方框默认画(不受"方框绘制"开关影响，用户要求)
                         corner_box({X1, Y1},{X2, Y2}, BotBoneColor,3, 0,1.8f);
@@ -2681,8 +2826,8 @@ void Draw_Main(ImDrawList *Draw){
                         std::string mirror_dist_str;
                         mirror_dist_str += std::to_string((int) dist);
                         mirror_dist_str += T(" 米", " m");
-                        auto textSize = ImGui::CalcTextSize(mirror_dist_str.c_str(), 0, 25);
-                        Draw->AddText({X1 + W/2-(textSize.x/2),Y2+10}, BotBoneColor, mirror_dist_str.c_str());
+                        ImVec2 mds = fi_calc(mfs, mirror_dist_str.c_str());
+                        fi_text(Draw, X1 + W/2 - mds.x/2, Y2 + 10, mfs, BotBoneColor, mirror_dist_str.c_str());
                     }
                         
                     // 射线不画(用户要求)。
@@ -2783,6 +2928,9 @@ void Draw_Main(ImDrawList *Draw){
         // 大厅/准备阶段(units_by_type 读全了且没有键 1/2)：没有任何玩家单位，场景里的人物对象全是
         // 无宿主的时装挂件(头饰/袖子)，阵营 1/2 整类不画。预知监管在读取循环里算，不受影响
         if ((data[i].camp == 1 || data[i].camp == 2) && PySelf::in_lobby())
+            continue;
+        // 模仿者会议阶段：人物一律不画 in-world(上面改画固定列表)；导演操控傀儡时同样不画(上面改画分身)
+        if ((data[i].camp == 1 || data[i].camp == 2) && (cc_meeting || cc_director))
             continue;
         // 镜中红夫人在循环后单独画(标「红夫人镜像」)，这里不重复(本体集合不可用时它会被当成普通红夫人画出来)
         if (mirror_img != 0 && data[i].obj == mirror_img)
@@ -3030,8 +3178,9 @@ void Draw_Main(ImDrawList *Draw){
                     bool echo   = PySelf::body_is_mirror(data[i].obj);
                     ImColor name_color = ImColor(255,200,0,255);
                     if (cc){
-                        char cc_text[48];
+                        char cc_text[160];
                         copycat_label(cc_identity, cc_seat, cc_text, sizeof(cc_text));
+                        copycat_append_tags(cc_seat, cc_text, sizeof(cc_text));
                         s += cc_text;
                         name_color = copycat_color(cc_identity);
                     } else
@@ -3042,8 +3191,16 @@ void Draw_Main(ImDrawList *Draw){
                     if (joseph && !echo)
                         s += PySelf::body_in_photo_world(data[i].obj) ? T(" 镜像", " Mirror") : T(" 现实", " Real");
                     if (echo) name_color = BotBoneColor;   // 镜像投影：名字白
-                    auto textSize = ImGui::CalcTextSize(s.c_str(), 0, 25);
-                    Draw->AddText({X1 + W/2-(textSize.x/2),Y1-45}, name_color, s.c_str());
+                    // 字号(2026-11-06 用户定，相对默认字号)：名字 0.9；求生者的距离/天赋 0.8，监管的距离/天赋/特质 0.9。
+                    // 每行行距 = 该行字号 + 2，名字底边离框顶保持原来的约 12px
+                    const float fs_base = ImGui::GetFontSize();
+                    const bool  is_civ  = data[i].camp == 2;
+                    const float name_fs = fs_base * 0.9f;
+                    const float sub_fs  = fs_base * (is_civ ? 0.8f : 0.9f);   // 距离、天赋、特质
+                    {
+                        ImVec2 ns = fi_calc(name_fs, s.c_str());
+                        fi_text(Draw, X1 + W/2 - ns.x/2, Y1 - name_fs - 12.0f, name_fs, name_color, s.c_str());
+                    }
                     // 约瑟夫局：方框永远画(无视"绘制方框"开关)。镜像投影白 / 真实监管红 / 真实求生者绿。
                     // 非约瑟夫局(场上无 PhotoUnit，不会有投影)走原来的开关逻辑。
                     if (joseph){
@@ -3063,13 +3220,13 @@ void Draw_Main(ImDrawList *Draw){
         			        corner_box({X1, Y1},{X2, Y2}, color_green,3, 0,1.8f);
         			}
                     float next_y = Y2 + 10;            // 距离、天赋、辅助特质依次往下排
-                    const float line_h = ImGui::GetFontSize() + 2.0f;
+                    const float line_h = sub_fs + 2.0f;
                     if (show_draw_Distance || echo){   // 镜像投影默认画距离(白框+名字+距离固定集)
                         std::string dist_str;
                         dist_str += std::to_string((int) dist);
                         dist_str += T(" 米", " m");
-                        auto textSize = ImGui::CalcTextSize(dist_str.c_str(), 0, 25);
-                        Draw->AddText({X1 + W/2-(textSize.x/2),next_y}, ImColor(255,200,0,255), dist_str.c_str());
+                        ImVec2 ds = fi_calc(sub_fs, dist_str.c_str());
+                        fi_text(Draw, X1 + W/2 - ds.x/2, next_y, sub_fs, ImColor(255,200,0,255), dist_str.c_str());
                         next_y += line_h;
                     }
 
@@ -3095,8 +3252,7 @@ void Draw_Main(ImDrawList *Draw){
                                 }
                                 // 飞轮就绪时"飞轮"两个字画红，优先于上面的整行配色
                                 ImColor flywheel_color = seg.flywheel_ready ? color_red : c;
-                                // 求生者的天赋行小一号(约 85%，2026-11-05 用户要求)；监管那行照旧
-                                const float gfs = data[i].camp == 2 ? ImGui::GetFontSize() * 0.85f : ImGui::GetFontSize();
+                                const float gfs = sub_fs;   // 字号见名字那里
                                 float w_pre = fi_calc(gfs, seg.pre).x;
                                 float w_flywheel = fi_calc(gfs, seg.flywheel).x;
                                 float w_post = fi_calc(gfs, seg.post).x;
@@ -3104,7 +3260,7 @@ void Draw_Main(ImDrawList *Draw){
                                 if (seg.pre[0])   fi_text(Draw, tx, next_y, gfs, c, seg.pre);
                                 if (seg.flywheel[0]) fi_text(Draw, tx + w_pre, next_y, gfs, flywheel_color, seg.flywheel);
                                 if (seg.post[0])   fi_text(Draw, tx + w_pre + w_flywheel, next_y, gfs, c, seg.post);
-                                next_y += gfs + 2.0f;
+                                next_y += line_h;
                             }
                             // 监管再单独一行写当前辅助特质 + 剩余冷却
                             // (带底牌会局中换特质，所以读的是实时值；冷却来自 skill_mgr，见 PyGenius.h)
@@ -3115,8 +3271,8 @@ void Draw_Main(ImDrawList *Draw){
                                 if (trait_line[0]){
                                     // 就绪=绿，冷却中=白；读不到冷却时按白显示(只有名字)
                                     ImColor cc = PyGenius::cd_ready(gi) ? color_green : ImColor(255,255,255,255);
-                                    auto ts2 = ImGui::CalcTextSize(trait_line, 0, 25);
-                                    Draw->AddText({X1 + W/2-(ts2.x/2),next_y}, cc, trait_line);
+                                    ImVec2 ts2 = fi_calc(sub_fs, trait_line);
+                                    fi_text(Draw, X1 + W/2 - ts2.x/2, next_y, sub_fs, cc, trait_line);
                                     next_y += line_h;
                                 }
                             }
@@ -3169,14 +3325,15 @@ void Draw_Main(ImDrawList *Draw){
                     }
                 }
                 const char *nm = T("红夫人镜像", "Queen's Mirror Image");
-                auto ts = ImGui::CalcTextSize(nm, 0, 25);
-                Draw->AddText({bx1 + bw/2 - ts.x/2, by1 - 45}, ImColor(255,200,0,255), nm);
+                const float qfs = ImGui::GetFontSize() * 0.8f;   // 红夫人镜像的名字/距离 0.8(2026-11-06 用户定)
+                ImVec2 ts = fi_calc(qfs, nm);
+                fi_text(Draw, bx1 + bw/2 - ts.x/2, by1 - qfs - 12.0f, qfs, ImColor(255,200,0,255), nm);
                 if (show_draw_Rect) corner_box({bx1, by1}, {bx1 + bw, by1 + bh}, BoneColor, 3, 0, 1.8f);
                 if (show_draw_Distance) {
                     char dt[24];
                     snprintf(dt, sizeof(dt), T("%d 米", "%d m"), (int)d);
-                    auto ds = ImGui::CalcTextSize(dt, 0, 25);
-                    Draw->AddText({bx1 + bw/2 - ds.x/2, by1 + bh + 10}, ImColor(255,200,0,255), dt);
+                    ImVec2 ds = fi_calc(qfs, dt);
+                    fi_text(Draw, bx1 + bw/2 - ds.x/2, by1 + bh + 10, qfs, ImColor(255,200,0,255), dt);
                 }
             }
         }
@@ -3679,6 +3836,12 @@ void Layout_tick_UI(bool *main_thread_flag) {
                 ImGui::SliderFloat(T("求 大小##fi_civ", "Svr size##fi_civ"), &fi_civ_size, 10.0f, 60.0f, "%.0f");
                 ImGui::SliderFloat(T("求 间距##fi_civ", "Svr gap##fi_civ"), &fi_civ_gap, 0.0f, 300.0f, "%.0f");
             }
+
+            // 模仿者会议阶段的身份列表(开会时代替 in-world 绘制，要开「模仿者」)
+            ImGui::TextUnformatted(T("模仿者会议列表", "Copycat meeting list"));
+            ImGui::SliderFloat(T("会 X##fi_cc", "Mtg X##fi_cc"), &fi_cc_x, 0.0f, mw, "%.0f");
+            ImGui::SliderFloat(T("会 Y##fi_cc", "Mtg Y##fi_cc"), &fi_cc_y, 0.0f, mh, "%.0f");
+            ImGui::SliderFloat(T("会 大小##fi_cc", "Mtg size##fi_cc"), &fi_cc_size, 10.0f, 60.0f, "%.0f");
         }
 
 
@@ -3714,15 +3877,18 @@ void Layout_tick_UI(bool *main_thread_flag) {
                     const PySelf::CopycatSeat &st = book.seat[k];
                     if (!st.known) continue;
                     const char *nm = PySelf::copycat_identity_name(st.identity);
-                    char row[64];
+                    char row[160];
                     int len = g_english ? snprintf(row, sizeof(row), "#%-2d ", k + 1)
                                         : snprintf(row, sizeof(row), "%2d号 ", k + 1);
                     if (nm) len += snprintf(row + len, sizeof(row) - len, "%s", nm);
                     else if (st.identity) len += g_english ? snprintf(row + len, sizeof(row) - len, "id%d", st.identity)
                                                            : snprintf(row + len, sizeof(row) - len, "身份%d", st.identity);
                     else len += snprintf(row + len, sizeof(row) - len, "?");
+                    copycat_append_tags(k + 1, row, sizeof(row));
+                    len = (int)strlen(row);
                     if (book.self_seat == k + 1) len += g_english ? snprintf(row + len, sizeof(row) - len, "  (me)")
                                                                   : snprintf(row + len, sizeof(row) - len, "  (我)");
+                    // 只有真死写「已死」；降灵师第一次死后是「灵体」(copycat_append_tags 已加)
                     if (st.dead) { if (g_english) snprintf(row + len, sizeof(row) - len, "  dead");
                                    else            snprintf(row + len, sizeof(row) - len, "  已死"); }
                     ImColor c = st.dead ? ImColor(140,140,140,255) : copycat_color(st.identity);

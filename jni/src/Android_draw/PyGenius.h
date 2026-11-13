@@ -365,7 +365,12 @@ static bool read_desperate_used(uint64_t slot)
 // support_skill_id 是实时值(底牌换完立刻变)，旧特质那些冻结的技能对象不在当前集合里，自然不会被选中。
 // ⚠️ 热更上新监管时这张表会缺新角色的 id：表现是该角色只显示特质名、不显示冷却，不会给错值。
 //    重新 dump：注入 probe2，命令通道里读 GK.DM.support_skill_data。
-static const int32_t MAIN_SKILL_LISTEN[]   = {701};
+// 聆听 2026-11 热更改版：不再是蓄力，改成和窥视者一样的充能型(2 层、每层 32 秒、开局 10 秒)，
+// 每个角色 4 个技能(地图界面/拖放/放区域/地图放区域，cd 共享)，配表第一个 = 类型 LISTEN_MAP_UI(8903)，
+// 就是界面上那个按钮、正常 tick 的主技能；放区域那个 stop_tick，不读它。
+static const int32_t MAIN_SKILL_LISTEN[]   = {701, 8903, 8907, 8911, 8915, 8919, 8923, 8927, 8931, 8935, 8939, 8943, 8947,
+                                      8951, 8955, 8959, 8963, 8967, 8971, 8975, 8979, 8983, 8987, 8991, 8995, 8999,
+                                      9003, 9007, 9011, 9015, 9019, 9023, 9027, 9031, 9035, 9039, 9043, 9047, 9051};
 static const int32_t MAIN_SKILL_ABNORMAL[]   = {751};
 static const int32_t MAIN_SKILL_EXCITEMENT[]   = {722};
 static const int32_t MAIN_SKILL_PATROLLER[] = {761, 763, 765, 3850, 9761, 10761, 11761, 12650, 13450, 13724, 13761, 14050,

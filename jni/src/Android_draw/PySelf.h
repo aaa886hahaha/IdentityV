@@ -90,10 +90,18 @@ static const int UNIT_TYPE_COUNT = sizeof(UNIT_TYPES) / sizeof(UNIT_TYPES[0]);
 // 玩家是 units_by_type[1088] 的 CopycatPlayerUnit(12 人)，**不在键 1/2**。
 //   identity_id    隐藏身份，进局约 2 秒后赋值、整局不变；全场真身份都下发给客户端
 //   copycat_index  0~11，游戏里的号码 = 它 + 1
-// 死亡后原单位留在 1088(模型不可见)，另生成 [1089] GhostCopycatPlayerUnit(同 unique_id，identity=None)。
-// 所以"谁死了" = 1088 里 unique_id 出现在 1089 里的那些；死者不收进本体集合，绘制侧自然不画。
+// 死人/隐身/灵魂(2026-11-10 反编译，见 skill copycat.md 四点三)：都读 combat 单位(unit.combat_unit)上的字段：
+//   _is_dead            死人。单位还是 1088 那个，被切到鬼魂世界继续走 —— 不画、不进本体集合
+//   _is_stealth         隐身(神偷 / 降灵师灵魂隐身)，活人，照画、名字后加「隐身」
+//   InvokerComponent    降灵师(307)：is_soul = 灵魂形态(活人，照画、加「灵魂」)；is_changing2soul = 被投出后
+//                       等下一轮变灵魂，这段在鬼魂世界，按死人处理
+// [1089] GhostCopycatPlayerUnit 其实是**尸体**(和过场动画的克隆)，每轮开始/每次开会都被游戏清空，
+// 炸弹/装箱/投票出局等死法还根本不生成 —— 以前拿它的 unique_id 认死者，漏得很多，已删。
 static const int COPYCAT_PLAYER_TYPE = 1088;
-static const int COPYCAT_GHOST_TYPE = 1089;
+static const int COPYCAT_INVOKER_ID = 307;        // 降灵师
+// [1089] 尸体(2026-11-10 用户要画：灰框「N号 尸体」)。同一个键里还有过场动画的克隆(参数整份拷活人，没有 dead_reason)，
+// 所以只认 dead_reason 是字符串的；被清洁工清理过的(combat 单位 has_cleand)不画。号码 = unique_id 对上的那个 1088 玩家
+static const int COPYCAT_CORPSE_TYPE = 1089;
 static const int COPYCAT_DIRECTOR_CLONE = 1210;   // CopycatDirectorCloneUnit = 导演局里的其他玩家
 static const int COPYCAT_DIRECTOR_PUPPET = 1211;  // CopycatDirectorPuppetUnit = 导演傀儡(= 自身)
 static const int COPYCAT_GHOUL_TYPE = 1203;       // CopycatGhoulUnit = 食人鬼(会杀人的地图生物,没身份)
@@ -108,7 +116,10 @@ static inline bool is_copycat_player_type(int t) {
     return t == COPYCAT_PLAYER_TYPE || t == COPYCAT_DIRECTOR_CLONE || t == COPYCAT_DIRECTOR_PUPPET;
 }
 // identity 0 = 还没赋值/读不到；seat 从 1 开始，0 = 读不到；body 0 = 读不到
-struct CopycatEntry { uint64_t body; int identity; int seat; bool dead; };
+// flags_ok = 这一轮 dead/stealth/soul/changing/boxed/face_as 读成功了(读不到时身份簿沿用旧值)
+// boxed   = 被送货员装着(GameStateComponent.game_state == Boxed)：位置每 tick 被设成送货员的，不画，改在送货员名字后列出
+// face_as = 千面人变身中扮的号码(FaceManComponent.face_status == Change 时 tar_face_id + 1)，0 = 没变身
+struct CopycatEntry { uint64_t body; int identity; int seat; bool flags_ok, dead, stealth, soul, changing, boxed; int face_as; };
 
 struct Snapshot {
     uint64_t anchor;                  // 当前操控单位的场景对象，0 = 没读到
@@ -189,10 +200,51 @@ static int               g_photo_players_n = 0;
 static int64_t           g_i_body_uid = -1;             // 收本体时读 unit.uid 的序号缓存(判它在不在镜世界)
 static int64_t g_i_yidhra = -1, g_i_puppet_uid = -1;    // 监管的 _current_yidhra_puppet_uid / 信徒的 uid
 static int64_t g_i_armor = -1, g_i_puppet_armor = -1;   // 监管 / 信徒的 super_armor(两个类字典不同，分开缓存)
-// 模仿者模式只有两个类(CopycatPlayerUnit / GhostCopycatPlayerUnit)，各用一组序号缓存就够
-static int64_t g_cc_i_model = -1, g_cc_i_another = -1, g_cc_i_ident = -1, g_cc_i_index = -1, g_cc_i_uq = -1;
-static int64_t g_cc_i_combat = -1;                      // unit.combat_unit 的序号(导演局走组件读身份用)
-static int64_t g_ccg_i_uq = -1;
+// 模仿者模式的玩家类(CopycatPlayerUnit 等)共用一组序号缓存，resolve_index 每次按名字核对
+static int64_t g_cc_i_model = -1, g_cc_i_another = -1, g_cc_i_ident = -1, g_cc_i_index = -1;
+static int64_t g_cc_i_combat = -1;                      // unit.combat_unit 的序号(读身份组件、死人/隐身用)
+// combat 单位上的 _is_dead / _is_stealth / components，降灵师组件上的 is_soul / is_changing2soul，
+// GameStateComponent.game_state，FaceManComponent.face_status / tar_face_id
+static int64_t g_cc_i_cdead = -1, g_cc_i_cstealth = -1, g_cc_i_ccomps = -1, g_cc_i_soul = -1, g_cc_i_chg = -1;
+static int64_t g_cc_i_gstate = -1, g_cc_i_fstatus = -1, g_cc_i_ftar = -1;
+// combat 单位 -> 组件 的缓存(按类名找，找到就记住)。种类：0=InvokerComponent 1=FaceManComponent 2=GameStateComponent
+enum { COMP_INVOKER = 0, COMP_FACEMAN = 1, COMP_GAMESTATE = 2, COMP_DIRECTOR = 3, COMP_KINDS = 4 };
+static const char *const COMP_CLASS[COMP_KINDS] = { "InvokerComponent", "FaceManComponent", "GameStateComponent", "DirectorComponent" };
+
+// ---- 导演操控傀儡(2026-11-10，机制见 skill copycat.md 四点三第 12 小节) ----
+// 开会进顺序发言时，服务器把每个活人的 [1210] 分身摆到他开会前的位置；导演可以"离开会议"操控 [1211] 傀儡
+// (g_cam_ctrl.unit = 傀儡、相机切普通视角)去刀分身 = 刀真人。这时会议桌边的真人没用，要画的是分身。
+// 分身/傀儡跟真人同号(copycat_index 照抄)，所以按号码存；平时藏在 HIDE_COL_POS=(0,-65536,0)，高度 > -300 = 已摆出来。
+// 刀人目标 = 导演自己的 DirectorComponent._now_kill_identity_id(服务器推给导演客户端)，绘制侧给目标画射线
+struct DirectorView {
+    bool  clone_ok[MAX_COPYCAT]; float cx[MAX_COPYCAT], cz[MAX_COPYCAT], cy[MAX_COPYCAT];   // 下标 = 号码 - 1
+    bool  puppet_ok; float px, pz, py;
+    int   target_identity;                                                                  // 0 = 没有
+};
+static DirectorView g_dir[2];
+static std::atomic<int> g_dir_active{0};
+static DirectorView g_dir_work;
+static std::atomic<bool> g_puppet_op{false};      // 我正在操控导演傀儡(g_cam_ctrl.unit 的 unit_type == 1211)
+static int64_t g_cc_i_dtarget = -1;
+static uint64_t g_any_cu = 0;                     // 本轮读到的任一 combat 单位(找舞台系统用 .core)
+static int64_t  g_seat_first_ms[MAX_COPYCAT];     // 每个号码本局第一次出现的时刻(「新号码」日志用)
+
+// ---- 指挥家舞台(CopycatStageSystem)：我(非模仿者阵营)站在舞台区里时，台上其他人的模型被挪到假位置 ----
+// 骨骼来自模型会画歪，所以台上的人不画骨骼(2026-11-10 用户要求)。判法照游戏 check_unit_pos_in_stage：
+// 水平距离 ≤ stage_radius 且高度差 ≤ stage_height。系统对象 = 任一 combat 单位 .core.system_instances['systems_copycat.CopycatStageSystem']
+struct StageView { bool active; float x, z, y, radius, height; };   // active = 我在舞台区里且不是模仿者阵营(游戏这时才挪模型)
+static StageView g_stage[2];
+static std::atomic<int> g_stage_active{0};
+static uint64_t g_stage_sys = 0, g_stage_um = 0;
+static int64_t  g_st_i_core = -1, g_st_i_sysinst = -1, g_st_i_in = -1, g_st_i_wolf = -1, g_st_i_center = -1, g_st_i_rad = -1, g_st_i_h = -1;
+struct CompCache { uint64_t cu, comp; };
+static CompCache g_comp_cache[COMP_KINDS][16];
+// ---- 会议阶段(2026-11-10)：g_cam_ctrl.cam_handler 的类名 == CamModeCopycatMeeting ----
+// 游戏开会各阶段都 set_cam_mode(COPYCAT_MEETING_MODE)，自己的 is_mode_copycat_meeting() 就是比这个。
+// 读不到时沿用上次的值；换局清零。⚠ CamModeCopycatStatic 不是会议(击杀/投票过场、监控摄像头、密道都用)
+static int64_t g_i_cam_handler = -1;
+static std::atomic<bool> g_meeting{false};
+static char g_cam_mode_name[48] = "";                   // 上次读到的相机模式类名(只为变化时打日志)
 // position 的候选属性，学若辰的回退链：position 当前不是活值时(假面舞会把模型换成石像、
 // 有的字段会失活)依次往后试。只要有一个读出合法 Vector3 就用。
 static const char *const POS_ATTRS[6] = {
@@ -234,6 +286,15 @@ static int       g_extra_n[2] = {0, 0};
 static std::atomic<int> g_extra_active{0};
 static ExtraUnit g_extra_work[MAX_EXTRA];
 static int       g_extra_work_n = 0;
+
+// 尸体(见 COPYCAT_CORPSE_TYPE)：每轮整份发布，seat 0 = 号码没对上
+static const int MAX_CORPSE = 16;
+struct CorpseUnit { float x, z, y; int seat; };
+static CorpseUnit g_corpse[2][MAX_CORPSE];
+static int        g_corpse_n[2] = {0, 0};
+static std::atomic<int> g_corpse_active{0};
+static int64_t g_cc_i_uq = -1;                                   // 1088 玩家的 unique_id(有尸体时才读)
+static int64_t g_cp_i_uq = -1, g_cp_i_reason = -1, g_cp_i_combat = -1, g_cp_i_clean = -1;
 
 static int64_t now_ms()
 {
@@ -572,27 +633,231 @@ static int read_identity(uint64_t d, const Dict &dk, bool allow_component)
     return 0;
 }
 
+static bool class_is(uint64_t obj, const char *name)
+{
+    uint64_t tp = is_obj(obj) ? getPtr64(obj + 8) : 0;
+    uint64_t np = is_obj(tp) ? getPtr64(tp + 0x18) : 0;      // PyTypeObject.tp_name
+    char buf[40] = {0};
+    return is_obj(np) && vm_readv(np, buf, sizeof(buf) - 1) && strcmp(buf, name) == 0;
+}
+
+// 在 combat_unit.components(dict) 里按类名找组件，按 combat 单位缓存(缓存命中时仍核对一次类名)
+static uint64_t find_comp(const PyCore::InstView &cv, uint64_t cu, int kind)
+{
+    CompCache *tbl = g_comp_cache[kind];
+    for (int i = 0; i < 16; i++)
+        if (tbl[i].cu == cu) {
+            if (class_is(tbl[i].comp, COMP_CLASS[kind])) return tbl[i].comp;
+            tbl[i].cu = 0; break;
+        }
+    bool has = false;
+    uint64_t comps = PyCore::inst_attr(cv, g_cc_i_ccomps, "components", has);
+    Dict ck;
+    if (!has || !read_dict(comps, ck)) return 0;
+    for (int64_t i = 0; i < ck.n_entries; i++) {
+        uint64_t comp = getPtr64(value_slot(ck, i));
+        if (!class_is(comp, COMP_CLASS[kind])) continue;
+        int slot = 0;                                             // 空位优先，满了覆盖第 0 个
+        for (int j = 0; j < 16; j++) if (tbl[j].cu == 0) { slot = j; break; }
+        tbl[slot] = {cu, comp};
+        return comp;
+    }
+    return 0;
+}
+
+// 读组件上一个 int 属性
+static bool comp_int(uint64_t comp, int64_t &idx, const char *name, int64_t &out)
+{
+    PyCore::InstView v;
+    bool has = false;
+    if (!PyCore::inst_view(comp, v)) return false;
+    PyCore::inst_attr(v, idx, name, has);
+    return has && read_int(getPtr64(PyCore::inst_value_slot(v, idx)), out);
+}
+
+// 读 combat 单位上的 死人/隐身/灵魂/被装/千面人变身。成功返回 nullptr，失败返回原因(日志用)，e 的这几项不动
+static const char *read_combat_state(uint64_t d, const Dict &dk, int identity, CopycatEntry &e)
+{
+    g_cc_i_combat = resolve_index(d, dk, g_cc_i_combat, "combat_unit");
+    if (g_cc_i_combat < 0) return "unit 上没有 combat_unit";
+    uint64_t cu = getPtr64(value_slot(dk, g_cc_i_combat));
+    PyCore::InstView cv;
+    if (!PyCore::inst_view(cu, cv)) return "combat_unit 读不到";
+    if (!g_any_cu) g_any_cu = cu;
+    bool has = false, dead = false, stealth = false;
+    PyCore::inst_attr(cv, g_cc_i_cdead, "_is_dead", has);
+    if (!has || !PyCore::read_bool(PyCore::inst_value_slot(cv, g_cc_i_cdead), dead)) return "_is_dead 读不到";
+    PyCore::inst_attr(cv, g_cc_i_cstealth, "_is_stealth", has);
+    if (!has || !PyCore::read_bool(PyCore::inst_value_slot(cv, g_cc_i_cstealth), stealth)) return "_is_stealth 读不到";
+    bool soul = false, changing = false;
+    if (identity == COPYCAT_INVOKER_ID) {
+        uint64_t comp = find_comp(cv, cu, COMP_INVOKER);
+        PyCore::InstView iv;
+        if (!comp || !PyCore::inst_view(comp, iv)) return "降灵师组件找不到";
+        PyCore::inst_attr(iv, g_cc_i_soul, "is_soul", has);
+        if (!has || !PyCore::read_bool(PyCore::inst_value_slot(iv, g_cc_i_soul), soul)) return "is_soul 读不到";
+        PyCore::inst_attr(iv, g_cc_i_chg, "is_changing2soul", has);
+        if (!has || !PyCore::read_bool(PyCore::inst_value_slot(iv, g_cc_i_chg), changing)) return "is_changing2soul 读不到";
+    }
+    // 被送货员装着：GameState.Boxed = 2(每个玩家都有这个组件)
+    int64_t gs = 0;
+    uint64_t gcomp = find_comp(cv, cu, COMP_GAMESTATE);
+    if (!gcomp) return "GameStateComponent 找不到";
+    if (!comp_int(gcomp, g_cc_i_gstate, "game_state", gs)) return "game_state 读不到";
+    // 导演：本轮刀人目标身份(None 时 read_int 失败 = 0)。只有导演自己的客户端有值
+    if (identity == 308) {
+        uint64_t dcomp = find_comp(cv, cu, COMP_DIRECTOR);
+        int64_t tid = 0;
+        if (dcomp && comp_int(dcomp, g_cc_i_dtarget, "_now_kill_identity_id", tid) && tid > 100 && tid < 400)
+            g_dir_work.target_identity = (int)tid;
+    }
+    // 千面人变身：FaceStatus.Change = 3，扮的是 tar_face_id(= 目标 copycat_index)
+    int face_as = 0;
+    if (identity == 202) {
+        uint64_t fcomp = find_comp(cv, cu, COMP_FACEMAN);
+        if (!fcomp) return "FaceManComponent 找不到";
+        int64_t st = 0, tar = -1;
+        if (!comp_int(fcomp, g_cc_i_fstatus, "face_status", st)) return "face_status 读不到";
+        if (st == 3 && comp_int(fcomp, g_cc_i_ftar, "tar_face_id", tar) && tar >= 0 && tar < MAX_COPYCAT) face_as = (int)tar + 1;
+    }
+    e.flags_ok = true;
+    e.dead = dead; e.stealth = stealth && !dead;
+    e.soul = soul && !dead; e.changing = changing && !dead;
+    e.boxed = gs == 2 && !dead;
+    e.face_as = dead ? 0 : face_as;
+    return nullptr;
+}
+
+// 读一个 math3d.vector(+0x10/+0x14/+0x18 = X/高度/Y)，类型必须是 position 校准时锁定的那个
+static bool read_vec3(uint64_t vo, float out[3])
+{
+    uint64_t want = g_pos_type.load();
+    if (!is_obj(vo) || !want) return false;
+    uint8_t b[0x1c];
+    if (!vm_readv(vo, b, sizeof(b))) return false;
+    uint64_t tp = 0; memcpy(&tp, b + 8, 8); tp &= 0x00FFFFFFFFFFFFFFULL;
+    if (tp != want) return false;
+    memcpy(out, b + 0x10, 12);
+    for (int k = 0; k < 3; k++) if (!std::isfinite(out[k]) || fabsf(out[k]) > 1e5f) return false;
+    return true;
+}
+
+static void stage_publish(const StageView &v)
+{
+    int w = 1 - g_stage_active.load();
+    g_stage[w] = v;
+    g_stage_active.store(w);
+}
+
+// 指挥家舞台状态(见 StageView)。系统对象每局找一次并缓存；找不到时 1 秒重试一次
+static void scan_stage(uint64_t um)
+{
+    static int64_t last_try = 0;
+    static int last_state = -1;                   // 日志：-1 未知 0 没找到系统 1 找到/不在台上 2 在台上
+    StageView sv; memset(&sv, 0, sizeof(sv));
+    if (um != g_stage_um) { g_stage_um = um; g_stage_sys = 0; }
+    bool has = false;
+    if (!g_stage_sys && g_any_cu && now_ms() - last_try >= 1000) {
+        last_try = now_ms();
+        PyCore::InstView cv, kv;
+        if (PyCore::inst_view(g_any_cu, cv)) {
+            uint64_t core = PyCore::inst_attr(cv, g_st_i_core, "core", has);
+            if (has && PyCore::inst_view(core, kv)) {
+                uint64_t si = PyCore::inst_attr(kv, g_st_i_sysinst, "system_instances", has);
+                int64_t i = has ? find_key(si, "systems_copycat.CopycatStageSystem", -1) : -1;
+                if (i >= 0) g_stage_sys = get_attr(si, i);
+                static uint64_t dumped_um = 0;                 // 找不到时把键名打一次(每局一次)，核对键格式
+                Dict sk;
+                if (i < 0 && has && dumped_um != um && read_dict(si, sk)) {
+                    dumped_um = um;
+                    printf("[模仿者] system_instances 共%lld个键:", (long long)sk.n_entries);
+                    for (int64_t j = 0; j < sk.n_entries && j < 80; j++) {
+                        char kn[64];
+                        if (PyCore::read_str(getPtr64(key_slot(sk, j)), kn, sizeof(kn))) printf(" %s", kn);
+                    }
+                    printf("\n");
+                    fflush(stdout);
+                }
+            }
+        }
+    }
+    PyCore::InstView v;
+    if (g_stage_sys && !PyCore::inst_view(g_stage_sys, v)) g_stage_sys = 0;
+    if (g_stage_sys) {
+        bool in = false, wolf = false;
+        PyCore::inst_attr(v, g_st_i_in, "_g_unit_in_area", has);
+        if (has) PyCore::read_bool(PyCore::inst_value_slot(v, g_st_i_in), in);
+        PyCore::inst_attr(v, g_st_i_wolf, "gunit_is_wolf", has);
+        if (has) PyCore::read_bool(PyCore::inst_value_slot(v, g_st_i_wolf), wolf);
+        float c[3], rad = 0, h = 0;
+        uint64_t cp = PyCore::inst_attr(v, g_st_i_center, "stage_center_pos", has);
+        bool cok = has && read_vec3(cp, c);
+        PyCore::inst_attr(v, g_st_i_rad, "stage_radius", has);
+        bool rok = has && PyCore::read_number(PyCore::inst_value_slot(v, g_st_i_rad), rad, 0.0, 1e5);
+        PyCore::inst_attr(v, g_st_i_h, "stage_height", has);
+        bool hok = has && PyCore::read_number(PyCore::inst_value_slot(v, g_st_i_h), h, 0.0, 1e5);
+        if (in && !wolf && cok && rok && hok && rad > 0) {
+            sv.active = true; sv.x = c[0]; sv.z = c[1]; sv.y = c[2]; sv.radius = rad; sv.height = h;
+        }
+    }
+    int st = !g_stage_sys ? 0 : (sv.active ? 2 : 1);
+    if (st != last_state) {
+        last_state = st;
+        if (st == 2) printf("[模仿者] 舞台：我在台上 中心(%.1f,%.1f,%.1f) 半径%.1f 高%.1f，台上的人不画骨骼\n", sv.x, sv.z, sv.y, sv.radius, sv.height);
+        else printf("[模仿者] 舞台：%s\n", st == 0 ? "没找到 CopycatStageSystem" : "系统已找到，我不在台上(或是模仿者阵营)");
+        fflush(stdout);
+    }
+    stage_publish(sv);
+}
+
 // 模仿者模式：玩家单位(1088 普通 + 1210 导演局其他玩家 + 1211 导演傀儡=自身)的 model+0x20 进本体集合，
-// 同时记下身份、号码(copycat_index)和 unit.position；1089(鬼魂)只用来认死者。
+// 同时记下身份、号码(copycat_index)、unit.position 和 死人/隐身/灵魂(read_combat_state)。
 // 导演局其他玩家是 CopycatDirectorCloneUnit(不在 1088、身份直读为 None):以前被当"无身份"盖固定"导演"标签,
 // 现在跟 1088 同路 —— 身份走 combat_unit.components(照若辰),号码走 copycat_index,按"N号 身份"进身份簿。
 // 1211 导演傀儡是自身,靠身份簿 self_seat / 绘制侧贴身<1m 过滤掉,不会误画。
-static void collect_copycat(uint64_t ubt, Snapshot &res)
+static void collect_copycat(uint64_t ubt, uint64_t um_for_stage, Snapshot &res)
 {
     const int64_t now = now_ms();
+    static char last_err[48] = "(未读)";      // 状态读失败原因，变了才打日志(第一次读成功也会打一行)
+    bool seat_seen[MAX_COPYCAT] = {false};    // 这一轮已经收过的号码(去重见玩家循环)
+    memset(&g_dir_work, 0, sizeof(g_dir_work));
+    g_any_cu = 0;
 
-    // 死者的 unique_id(字符串，账号 uid 这类纯数字)。读不到就当没人死，最坏是多画一具尸体
-    char dead[MAX_COPYCAT][24];
-    int dead_n = 0;
-    int64_t gn = 0; uint64_t gitems = 0;
-    if (read_list(get_type_list(ubt, COPYCAT_GHOST_TYPE), gn, gitems)) {
-        for (int64_t i = 0; i < gn && dead_n < MAX_COPYCAT; i++) {
-            uint64_t d = get_inst_dict(getPtr64(gitems + i * 8));
-            Dict dk;
-            if (!d || !read_dict(d, dk)) continue;
-            g_ccg_i_uq = resolve_index(d, dk, g_ccg_i_uq, "unique_id");
-            if (g_ccg_i_uq >= 0 && PyCore::read_str(getPtr64(value_slot(dk, g_ccg_i_uq)), dead[dead_n], sizeof(dead[0])))
-                dead_n++;
+    // ---- 尸体：先收位置和 unique_id，号码在下面玩家循环里按 unique_id 对 ----
+    struct CorpseWork { float x, z, y; char uq[24]; int seat; };
+    CorpseWork cw[MAX_CORPSE];
+    int cn = 0, c_total = 0, c_clone = 0, c_clean = 0;
+    {
+        int64_t gn = 0; uint64_t gitems = 0;
+        if (read_list(get_type_list(ubt, COPYCAT_CORPSE_TYPE), gn, gitems)) {
+            for (int64_t i = 0; i < gn && cn < MAX_CORPSE; i++) {
+                uint64_t d = get_inst_dict(getPtr64(gitems + i * 8));
+                Dict dk;
+                if (!d || !read_dict(d, dk)) continue;
+                c_total++;
+                char rs[32];
+                g_cp_i_reason = resolve_index(d, dk, g_cp_i_reason, "dead_reason");
+                if (g_cp_i_reason < 0 || !PyCore::read_str(getPtr64(value_slot(dk, g_cp_i_reason)), rs, sizeof(rs))) { c_clone++; continue; }
+                g_cp_i_combat = resolve_index(d, dk, g_cp_i_combat, "combat_unit");
+                PyCore::InstView cv;
+                if (g_cp_i_combat >= 0 && PyCore::inst_view(getPtr64(value_slot(dk, g_cp_i_combat)), cv)) {
+                    bool has = false, clean = false;
+                    PyCore::inst_attr(cv, g_cp_i_clean, "has_cleand", has);
+                    if (has && PyCore::read_bool(PyCore::inst_value_slot(cv, g_cp_i_clean), clean) && clean) { c_clean++; continue; }
+                }
+                float p[3];
+                if (!read_position(d, dk, 0, p)) continue;
+                CorpseWork &w = cw[cn++];
+                w.x = p[0]; w.z = p[1]; w.y = p[2]; w.seat = 0; w.uq[0] = 0;
+                g_cp_i_uq = resolve_index(d, dk, g_cp_i_uq, "unique_id");
+                if (g_cp_i_uq >= 0) PyCore::read_str(getPtr64(value_slot(dk, g_cp_i_uq)), w.uq, sizeof(w.uq));
+            }
+        }
+        static int last_total = -1, last_n = -1, last_clean = -1;
+        if (c_total != last_total || cn != last_n || c_clean != last_clean) {
+            printf("[模仿者] 1089 共%d 尸体%d 过场克隆%d 已清理%d\n", c_total, cn, c_clone, c_clean);
+            fflush(stdout);
+            last_total = c_total; last_n = cn; last_clean = c_clean;
         }
     }
 
@@ -619,26 +884,73 @@ static void collect_copycat(uint64_t ubt, Snapshot &res)
             g_cc_i_model = resolve_index(d, dk, g_cc_i_model, "model");
             if (g_cc_i_model >= 0) body = get_scene_obj(getPtr64(value_slot(dk, g_cc_i_model)));
 
-            bool is_dead = false;
-            if (dead_n > 0) {
-                g_cc_i_uq = resolve_index(d, dk, g_cc_i_uq, "unique_id");
-                char uq[24];
-                if (g_cc_i_uq >= 0 && PyCore::read_str(getPtr64(value_slot(dk, g_cc_i_uq)), uq, sizeof(uq)))
-                    for (int j = 0; j < dead_n && !is_dead; j++) is_dead = strcmp(uq, dead[j]) == 0;
-            }
-
-            if (body && !is_dead) add_unique(res.body, res.body_count, MAX_BODIES, body);
-            if (res.copycat_count >= MAX_COPYCAT) continue;
-
-            CopycatEntry &e = res.copycat[res.copycat_count++];
+            CopycatEntry e;
+            memset(&e, 0, sizeof(e));
             e.body = body;
-            e.identity = read_identity(d, dk, allow_component);
-            e.seat = 0;
-            e.dead = is_dead;
             int64_t v = 0;
             g_cc_i_index = resolve_index(d, dk, g_cc_i_index, "copycat_index");
             if (g_cc_i_index >= 0 && read_int(getPtr64(value_slot(dk, g_cc_i_index)), v) && v >= 0 && v < MAX_COPYCAT)
                 e.seat = (int)v + 1;
+            // 同一号码一轮只认第一份(2026-11-10 导演局实测)：导演局里 [1210] 导演分身和 [1088] 真人带同一个 copycat_index，
+            // 两份都写身份簿同一格时，状态每轮被分身覆盖(降灵师「等变灵魂」1/0 来回跳了 1.1 万行)、坐标也被换成分身的。
+            // [1088] 在 COPYCAT_PLAYER_TYPES 最前面，所以真人优先；重复的只照旧进本体集合，不读状态/坐标、不进簿子
+            if (e.seat > 0) {
+                if (seat_seen[e.seat - 1]) {
+                    if (body) add_unique(res.body, res.body_count, MAX_BODIES, body);
+                    // 导演分身/傀儡：记坐标(导演操控傀儡时画分身、按傀儡算距离)
+                    float p[3];
+                    if ((ptype == COPYCAT_DIRECTOR_CLONE || ptype == COPYCAT_DIRECTOR_PUPPET) && read_position(d, dk, 0, p) && p[1] > -300.0f) {
+                        if (ptype == COPYCAT_DIRECTOR_CLONE) {
+                            int k = e.seat - 1;
+                            g_dir_work.clone_ok[k] = true; g_dir_work.cx[k] = p[0]; g_dir_work.cz[k] = p[1]; g_dir_work.cy[k] = p[2];
+                        } else {
+                            g_dir_work.puppet_ok = true; g_dir_work.px = p[0]; g_dir_work.pz = p[1]; g_dir_work.py = p[2];
+                        }
+                    }
+                    continue;
+                }
+                seat_seen[e.seat - 1] = true;
+            }
+            e.identity = read_identity(d, dk, allow_component);
+            // 每局每个号码第一次出现时打一行：来自哪个键、单位类名、身份、坐标(查"会议上多出一个 13号 ?"这类来历不明的号码)
+            {
+                static uint64_t seen_um = 0;
+                static bool logged[MAX_COPYCAT];
+                if (um_for_stage != seen_um) { seen_um = um_for_stage; memset(logged, 0, sizeof(logged)); memset(g_seat_first_ms, 0, sizeof(g_seat_first_ms)); }
+                const int64_t first = e.seat > 0 ? g_seat_first_ms[e.seat - 1] : 0;
+                if (e.seat > 0 && !logged[e.seat - 1] && (e.identity || (first && now - first > 5000))) {
+                    logged[e.seat - 1] = true;
+                    uint64_t inst = getPtr64(items + i * 8);
+                    uint64_t tp = is_obj(inst) ? getPtr64(inst + 8) : 0;
+                    uint64_t np = is_obj(tp) ? getPtr64(tp + 0x18) : 0;
+                    char cls[40] = "?";
+                    if (is_obj(np)) vm_readv(np, cls, sizeof(cls) - 1);
+                    float p[3] = {0, 0, 0};
+                    read_position(d, dk, 0, p);
+                    printf("[模仿者] 新号码 %d号 键=%d 类=%s 身份%d 坐标(%.1f,%.1f,%.1f)\n", e.seat, ptype, cls, e.identity, p[0], p[1], p[2]);
+                    fflush(stdout);
+                } else if (e.seat > 0 && !g_seat_first_ms[e.seat - 1]) {
+                    g_seat_first_ms[e.seat - 1] = now;               // 身份还没赋值：最多等 5 秒再打(真玩家约 2 秒就有身份)
+                }
+            }
+            const char *err = read_combat_state(d, dk, e.identity, e);
+            if (strcmp(err ? err : "", last_err) != 0) {
+                snprintf(last_err, sizeof(last_err), "%s", err ? err : "");
+                printf("[模仿者] 死人/隐身状态读取%s%s\n", err ? "失败: " : "正常", err ? err : "");
+                fflush(stdout);
+            }
+            // 死人和"被投出、等变灵魂"的降灵师都在鬼魂世界；被送货员装着的人位置贴在送货员身上 ——
+            // 这几种都不进本体集合、不读坐标、不画(状态这轮读不到时照旧收；身份簿那边沿用旧值，按簿子画的不受影响)
+            const bool is_dead = e.dead || e.changing || e.boxed;
+            if (body && !is_dead) add_unique(res.body, res.body_count, MAX_BODIES, body);
+            if (res.copycat_count >= MAX_COPYCAT) continue;
+            res.copycat[res.copycat_count++] = e;
+            if (cn > 0 && e.seat > 0) {                 // 尸体号码：unique_id 跟这个玩家对上
+                char uq[24];
+                g_cc_i_uq = resolve_index(d, dk, g_cc_i_uq, "unique_id");
+                if (g_cc_i_uq >= 0 && PyCore::read_str(getPtr64(value_slot(dk, g_cc_i_uq)), uq, sizeof(uq)) && uq[0])
+                    for (int j = 0; j < cn; j++) if (cw[j].seat == 0 && strcmp(cw[j].uq, uq) == 0) cw[j].seat = e.seat;
+            }
 
             // 坐标只给活人读；号码读不到就不知道记到哪一格
             float p[3];
@@ -649,6 +961,19 @@ static void collect_copycat(uint64_t ubt, Snapshot &res)
             }
         }
     }
+
+    {
+        int cwi = 1 - g_corpse_active.load();
+        for (int j = 0; j < cn; j++) g_corpse[cwi][j] = {cw[j].x, cw[j].z, cw[j].y, cw[j].seat};
+        g_corpse_n[cwi] = cn;
+        g_corpse_active.store(cwi);
+    }
+    {
+        int dw = 1 - g_dir_active.load();
+        g_dir[dw] = g_dir_work;
+        g_dir_active.store(dw);
+    }
+    scan_stage(um_for_stage);
 
     // 额外单位:真正没号码没身份、只能按 position 画固定标签的 —— 只剩食人鬼(地图生物)。
     // 导演分身/傀儡(1210/1211)已改走上面的"号码+身份"身份簿。普通模仿者局 1203 键不存在,收不到东西。
@@ -676,11 +1001,12 @@ static void collect_copycat(uint64_t ubt, Snapshot &res)
 // 思路同 PyGenius.h 的天赋锁存，但简单得多：身份整局不变，按号码(copycat_index)记，
 //   - 读到就写进簿子(新读到的值永远覆盖旧值 —— 所以万一没清干净，新一局第一次读到就自动纠正)
 //   - 读不到就沿用簿子
-//   - 死亡只会置上、不会撤销
+//   - 死亡只会置上、不会撤销；隐身/灵魂/等变灵魂每轮跟着读到的值走(读不到沿用)
 //   - unit_mgr 地址变了(换局/回大厅)就整本清空
 // 只在界面上「模仿者模式」打开时记(g_book_enabled)，关掉就清空。
 // 发布方式跟 Snapshot 一样双缓冲，但**不依赖锚点成功** —— 锚点那步失败时簿子照样更新和发布
-struct CopycatSeat { bool known; uint64_t body; int identity; bool dead; };
+// 状态变化打日志 [模仿者] N号 ...(上机核对 _is_dead 等字段名用，pull hack_stdout.log 看)
+struct CopycatSeat { bool known; uint64_t body; int identity; bool dead, stealth, soul, changing, boxed; int face_as; };
 struct CopycatBook { CopycatSeat seat[MAX_COPYCAT]; int self_seat; };   // seat[号码-1]；self_seat 从 1 开始，0 = 不知道
 static CopycatBook g_book[2];
 static std::atomic<int> g_book_active{0};
@@ -721,7 +1047,17 @@ static void book_merge(const Snapshot &res, uint64_t um)
         if (!b.known) { b.known = true; changed = true; }
         if (e.body && e.body != b.body) { b.body = e.body; changed = true; }
         if (e.identity && e.identity != b.identity) { b.identity = e.identity; changed = true; }
-        if (e.dead && !b.dead) { b.dead = true; changed = true; }
+        if (!e.flags_ok) continue;
+        bool dead = b.dead || e.dead;
+        if (dead != b.dead || e.stealth != b.stealth || e.soul != b.soul || e.changing != b.changing
+            || e.boxed != b.boxed || e.face_as != b.face_as) {
+            b.dead = dead; b.stealth = e.stealth; b.soul = e.soul; b.changing = e.changing;
+            b.boxed = e.boxed; b.face_as = e.face_as;
+            changed = true;
+            printf("[模仿者] %d号 身份%d 死=%d 隐身=%d 灵魂=%d 等变灵魂=%d 被装=%d 扮=%d\n",
+                   e.seat, b.identity, (int)b.dead, (int)b.stealth, (int)b.soul, (int)b.changing, (int)b.boxed, b.face_as);
+            fflush(stdout);
+        }
     }
     if (changed) book_publish();
 }
@@ -842,15 +1178,27 @@ static bool try_refresh()
 
     // 模仿者模式放在锚点之前：锚点失败时身份簿和坐标照样要更新(开会阶段锚点常读不到)
     static uint64_t pos_um = 0;
-    if (is_obj(um) && um != pos_um) {                   // 换局：上一局的坐标作废
+    if (is_obj(um) && um != pos_um) {                   // 换局：上一局的坐标、会议标志作废
         memset(g_pos_ms, 0, sizeof(g_pos_ms));
+        memset(g_comp_cache, 0, sizeof(g_comp_cache));   // 组件缓存按 combat 单位地址记，换局地址会被复用
+        g_meeting = false;
+        g_puppet_op = false;
         pos_um = um;
     }
-    if (is_obj(ubt) && has_copycat) collect_copycat(ubt, res);
-    else if (g_extra_n[g_extra_active.load()] != 0) {   // 不是模仿者局：食人鬼列表清空一次，免得残留上一局的
-        int ew = 1 - g_extra_active.load();
-        g_extra_n[ew] = 0;
-        g_extra_active.store(ew);
+    if (is_obj(ubt) && has_copycat) collect_copycat(ubt, um, res);
+    else {                                              // 不是模仿者局：食人鬼/尸体列表清空一次，免得残留上一局的
+        if (g_extra_n[g_extra_active.load()] != 0) {
+            int ew = 1 - g_extra_active.load();
+            g_extra_n[ew] = 0;
+            g_extra_active.store(ew);
+        }
+        if (g_corpse_n[g_corpse_active.load()] != 0) {
+            int cwi = 1 - g_corpse_active.load();
+            g_corpse_n[cwi] = 0;
+            g_corpse_active.store(cwi);
+        }
+        if (g_stage[g_stage_active.load()].active) { StageView z; memset(&z, 0, sizeof(z)); stage_publish(z); }
+        g_puppet_op = false;
     }
     pos_publish(now_ms());
     book_merge(res, um);
@@ -864,6 +1212,23 @@ static bool try_refresh()
     if (!camd) { snprintf(g_status, sizeof(g_status), "%s", T("g_cam_ctrl 不是 managed-dict 布局", "g_cam_ctrl is not managed-dict layout")); return false; }
     Dict camk;
     if (!read_dict(camd, camk)) { snprintf(g_status, sizeof(g_status), "%s", T("g_cam_ctrl 字典异常", "g_cam_ctrl dict malformed")); return false; }
+
+    // 会议阶段：cam_handler 的类名。放在 cam.unit 之前，开会时锚点常读不到也照样更新
+    g_i_cam_handler = resolve_index(camd, camk, g_i_cam_handler, "cam_handler");
+    if (g_i_cam_handler >= 0) {
+        uint64_t h = getPtr64(value_slot(camk, g_i_cam_handler));
+        uint64_t tp = is_obj(h) ? getPtr64(h + 8) : 0;
+        uint64_t np = is_obj(tp) ? getPtr64(tp + 0x18) : 0;     // PyTypeObject.tp_name
+        char nm[48] = {0};
+        if (is_obj(np) && vm_readv(np, nm, sizeof(nm) - 1)) {
+            g_meeting = strcmp(nm, "CamModeCopycatMeeting") == 0;
+            if (res.copycat_count > 0 && strcmp(nm, g_cam_mode_name) != 0) {   // 只在模仿者局打日志
+                printf("[模仿者] 相机模式 %s 会议=%d\n", nm, (int)g_meeting.load());
+                fflush(stdout);
+            }
+            memcpy(g_cam_mode_name, nm, sizeof(nm));
+        }
+    }
 
     g_i_cam_unit = resolve_index(camd, camk, g_i_cam_unit, "unit");
     if (g_i_cam_unit < 0) { snprintf(g_status, sizeof(g_status), "%s", T("g_cam_ctrl 里没有 unit", "no unit in g_cam_ctrl")); return false; }
@@ -880,7 +1245,19 @@ static bool try_refresh()
     g_i_uid   = resolve_index(me_d, me_k, g_i_uid,   "uid");
 
     if (g_i_model >= 0) res.anchor = get_scene_obj(getPtr64(value_slot(me_k, g_i_model)));
-    if (g_i_utype >= 0) { int64_t v = 0; if (read_int(getPtr64(value_slot(me_k, g_i_utype)), v)) res.camp = (int)v; }
+    if (g_i_utype >= 0) {
+        int64_t v = 0;
+        if (read_int(getPtr64(value_slot(me_k, g_i_utype)), v)) {
+            res.camp = (int)v;
+            // 导演操控傀儡：在锚点之前发布(傀儡没真模型，锚点那步大概率失败)。读不到 unit_type 时沿用上次
+            bool op = (v == COPYCAT_DIRECTOR_PUPPET);
+            if (op != g_puppet_op.load()) {
+                g_puppet_op = op;
+                printf("[模仿者] 导演傀儡 %s\n", op ? "开始操控" : "结束操控");
+                fflush(stdout);
+            }
+        }
+    }
     if (g_i_uid   >= 0) { int64_t v = 0; if (read_int(getPtr64(value_slot(me_k, g_i_uid)),   v)) res.uid  = v; }
 
     if (res.anchor == 0) { snprintf(g_status, sizeof(g_status), "%s", T("cam.unit.model 读不到", "cam.unit.model unreadable")); return false; }
@@ -925,8 +1302,14 @@ static void refresh_once()
         g_i_unit_model = g_i_cpuppet = -1;
         g_i_outphoto = -1;
         g_pd_i_time = g_pd_i_players = -1; g_photo_key = -1;
-        g_cc_i_model = g_cc_i_another = g_cc_i_ident = g_cc_i_index = g_cc_i_uq = g_ccg_i_uq = -1;
-        g_cc_i_combat = -1;
+        g_cc_i_model = g_cc_i_another = g_cc_i_ident = g_cc_i_index = -1;
+        g_cc_i_combat = g_cc_i_cdead = g_cc_i_cstealth = g_cc_i_ccomps = g_cc_i_soul = g_cc_i_chg = -1;
+        memset(g_comp_cache, 0, sizeof(g_comp_cache));
+        g_cc_i_gstate = g_cc_i_fstatus = g_cc_i_ftar = g_cc_i_dtarget = -1;
+        g_stage_sys = 0;
+        g_st_i_core = g_st_i_sysinst = g_st_i_in = g_st_i_wolf = g_st_i_center = g_st_i_rad = g_st_i_h = -1;
+        g_i_cam_handler = -1;
+        g_cc_i_uq = g_cp_i_uq = g_cp_i_reason = g_cp_i_combat = g_cp_i_clean = -1;
         for (int a = 0; a < 6; a++) g_cc_i_posattr[a] = -1;
         g_class_cache_count = 0;
         g_fail_streak = 0;
@@ -1116,6 +1499,22 @@ static bool is_butcher_body(uintptr_t obj)
 // 当前是不是模仿者对局(1088 里读到了活人)
 static inline bool copycat_active() { return g_available && g_buf[g_active].copycat_count > 0; }
 
+// 会议阶段(相机在 CamModeCopycatMeeting)：绘制侧不画 in-world 人物，改画固定列表
+static inline bool copycat_meeting() { return g_meeting.load(); }
+
+// 我正在操控导演傀儡：绘制侧不画会议桌边的真人，改画已摆出的分身(见 DirectorView)
+static inline bool director_puppet_mode() { return g_puppet_op.load(); }
+static inline DirectorView director_view() { return g_dir[g_dir_active.load()]; }
+
+// 指挥家舞台：这个坐标(x / 高度 / y)的人在不在台上、而且模型正被游戏挪到假位置(我在台上且不是模仿者阵营)
+static bool in_fake_stage(float x, float z, float y)
+{
+    const StageView &s = g_stage[g_stage_active.load()];
+    if (!s.active) return false;
+    float dx = x - s.x, dy = y - s.y;
+    return dx * dx + dy * dy <= s.radius * s.radius && fabsf(z - s.z) <= s.height;
+}
+
 // 界面开关「模仿者模式」每帧同步过来：开着才记身份簿，关掉就清空
 static inline void set_copycat_book(bool on) { g_book_enabled = on; }
 
@@ -1137,7 +1536,7 @@ static bool copycat_identity(uintptr_t obj, int &identity, int &seat)
     const CopycatBook &b = g_book[g_book_active];
     for (int i = 0; i < MAX_COPYCAT; i++) {
         const CopycatSeat &s = b.seat[i];
-        if (!s.known || s.dead || s.body != (uint64_t)obj) continue;
+        if (!s.known || s.dead || s.changing || s.boxed || s.body != (uint64_t)obj) continue;
         identity = s.identity;
         seat = i + 1;
         return true;
@@ -1163,6 +1562,15 @@ static int copycat_extra(ExtraUnit *out, int cap)
     int n = g_extra_n[a];
     if (n > cap) n = cap;
     memcpy(out, g_extra[a], sizeof(ExtraUnit) * n);
+    return n;
+}
+// 尸体当前快照(x / 高度 / y / 号码，号码 0 = 没对上)
+static int copycat_corpses(CorpseUnit *out, int cap)
+{
+    int a = g_corpse_active.load();
+    int n = g_corpse_n[a];
+    if (n > cap) n = cap;
+    memcpy(out, g_corpse[a], sizeof(CorpseUnit) * n);
     return n;
 }
 static const char *const EXTRA_LABELS_EN[1] = { "Ghoul" };   // 游戏里叫"食尸鬼"，英文 Ghoul(TID_COPYCAT_TASK_NAME_19)

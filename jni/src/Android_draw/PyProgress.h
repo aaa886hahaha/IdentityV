@@ -80,7 +80,7 @@ static const int GENERATOR_UNIT_TYPE = 3;
 static const int MAX_DOORS = 4;
 static const int DOOR_UNIT_TYPE = 6;
 
-struct Entry { uint64_t scene_obj; float x, y, z; float progress; };
+struct Entry { uint64_t scene_obj; float x, y, z; float progress; bool locked; };
 struct DoorEntry { uint64_t scene_obj; float progress; bool can_open, has_open, is_opening; };
 
 // 红夫人镜面：units_by_type[246] = MaryMirrorUnit，一局 0/1 个。
@@ -142,6 +142,48 @@ static inline bool is_photo_ghost(uint64_t d, const Dict &dk)
     if (g_i_outphoto < 0) return false;
     int64_t v = 0;
     return PyCore::read_int(getPtr64(value_slot(dk, g_i_outphoto)), v) && v > 0;
+}
+
+// 密码机被封锁(2026-11-13 反编译热更脚本 iCommonGenerator / ClientUnits.GeneratorUnit / WaxProgressMgr)：
+//   1) locked_flag —— 监管天赋封禁(被动 205)开局锁机，do_unlock_generator 清掉。游戏 is_be_locked() 第一条
+//   2) combat_unit.is_block_tagged —— GameplayTag Generator.Block，is_be_locked() 第二条(其它技能的封锁走这里)
+//   3) wax_progress_mgr.waxs['COLD'] 进度 == max_progress —— 蜡像封机(check_locked_for_imm_speech 第一条)
+// 任意一条成立就算封锁；读不到的项当没封，不影响进度本身
+static int64_t g_i_locked = -1, g_i_combat = -1, g_i_blocktag = -1, g_i_waxmgr = -1, g_i_waxs = -1, g_i_cold = -1;
+static int64_t g_i_wprog = -1, g_i_wmax = -1;
+static bool read_gen_locked(uint64_t d, const Dict &dk)
+{
+    bool b = false;
+    g_i_locked = resolve_index(d, dk, g_i_locked, "locked_flag");
+    if (g_i_locked >= 0 && read_bool(value_slot(dk, g_i_locked), b) && b) return true;
+
+    g_i_combat = resolve_index(d, dk, g_i_combat, "combat_unit");
+    if (g_i_combat >= 0) {
+        PyCore::InstView cv; bool ok = false;
+        uint64_t cu = getPtr64(value_slot(dk, g_i_combat));
+        if (PyCore::inst_view(cu, cv)) {
+            PyCore::inst_attr(cv, g_i_blocktag, "is_block_tagged", ok);
+            if (ok && read_bool(PyCore::inst_value_slot(cv, g_i_blocktag), b) && b) return true;
+        }
+    }
+
+    g_i_waxmgr = resolve_index(d, dk, g_i_waxmgr, "wax_progress_mgr");
+    if (g_i_waxmgr < 0) return false;
+    PyCore::InstView mv; bool ok = false;
+    if (!PyCore::inst_view(getPtr64(value_slot(dk, g_i_waxmgr)), mv)) return false;
+    uint64_t waxs = PyCore::inst_attr(mv, g_i_waxs, "waxs", ok);
+    if (!ok || getPtr64(waxs + 8) != PyRoot::g_dict_type) return false;
+    g_i_cold = find_key(waxs, "COLD", g_i_cold);
+    PyCore::InstView wv;
+    if (g_i_cold < 0 || !PyCore::inst_view(get_attr(waxs, g_i_cold), wv)) return false;
+    PyCore::inst_attr(wv, g_i_wprog, "progress", ok);
+    if (!ok) return false;
+    PyCore::inst_attr(wv, g_i_wmax, "max_progress", ok);
+    if (!ok) return false;
+    float prog = 0.f, mx = 0.f;
+    if (!PyCore::read_number(PyCore::inst_value_slot(wv, g_i_wprog), prog, -1.0, 10000.0)) return false;
+    if (!PyCore::read_number(PyCore::inst_value_slot(wv, g_i_wmax), mx, 0.5, 10000.0)) return false;
+    return prog >= mx - 0.01f;
 }
 
 static bool resolve_module()
@@ -351,6 +393,7 @@ static bool try_refresh()
         g_buf[write_idx][count].z = xyz[1];
         g_buf[write_idx][count].y = xyz[2];
         g_buf[write_idx][count].progress = progress;
+        g_buf[write_idx][count].locked = read_gen_locked(d, dk);
         count++;
     }
 
@@ -380,6 +423,7 @@ static void refresh_once()
         g_i_unit_mgr = g_i_ubt = g_i_fix = g_i_pos = g_i_model = -1;
         g_i_hack = g_i_door_model = g_i_can_open = g_i_has_open = g_i_is_opening = -1;
         g_i_outphoto = -1;
+        g_i_locked = g_i_combat = g_i_blocktag = g_i_waxmgr = g_i_waxs = g_i_cold = g_i_wprog = g_i_wmax = -1;
         g_fail_streak = 0;
     }
 }
