@@ -38,8 +38,8 @@ namespace WaxAim {
 
 // ---------------- 菜单项 ----------------
 inline bool enabled       = true;    // 总开关(只在我是蜡像师时生效)
-inline bool show_traj     = true;    // 落点预测(喷射中，只画终点的小球)
-inline bool show_always   = false;   // 不喷射时也画瞄准线
+inline bool show_traj     = false;    // 落点预测(喷射中，只画终点的小球)
+inline bool show_always   = true;   // 不喷射时也画瞄准线
 inline float aim_x = -1.f, aim_y = -1.f;   // 游戏蜡枪瞄准标记的屏幕坐标，<0 = 屏幕中心
 
 // ---------------- 常量(配表 skill 3811 / air_power 36 / box_bounding 3,150,151) ----------------

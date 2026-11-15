@@ -168,6 +168,7 @@ static std::atomic<int> g_active{0};      // 见 PyProgress.h 同名变量的注
 static uintptr_t g_libbase = 0;
 static uint64_t  g_module_dict = 0;
 static int64_t   g_i_cam = -1, g_i_cam_unit = -1;
+static int64_t   g_i_gunit = -1, g_i_gunit_type = -1;   // GK.g_unit 及其 unit_type，被扛时用(见 try_refresh 里 cam.unit 那段)
 static int64_t   g_i_unit_mgr = -1, g_i_ubt = -1;
 static int64_t   g_i_model = -1, g_i_another = -1, g_i_utype = -1, g_i_uid = -1;
 // another_model 的序号缓存**按类分开存**(键 = 实例的 ob_type)。
@@ -1240,6 +1241,28 @@ static bool try_refresh()
     Dict me_k;
     if (!read_dict(me_d, me_k)) { snprintf(g_status, sizeof(g_status), "%s", T("cam.unit 字典异常", "cam.unit dict malformed")); return false; }
 
+    // 被监管牵上气球时，游戏把镜头切去跟随监管(CivilianUnit.set_catch_by -> g_cam_ctrl.change_unit(butcher))，
+    // 直到挣脱/上椅(set_drop_by / hang -> change_unit(self))。这段时间 cam.unit 是监管，按它算"自身"会把我当成监管
+    // (固定信息 B 消失、C 冒出来并清锁存、监管被当成自己不画…)。我的主角色 GK.g_unit 不跟镜头走：
+    // cam.unit 是监管(1)而 g_unit 是求生者(2)时，改用 g_unit。
+    // 机械师操控玩偶(两边都是 2)、女巫操控信徒(g_unit 是 1)、我本来就是监管，都不触发
+    g_i_utype = resolve_index(me_d, me_k, g_i_utype, "unit_type");
+    int64_t cam_type = -1;
+    if (g_i_utype >= 0) read_int(getPtr64(value_slot(me_k, g_i_utype)), cam_type);
+    if (cam_type == 1) {
+        g_i_gunit = find_key(g_module_dict, "g_unit", g_i_gunit);
+        uint64_t gu = (g_i_gunit >= 0) ? get_attr(g_module_dict, g_i_gunit) : 0;
+        uint64_t gu_d = (is_obj(gu) && gu != me) ? get_inst_dict(gu) : 0;
+        Dict gu_k;
+        if (gu_d && read_dict(gu_d, gu_k)) {
+            g_i_gunit_type = resolve_index(gu_d, gu_k, g_i_gunit_type, "unit_type");
+            int64_t gt = -1;
+            if (g_i_gunit_type >= 0 && read_int(getPtr64(value_slot(gu_k, g_i_gunit_type)), gt) && gt == 2) {
+                me = gu; me_d = gu_d; me_k = gu_k;
+            }
+        }
+    }
+
     g_i_model = resolve_index(me_d, me_k, g_i_model, "model");
     g_i_utype = resolve_index(me_d, me_k, g_i_utype, "unit_type");
     g_i_uid   = resolve_index(me_d, me_k, g_i_uid,   "uid");
@@ -1298,6 +1321,7 @@ static void refresh_once()
     if (++g_fail_streak >= 8) {                       // 连续失败就把序号缓存作废，下一轮按名字重找
         g_module_dict = 0;
         g_i_cam = g_i_cam_unit = g_i_unit_mgr = g_i_ubt = -1;
+        g_i_gunit = g_i_gunit_type = -1;
         g_i_model = g_i_another = g_i_utype = g_i_uid = -1;
         g_i_unit_model = g_i_cpuppet = -1;
         g_i_outphoto = -1;

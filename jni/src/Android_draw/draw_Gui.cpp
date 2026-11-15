@@ -12,10 +12,13 @@
 #include "PySelf.h"
 #include "PyScene.h"
 #include "AutoPallet.h"
+#include "AutoQte.h"
+#include "AutoMusician.h"
 #include "NativeBones.h"
 #include "GeniusTree.h"
 #include "PyWaterFight.h"
 #include "PyItems.h"
+#include "PyKnight.h"
 #include "WaxAim.h"
 #include <linux/input.h>
 #include <sstream>
@@ -149,9 +152,9 @@ int data_count,zfcz,zfc;
 float matrix[16];
 float angle;
 
-static bool show_draw_Rect = false;//方框
+static bool show_draw_Rect = true;//方框
 static bool show_draw_Bones = true;//原生骨骼(抄若辰链,驱动读)
-static bool show_draw_Line = true;//射线
+static bool show_draw_Line = false;//射线
 static bool show_draw_Camera = false;//相机
 static bool show_draw_Door = true;//门(开门进度，走 Python 层单独绘制，不依赖 getscene)
 static bool show_draw_Box = false;//盒子
@@ -162,7 +165,7 @@ static bool show_draw_Chair = false;//椅子
 static bool show_draw_Prop = false;//道具
 static bool show_draw_Genius = true;//天赋/辅助特质(走 CPython 链路，见 PyGenius.h)
 static bool show_draw_prophet = true;//预知监管者
-static bool redqueenmod = false;//红夫人模式
+static bool redqueenmod = true;//红夫人模式(默认开：只在我是红夫人、镜子瞄准/放下时才画)
 static bool copycat_mode = false;//模仿者模式：角色名换成"N号 身份"，按阵营着色(见 PySelf.h 模仿者模式那节)
 static bool waterfight_mode = false;//林中童话(娱乐模式,底层打水仗)：独立绘制玩家(动物阵营配色)+物资，见 PyWaterFight.h
 static bool show_draw_secret_mechine = true;//密码机(含破译进度/进度条/最后一台)
@@ -176,9 +179,9 @@ static bool show_window = true;  // 音量键控制：音量下=隐藏，音量�
 static bool voice = true;
 static bool inform_ghost = true; // 显示鬼魂
 static bool show_sohook = false;  // 骨骼与进度覆盖层
-static bool show_genius_tree = false;  // 监管天赋树(径向图，独立可拖动窗口)
-static bool show_crosshair = false;    // 准星(所有角色通用)，位置 = WaxAim::aim_x/aim_y
-static bool shot_hide_menu = true;     // 截图时先把主菜单藏起来
+static bool show_genius_tree = true;  // 监管天赋树(径向图，独立可拖动窗口)
+static bool show_crosshair = true;    // 准星(所有角色通用)，位置 = WaxAim::aim_x/aim_y
+static bool shot_hide_menu = false;     // 截图时先把主菜单藏起来
 // 准星位置按角色(pid)分别记：配置文件里每个角色一行 xhair=pid,x,y。换角色时自动套用；
 // 这个角色没存过就用蜡像师(pid 112)的，蜡像师也没有就用默认(游戏蜡枪标记，截图实测 2772x1280 下 (1385.5, 556.6))
 #include <map>
@@ -189,7 +192,7 @@ struct XhairCfg { float x = -1.f, y = -1.f; int style = XH_CROSS_DOT; float size
 static std::map<int, XhairCfg> g_xhair;
 static XhairCfg g_xh;                                          // 当前套用中的(位置同步在 WaxAim::aim_x/aim_y，蜡像师瞄准线用)
 static int g_xhair_pid = -2;                                   // 当前已套用的角色，-2 = 需要重新套用
-static float panel_alpha = 0.94f;      // 菜单/天赋树窗口背景不透明度(同金铲铲 ui.alpha)。0.94 = ImGui 默认 WindowBg
+static float panel_alpha = 0.78f;      // 菜单/天赋树窗口背景不透明度(同金铲铲 ui.alpha)。0.94 = ImGui 默认 WindowBg
 
 // ===== 固定信息：屏幕坐标 HUD 汇总，不依赖矩阵。每块独立开关 + 独立 X/Y/大小(size=文字像素高) =====
 //   调试阶段用菜单里的滑动条摆位置/大小，调好后把下面的初值固化即可。
@@ -200,7 +203,10 @@ static bool  fi_hunter_on = true;                                        // 监�
 static float fi_hunter_x  = 0.0f,    fi_hunter_y = 173.0f, fi_hunter_size = 30.0f;
 static bool  fi_civ_on    = true;                                        // 求生者天赋(右上横排，只在我是监管时显示)
 static float fi_civ_x     = 1894.0f, fi_civ_y    = 328.0f, fi_civ_size    = 28.0f, fi_civ_gap = 80.0f;
-static float fi_cc_x      = 40.0f,   fi_cc_y     = 320.0f, fi_cc_size     = 25.0f;   // 模仿者会议阶段的身份列表(左中)
+static float fi_cc_x      = 191.0f,  fi_cc_y     = 288.0f, fi_cc_size     = 29.0f;   // 模仿者会议阶段的身份列表(左中)
+static bool  fi_knight_on = true;                                        // 骑士对我的预测(技能/普攻/相持，只在我是监管时显示，见 PyKnight.h)
+static float fi_knight_x  = 0.0f,    fi_knight_y = 851.0f, fi_knight_size = 43.0f;   // 用户 2026-11-15 摆好的位置
+static float fi_knight_gap = 30.0f;                                      // 两段预测之间的间距(像素)
 
 // ===== 配置保存/读取：/data/IdentityV_config.txt，一行一个 key=value(# 开头是注释，可手改) =====
 // 读取时未知键忽略、缺的键保持当前值，所以加了新选项旧文件照样能读。
@@ -239,6 +245,8 @@ static const CfgItem CFG_ITEMS[] = {
     {"fi_civ_on", CFG_BOOL, &fi_civ_on},     {"fi_civ_x", CFG_FLOAT, &fi_civ_x},     {"fi_civ_y", CFG_FLOAT, &fi_civ_y},     {"fi_civ_size", CFG_FLOAT, &fi_civ_size},
     {"fi_civ_gap", CFG_FLOAT, &fi_civ_gap},
     {"fi_cc_x", CFG_FLOAT, &fi_cc_x},       {"fi_cc_y", CFG_FLOAT, &fi_cc_y},       {"fi_cc_size", CFG_FLOAT, &fi_cc_size},
+    {"fi_knight_on", CFG_BOOL, &fi_knight_on}, {"fi_knight_x", CFG_FLOAT, &fi_knight_x}, {"fi_knight_y", CFG_FLOAT, &fi_knight_y}, {"fi_knight_size", CFG_FLOAT, &fi_knight_size},
+    {"fi_knight_gap", CFG_FLOAT, &fi_knight_gap},
     // 蜡像师
     {"wax_on", CFG_BOOL, &WaxAim::enabled},      {"wax_traj", CFG_BOOL, &WaxAim::show_traj},
     {"wax_always", CFG_BOOL, &WaxAim::show_always}, {"show_crosshair", CFG_BOOL, &show_crosshair},
@@ -251,7 +259,19 @@ static const CfgItem CFG_ITEMS[] = {
     {"pallet_predict", CFG_BOOL, &AutoPallet::predict_fast},      {"pallet_predict_mps", CFG_FLOAT, &AutoPallet::fast_mps},
     {"pallet_lead_ms", CFG_INT, &AutoPallet::lead_ms},
     {"pallet_width", CFG_FLOAT, &AutoPallet::width},              {"pallet_random", CFG_BOOL, &AutoPallet::random_width},
-    {"pallet_width_lo", CFG_FLOAT, &AutoPallet::width_lo},        {"pallet_width_hi", CFG_FLOAT, &AutoPallet::width_hi},    // 窗口
+    {"pallet_width_lo", CFG_FLOAT, &AutoPallet::width_lo},        {"pallet_width_hi", CFG_FLOAT, &AutoPallet::width_hi},
+    // 自动校准
+    {"qte_enabled", CFG_BOOL, &AutoQte::enabled},                 {"qte_show_touch", CFG_BOOL, &AutoQte::show_touch_point},
+    {"qte_touch_x", CFG_FLOAT, &AutoQte::touch_x},                {"qte_touch_y", CFG_FLOAT, &AutoQte::touch_y},
+    {"qte_lead_ms", CFG_INT, &AutoQte::lead_ms},                  {"qte_time_jitter_ms", CFG_INT, &AutoQte::time_jitter_ms},
+    {"qte_hold_ms", CFG_INT, &AutoQte::hold_ms},                  {"qte_jitter_px", CFG_INT, &AutoQte::jitter_px},
+    // 作曲家修机节奏
+    {"mus_enabled", CFG_BOOL, &AutoMusician::enabled},            {"mus_show_touch", CFG_BOOL, &AutoMusician::show_touch_point},
+    {"mus_l_x", CFG_FLOAT, &AutoMusician::l_x},                   {"mus_l_y", CFG_FLOAT, &AutoMusician::l_y},
+    {"mus_r_x", CFG_FLOAT, &AutoMusician::r_x},                   {"mus_r_y", CFG_FLOAT, &AutoMusician::r_y},
+    {"mus_lead_ms", CFG_INT, &AutoMusician::lead_ms},             {"mus_time_jitter_ms", CFG_INT, &AutoMusician::time_jitter_ms},
+    {"mus_hold_ms", CFG_INT, &AutoMusician::hold_ms},             {"mus_jitter_px", CFG_INT, &AutoMusician::jitter_px},
+    // 窗口
     {"win_main_x", CFG_FLOAT, &cfg_main_x}, {"win_main_y", CFG_FLOAT, &cfg_main_y},
     {"win_tree_x", CFG_FLOAT, &cfg_tree_x}, {"win_tree_y", CFG_FLOAT, &cfg_tree_y},
     {"win_tree_w", CFG_FLOAT, &cfg_tree_w}, {"win_tree_h", CFG_FLOAT, &cfg_tree_h},
@@ -1009,10 +1029,15 @@ void read_thread(long int PD1,long int PD2,long int PD3)
     PyWaterFight::start(libbase);
     // 道具白名单(cur_world.item_mgr._uid2item)：独立线程 100ms 一轮，只在「绘制道具」开着时读
     PyItems::start(libbase);
+    PyKnight::start(libbase);
     // 蜡像师喷蜡辅助瞄准：独立线程 33ms 一轮，只在我是蜡像师时算(见 WaxAim.h)
     WaxAim::start(libbase);
     // 自动盖板：独立线程 10ms 一轮，板子列表由下面的读取循环每轮发布过去
     AutoPallet::start();
+    // 自动校准：独立线程，开着时 4ms 轮询 UIBattle.inc_flag(见 AutoQte.h)
+    AutoQte::start();
+    // 作曲家修机节奏：独立线程，开着且在修机时 3ms 轮询两条轨道(见 AutoMusician.h)
+    AutoMusician::start();
 
     while (MatrixOffset==0||ArrayaddrOffset==0)
     {
@@ -1926,8 +1951,12 @@ void Draw_Main(ImDrawList *Draw){
     PySelf::set_copycat_book(copycat_mode);        // 身份簿只在开关打开时记，见 PySelf.h
     PyWaterFight::set_enabled(waterfight_mode);    // 林中童话关着时它的线程不读内存，见 PyWaterFight.h
     PyItems::set_enabled(show_draw_Prop);          // 道具白名单同理，见 PyItems.h
+    // 骑士预测：开关开着、局内、我是监管(操控梦之信徒时 camp=236)才读
+    PyKnight::set_enabled(fi_knight_on && PyScene::in_battle() && (PySelf::camp() == 1 || PySelf::camp() == 236));
     if (libbase == 0 || read_state == 0) return;  // 数据未就绪，跳过本帧绘制
     xhair_follow_role();                           // 准星位置跟着当前角色走
+    // 夫人模式只在「我是监管且是红夫人(pid 85)」时生效；求生者那边的镜中红夫人另有绘制，不受它管
+    const bool queen_on = redqueenmod && PySelf::camp() == 1 && WaxAim::status().pid == 85;
     int char_count = 0;
 
     // ---- 自身锚点：引擎自己持有的答案。相机深度启发式兜底已停用，这是唯一来源 ----
@@ -2013,7 +2042,7 @@ void Draw_Main(ImDrawList *Draw){
     //   还在地下、老来源算不出) —— 正好补上预览→放出的衔接空窗。读不到(没放/非红夫人局)才退回老来源。
     {
         float mpx, mpz, mnx, mnz;
-        if (redqueenmod && PyProgress::mirror_plane(mpx, mpz, mnx, mnz)) {
+        if (queen_on && PyProgress::mirror_plane(mpx, mpz, mnx, mnz)) {
             mirror_line_x1 = mpx;        mirror_line_y1 = mpz;
             mirror_line_x2 = mpx - mnz;  mirror_line_y2 = mpz + mnx;   // 沿镜面方向 = 法向的垂线
             mirror = true;
@@ -2070,7 +2099,7 @@ void Draw_Main(ImDrawList *Draw){
         static float last_ml_x1 = 0, last_ml_y1 = 0, last_ml_x2 = 0, last_ml_y2 = 0;
         static int mirror_stale = 0;
         const int MIRROR_STALE_MAX = 30;   // 约 0.5s@60fps
-        if (!redqueenmod) {
+        if (!queen_on) {
             have_last_mirror = false;                     // 非红夫人模式不保留，防切回来用到陈旧镜线
         } else if (mirror) {
             have_last_mirror = true; mirror_stale = 0;    // 本帧有新镜线，刷新缓存
@@ -2173,6 +2202,21 @@ void Draw_Main(ImDrawList *Draw){
         }
     }
 
+    // 骑士对我的预测(只显示 技能/普攻/相持，预测结束就消失)。数据见 PyKnight.h
+    if (fi_knight_on && PyKnight::available()){
+        const char *kn[PyKnight::MAX_PREDS];
+        int kc = PyKnight::names_for(PySelf::self_uid(), kn, PyKnight::MAX_PREDS);
+        if (kc > 0){
+            float sz = fi_knight_size, w = 0.f;
+            for (int k = 0; k < kc; k++) w += fi_calc(sz, kn[k]).x + (k ? fi_knight_gap : 0.f);
+            float x = fi_knight_x > 0.f ? fi_knight_x : px - w/2.0f;
+            for (int k = 0; k < kc; k++){
+                fi_text(Draw, x, fi_knight_y, sz, color_green, kn[k]);
+                x += fi_calc(sz, kn[k]).x + fi_knight_gap;
+            }
+        }
+    }
+
     // 准备阶段：预知那行下面按座位号列出四个求生者的大天赋，**只在我是监管时显示**(用户要求)
     //   数据来自 g_avatar.final_genius_dict(实时；60 秒差分实测只有它跟着对面换天赋变)，座位号来自 uid2pos，见 PyGenius.h
     //   不再显示监管辅助特质(用户 2026-09-24 决定不要)；也不再看花名册 —— 大厅里那是上一局的旧数据
@@ -2218,6 +2262,31 @@ void Draw_Main(ImDrawList *Draw){
         Draw->AddLine({tp.x - 12, tp.y}, {tp.x + 12, tp.y}, ImColor(0, 255, 255, 255), 2.0f);
         Draw->AddLine({tp.x, tp.y - 12}, {tp.x, tp.y + 12}, ImColor(0, 255, 255, 255), 2.0f);
         Draw->AddText({tp.x + 46, tp.y - 12}, ImColor(0, 255, 255, 255), T("盖板触摸点", "Pallet tap point"));
+    }
+    // 自动校准的触摸点：对准校准按钮(品红，和盖板的青色区分)
+    if (AutoQte::show_touch_point) {
+        ImVec2 tp(AutoQte::touch_x, AutoQte::touch_y);
+        ImColor c(255, 0, 255, 255);
+        Draw->AddCircle(tp, 40.0f, c, 32, 3.0f);
+        if (AutoQte::jitter_px > 0)
+            Draw->AddCircle(tp, (float)AutoQte::jitter_px, ImColor(255, 255, 0, 255), 24, 2.0f);
+        Draw->AddLine({tp.x - 12, tp.y}, {tp.x + 12, tp.y}, c, 2.0f);
+        Draw->AddLine({tp.x, tp.y - 12}, {tp.x, tp.y + 12}, c, 2.0f);
+        Draw->AddText({tp.x + 46, tp.y + 8}, c, T("校准触摸点", "QTE tap point"));
+    }
+    // 作曲家两个修机键的触摸点(橙色)
+    if (AutoMusician::show_touch_point) {
+        ImColor c(255, 140, 0, 255);
+        const float xs[2] = {AutoMusician::l_x, AutoMusician::r_x}, ys[2] = {AutoMusician::l_y, AutoMusician::r_y};
+        for (int i = 0; i < 2; i++) {
+            ImVec2 tp(xs[i], ys[i]);
+            Draw->AddCircle(tp, 36.0f, c, 32, 3.0f);
+            if (AutoMusician::jitter_px > 0)
+                Draw->AddCircle(tp, (float)AutoMusician::jitter_px, ImColor(255, 255, 0, 255), 24, 2.0f);
+            Draw->AddLine({tp.x - 12, tp.y}, {tp.x + 12, tp.y}, c, 2.0f);
+            Draw->AddLine({tp.x, tp.y - 12}, {tp.x, tp.y + 12}, c, 2.0f);
+            Draw->AddText({tp.x - 20, tp.y - 64}, c, i == 0 ? T("作曲家左", "Composer L") : T("作曲家右", "Composer R"));
+        }
     }
 
     // ===== 固定信息(屏幕坐标 HUD 汇总，增量叠加，不改上面任何现有逻辑) =====
@@ -2915,7 +2984,7 @@ void Draw_Main(ImDrawList *Draw){
                 Z.X = D.X; Z.Z = D.Z; Z.Y = D.Y;
             }
             // 我是求生者时自己的镜像也要画(红夫人镜子里的我)。lambda 里自带 camp==2 / 450 判断，监管自身不会画
-            if (mirror && redqueenmod && !(D.X==0 && D.Y==0) && D.Z>-300) draw_mirror_image(i);
+            if (mirror && queen_on && !(D.X==0 && D.Y==0) && D.Z>-300) draw_mirror_image(i);
             continue; // 不管有效无效, 自身都不需要再走下面的常规实体流程
         }
 
@@ -3287,7 +3356,7 @@ void Draw_Main(ImDrawList *Draw){
     	}//判断w    
 	     
 	                
-	    if (mirror&&redqueenmod) draw_mirror_image(i);   // 红夫人镜像(见循环前的 draw_mirror_image)
+	    if (mirror&&queen_on) draw_mirror_image(i);   // 红夫人镜像(见循环前的 draw_mirror_image)
     }
 
     // ---- 红夫人镜像(镜中红夫人 MaryMirrorImageUnit，键 247)：我是求生者时画，不看「夫人模式」(2026-11-05 用户要求) ----
@@ -3584,6 +3653,29 @@ static void shot_tick()
     }
 }
 
+// 折叠框里的二级折叠：标题后面跟状态(关闭/待命 灰、生效中 绿)。
+// auto_open 时生效状态一变就跟着展开/收起(进对应角色的局自动展开)，其余时间听手动的。返回 true 时调用方画内容并 TreePop()
+static bool sub_fold(const char *cn, const char *en, const char *id, bool on, bool active, bool auto_open)
+{
+    struct Last { const char *id; int v; };
+    static Last last[16];
+    static int last_n = 0;
+    int cur = active ? 1 : 0, k = 0;
+    while (k < last_n && strcmp(last[k].id, id) != 0) k++;
+    if (k == last_n && last_n < 16) { last[last_n++] = {id, -1}; }
+    if (auto_open && k < 16 && last[k].v != cur) ImGui::SetNextItemOpen(active, ImGuiCond_Always);
+    if (k < 16) last[k].v = cur;
+
+    char label[96];
+    snprintf(label, sizeof(label), "%s###%s", g_english ? en : cn, id);
+    bool open = ImGui::TreeNode(label);
+    ImGui::SameLine();
+    if (!on)         ImGui::TextDisabled("%s", T("关闭", "off"));
+    else if (active) ImGui::TextColored(ImVec4(0.4f, 1, 0.4f, 1), "%s", T("生效中", "active"));
+    else             ImGui::TextDisabled("%s", T("待命", "standby"));
+    return open;
+}
+
 // 选项后面的灰色 (?)：手指按住显示说明(触屏松手后提示会留着，点别处消失)
 static void help_marker(const char *zh, const char *en)
 {
@@ -3658,6 +3750,35 @@ void Layout_tick_UI(bool *main_thread_flag) {
         ImGui::TextDisabled("|");
         ImGui::SameLine();
         ImTextT("%.0f FPS  内存 %.0f MB", "%.0f FPS  Mem %.0f MB", ImGui::GetIO().Framerate, mem.total_kb() / 1024.0f);
+
+        // 本局识别：阶段 阵营 角色 模式(空格分隔，字库里没有间隔点)。只拼读到的部分，判错了一眼能看出来
+        {
+            char row[192];
+            int len = 0;
+            static const char *PH_CN[] = {"阶段未知", "大厅", "准备", "局内"};
+            static const char *PH_EN[] = {"phase ?", "lobby", "prep", "in match"};
+            len += snprintf(row + len, sizeof(row) - len, "%s", (g_english ? PH_EN : PH_CN)[(int)PyScene::phase() & 3]);
+            if (PyScene::in_battle()) {
+                int cp = PySelf::camp();
+                const char *camp_s = cp == 2 ? T("求生者", "Survivor") : (cp == 1 || cp == 236) ? T("监管", "Hunter") : nullptr;
+                if (camp_s) len += snprintf(row + len, sizeof(row) - len, "  %s", camp_s);
+                // 角色名：自身锚点在 data[] 里的翻译名；没有就按 pid 查监管表，再没有写 pid
+                const char *role = nullptr;
+                uint64_t self_obj = 0;
+                if (PySelf::anchor(self_obj))
+                    for (int i = 0; i < data_count; i++) if (data[i].obj == self_obj && data[i].str[0]) { role = data[i].str; break; }
+                int rpid = WaxAim::status().pid;
+                if (!role && rpid > 0) role = getboss_by_pid(rpid);
+                if (role) len += snprintf(row + len, sizeof(row) - len, "  %s", role);
+                else if (rpid > 0) len += snprintf(row + len, sizeof(row) - len, "  pid %d", rpid);
+                const char *mode = PySelf::copycat_active() ? T("模仿者", "Copycat")
+                                 : (waterfight_mode && PyWaterFight::available()) ? T("林中童话", "Forest's Fable")
+                                 : PySelf::butcher_count() >= 2 ? T("联合狩猎", "Joint Hunt")
+                                 : T("普通局", "Normal");
+                snprintf(row + len, sizeof(row) - len, "  %s", mode);
+            }
+            ImGui::TextUnformatted(row);
+        }
 
         // 语言切换：点击在 中文/英文 间切换(g_english 定义在 Name.h)。
         // 按钮文字显示「点击后会切到的语言」：当前中文时显示 English,当前英文时显示 中文。
@@ -3741,10 +3862,7 @@ void Layout_tick_UI(bool *main_thread_flag) {
 
                 ImGui::TableNextColumn();
                 ImGui::Checkbox(T("绘制道具", "Draw Items"), &show_draw_Prop);
-                ImGui::TableNextColumn();
-                ImGui::Checkbox(T("夫人模式", "Queen Mode"), &redqueenmod);
-                help_marker("红夫人瞄准或放下镜子时，画出求生者在镜中的位置(方框+骨骼)",
-                            "When Bloody Queen aims or places a mirror, draw survivors' mirror images (box + bones)");
+                // 「夫人模式」已移到「角色专属」折叠框
 
                 ImGui::TableNextColumn();
                 ImGui::Checkbox(T("绘制调试", "Draw Debug"), &Debugging);
@@ -3837,6 +3955,14 @@ void Layout_tick_UI(bool *main_thread_flag) {
                 ImGui::SliderFloat(T("求 间距##fi_civ", "Svr gap##fi_civ"), &fi_civ_gap, 0.0f, 300.0f, "%.0f");
             }
 
+            ImGui::Checkbox(T("骑士预测##fi_knight", "Knight prediction##fi_knight"), &fi_knight_on);
+            if (fi_knight_on) {
+                ImGui::SliderFloat(T("骑 X(0=居中)##fi_knight", "Kni X(0=center)##fi_knight"), &fi_knight_x, 0.0f, mw, "%.0f");
+                ImGui::SliderFloat(T("骑 Y##fi_knight", "Kni Y##fi_knight"), &fi_knight_y, 0.0f, mh, "%.0f");
+                ImGui::SliderFloat(T("骑 大小##fi_knight", "Kni size##fi_knight"), &fi_knight_size, 10.0f, 60.0f, "%.0f");
+                ImGui::SliderFloat(T("骑 间距##fi_knight", "Kni gap##fi_knight"), &fi_knight_gap, 0.0f, 300.0f, "%.0f");
+            }
+
             // 模仿者会议阶段的身份列表(开会时代替 in-world 绘制，要开「模仿者」)
             ImGui::TextUnformatted(T("模仿者会议列表", "Copycat meeting list"));
             ImGui::SliderFloat(T("会 X##fi_cc", "Mtg X##fi_cc"), &fi_cc_x, 0.0f, mw, "%.0f");
@@ -3845,8 +3971,12 @@ void Layout_tick_UI(bool *main_thread_flag) {
         }
 
 
-        // 蜡像师喷蜡辅助瞄准：把游戏的蜡枪瞄准标记抬进天空中的粗线里 = 能附着(见 WaxAim.h)
-        if (ImGui::CollapsingHeader(T("蜡像师###wax", "Waxwork###wax"))) {
+        // 角色专属：蜡像师 / 红夫人 / 作曲家。三个都自己判断场合(不是对应角色或对局时什么都不做)，默认全开
+        if (ImGui::CollapsingHeader(T("角色专属###role", "Role-specific###role"))) {
+            const int  my_pid  = WaxAim::status().pid, my_camp = PySelf::camp();
+            const bool battle  = PyScene::in_battle();
+            // 蜡像师喷蜡辅助瞄准：把游戏的蜡枪瞄准标记抬进天空中的粗线里 = 能附着(见 WaxAim.h)
+            if (sub_fold("蜡像师", "Waxwork", "sf_wax", WaxAim::enabled, WaxAim::status().is_wax, true)) {
             const ImVec4 C_OK(0.4f, 1, 0.4f, 1), C_BAD(1, 0.45f, 0.45f, 1), C_DIM(0.65f, 0.65f, 0.65f, 1);
             ImGui::Checkbox(T("开启##wax_on", "Enable##wax_on"), &WaxAim::enabled);
             ImGui::SameLine();
@@ -3858,6 +3988,51 @@ void Layout_tick_UI(bool *main_thread_flag) {
             if (st.is_wax) ImGui::TextColored(col_ok ? C_OK : C_BAD, "%s", col_ok ? T("蜡像师：已识别，遮挡已加载", "Waxwork detected, occlusion loaded")
                                                                                    : T("蜡像师：已识别，本图没有遮挡文件", "Waxwork detected, no occlusion file for this map"));
             else           ImGui::TextColored(C_DIM, "%s", T("当前不是蜡像师", "Not playing Waxwork"));
+            ImGui::TreePop();
+            }
+
+            // 红夫人镜像：我是红夫人(监管)时，镜子瞄准/放下期间才画
+            if (sub_fold("红夫人", "Bloody Queen", "sf_queen", redqueenmod,
+                         redqueenmod && my_camp == 1 && my_pid == 85, true)) {
+            ImGui::Checkbox(T("夫人模式", "Queen Mode"), &redqueenmod);
+            help_marker("我是红夫人时，瞄准或放下镜子期间画出求生者在镜中的位置(方框+骨骼)",
+                        "When you play Bloody Queen and aim or place a mirror, draw survivors' mirror images (box + bones)");
+            ImGui::TreePop();
+            }
+
+            // 作曲家修机节奏：按游戏判定点(begin_time + 时长 − 判定线偏移)点左右两个修机键，不管技能轨道
+            if (sub_fold("作曲家修机", "Composer Fix", "sf_mus", AutoMusician::enabled,
+                         AutoMusician::enabled && battle && my_camp == 2 && my_pid == 114, true)) {
+            if (ImGui::BeginTable("##mus_tbl", 2, ImGuiTableFlags_SizingFixedFit)) {
+                ImGui::TableNextColumn();
+                ImGui::Checkbox(T("开启##auto_mus", "Enable##auto_mus"), &AutoMusician::enabled);
+                ImGui::TableNextColumn();
+                ImGui::Checkbox(T("显示触摸点##mus_tp", "Show Touch Points##mus_tp"), &AutoMusician::show_touch_point);
+                ImGui::TableNextColumn();
+                if (ImGui::Button(T("测试左键##mus_tl", "Test L##mus_tl"))) AutoMusician::request_test_tap(0);
+                ImGui::TableNextColumn();
+                if (ImGui::Button(T("测试右键##mus_tr", "Test R##mus_tr"))) AutoMusician::request_test_tap(1);
+                ImGui::TableNextColumn();
+                ImGui::Checkbox(T("只记日志不点##mus_dry", "Log only##mus_dry"), &AutoMusician::dry_run);
+                ImGui::EndTable();
+            }
+            ImGui::SliderFloat(T("左键 X##mus_lx", "L X##mus_lx"), &AutoMusician::l_x, 0.0f, (float)displayInfo.width, "%.0f");
+            ImGui::SliderFloat(T("左键 Y##mus_ly", "L Y##mus_ly"), &AutoMusician::l_y, 0.0f, (float)displayInfo.height, "%.0f");
+            ImGui::SliderFloat(T("右键 X##mus_rx", "R X##mus_rx"), &AutoMusician::r_x, 0.0f, (float)displayInfo.width, "%.0f");
+            ImGui::SliderFloat(T("右键 Y##mus_ry", "R Y##mus_ry"), &AutoMusician::r_y, 0.0f, (float)displayInfo.height, "%.0f");
+            ImGui::SliderInt(T("提前量(ms)##mus_lead", "Lead (ms)##mus_lead"), &AutoMusician::lead_ms, -50, 100);
+            help_marker("点击比判定点早多少。日志里「相对判定点」是我们按下的时刻，游戏读到还要再晚这么多",
+                        "How early to tap before the judge point");
+            ImGui::SliderInt(T("时机随机(±ms)##mus_tj", "Timing jitter (ms)##mus_tj"), &AutoMusician::time_jitter_ms, 0, 30);
+            ImGui::SliderInt(T("按住(ms)##mus_hold", "Hold (ms)##mus_hold"), &AutoMusician::hold_ms, 8, 60);
+            ImGui::SliderInt(T("位置随机(px)##mus_jp", "Jitter (px)##mus_jp"), &AutoMusician::jitter_px, 0, 40);
+            ImTextT("状态: %s", "Status: %s", AutoMusician::status_text());
+            ImTextT("参数: %s", "Params: %s", AutoMusician::params_text());
+            ImTextT("点击%d 补打%d 错过%d", "taps%d retaps%d missed%d", AutoMusician::g_taps.load(),
+                    AutoMusician::g_retap.load(), AutoMusician::g_missed.load());
+            ImTextT("上次: %s", "Last: %s", AutoMusician::last_result());
+            ImGui::TreePop();
+            }
         }
 
         // 模仿者模式：开关 + 身份簿。开着时名字换成"N号 身份"、不画射线；读到的身份记在簿子里，
@@ -3898,7 +4073,11 @@ void Layout_tick_UI(bool *main_thread_flag) {
         }
 
         // 自动盖板(若辰同款判定)：监管走进板子判定区、自己站在板边、两人相距 ≤3 米时点一下交互键
-        if (ImGui::CollapsingHeader(T("自动盖板###pallet", "Auto Pallet###pallet"))) {
+        // 自动盖板 + 自动校准(都是求生者局内的自动点击)
+        // 两节都是求生者局内才生效；不自动展开(每局求生者都会命中，自动展开会把这一大块弹开)
+        if (ImGui::CollapsingHeader(T("自动盖板 / 校准###pallet", "Auto Pallet / QTE###pallet"))) {
+            const bool svr_battle = PyScene::in_battle() && PySelf::camp() == 2;
+            if (sub_fold("自动盖板", "Auto Pallet", "sf_pallet", AutoPallet::enabled, AutoPallet::enabled && svr_battle, false)) {
             if (ImGui::BeginTable("##pallet_tbl", 2, ImGuiTableFlags_SizingFixedFit)) {
                 ImGui::TableNextColumn();
                 ImGui::Checkbox(T("开启##auto_pallet", "Enable##auto_pallet"), &AutoPallet::enabled);   // 不能跟折叠框同名，同名 ID 冲突会点不动
@@ -3960,6 +4139,36 @@ void Layout_tick_UI(bool *main_thread_flag) {
             ImTextT("点击 成功%d 失败%d  确认放下%d", "Tap ok%d fail%d confirmed%d",
                     AutoPallet::g_tap_ok.load(), AutoPallet::g_tap_fail.load(), AutoPallet::g_confirmed.load());
             ImTextT("上次: %s", "Last: %s", AutoPallet::last_result());
+            ImGui::TreePop();
+            }
+
+            // 自动校准：按游戏自己的出题参数算指针到完美区中心的时刻，提前「提前量」点校准按钮
+            if (sub_fold("自动校准", "Auto QTE", "sf_qte", AutoQte::enabled, AutoQte::enabled && svr_battle, false)) {
+            if (ImGui::BeginTable("##qte_tbl", 2, ImGuiTableFlags_SizingFixedFit)) {
+                ImGui::TableNextColumn();
+                ImGui::Checkbox(T("开启##auto_qte", "Enable##auto_qte"), &AutoQte::enabled);
+                ImGui::TableNextColumn();
+                ImGui::Checkbox(T("显示触摸点##qte_tp", "Show Touch Point##qte_tp"), &AutoQte::show_touch_point);
+                ImGui::TableNextColumn();
+                if (ImGui::Button(T("测试点击##qte_test", "Test Tap##qte_test"))) AutoQte::request_test_tap();
+                help_marker("修机出校准时按，指针停下说明触摸点对准了校准按钮",
+                            "Press during a QTE; if the needle stops, the touch point is on the QTE button");
+                ImGui::EndTable();
+            }
+            ImGui::SliderFloat(T("触摸点 X##qte_x", "Touch X##qte_x"), &AutoQte::touch_x, 0.0f, (float)displayInfo.width, "%.0f");
+            ImGui::SliderFloat(T("触摸点 Y##qte_y", "Touch Y##qte_y"), &AutoQte::touch_y, 0.0f, (float)displayInfo.height, "%.0f");
+            ImGui::SliderInt(T("提前量(ms)##qte_lead", "Lead (ms)##qte_lead"), &AutoQte::lead_ms, 0, 150);
+            help_marker("点击比指针到完美区中心早多少。总是偏晚(过了完美区)就加大，偏早就减小；完美窗口约 ±50ms",
+                        "How early to tap before the needle reaches the perfect zone center. Late -> increase, early -> decrease; window is about +-50ms");
+            ImGui::SliderInt(T("时机随机(±ms)##qte_tj", "Timing jitter (ms)##qte_tj"), &AutoQte::time_jitter_ms, 0, 40);
+            ImGui::SliderInt(T("按住(ms)##qte_hold", "Hold (ms)##qte_hold"), &AutoQte::hold_ms, 10, 120);
+            ImGui::SliderInt(T("位置随机(px)##qte_jp", "Jitter (px)##qte_jp"), &AutoQte::jitter_px, 0, 60);
+            ImTextT("状态: %s", "Status: %s", AutoQte::status_text());
+            ImTextT("命中%d 失败%d 跳过%d", "hit%d fail%d skip%d",
+                    AutoQte::g_hit.load(), AutoQte::g_fail.load(), AutoQte::g_skip.load());
+            ImTextT("上次: %s", "Last: %s", AutoQte::last_result());
+            ImGui::TreePop();
+            }
         }
 
         // 发布版本: 注入功能已停用

@@ -71,8 +71,8 @@ extern float dist_scale;   // draw_Gui.cpp：1 米 = 11.886 游戏单位
 namespace AutoPallet {
 
 // ---- 界面配置(渲染线程写、盖板线程读；跟 show_draw_* 一样直接共享，单个 bool/int/float 的撕裂无害) ----
-static bool  enabled = false;
-static float width = 12.0f;                // 固定模式的触发宽度(游戏单位)
+static bool  enabled = true;
+static float width = 10.8f;                // 固定模式的触发宽度(游戏单位)
 static bool  random_width = false;         // 随机模式：每次点完在下限~上限之间重抽
 static float width_lo = 8.0f, width_hi = 12.0f;
 static const float WIDTH_MIN = 5.0f, WIDTH_MAX = 15.0f;
@@ -88,8 +88,8 @@ static const int64_t ALPHA_PUT_PANEL = 3;
 // 但要砸中需 0 ≤ L − 提前量 ≤ 穿区时间(区深/速度)：越快容错越小。点早了不要紧——游戏倒板后 1.1s 内一直检测，
 // 冲刺中的监管照样冲进来；点晚了就穿过去了。所以宁大勿小，默认 350ms。
 static bool  predict_fast = true;
-static float fast_mps = 5.9f;              // 预判速度门槛(米/秒) = 4.71 × 1.25
-static int   lead_ms = 350;
+static float fast_mps = 7.1f;              // 预判速度门槛(米/秒) = 4.71 × 1.25
+static int   lead_ms = 335;
 static float touch_x = 2418.f, touch_y = 1056.f;   // 屏幕像素(横屏方向)，就是游戏里交互(放板)按钮的位置。用户在 3200x1440 上对准的值
 static bool  show_touch_point = false;
 static bool  show_range = false;           // 把附近板子的判定矩形画在地上
