@@ -404,7 +404,22 @@ static bool try_refresh()
     return true;
 }
 
+static void refresh_once_inner();
+// 可用状态一变就记一行。Python 不可用时没有写死偏移兜底(2026-11-18 删了 is_real_generator / +0x6D 镜中红夫人)，
+// 密码机标记和红夫人镜像就不画 —— 原因看这行日志
 static void refresh_once()
+{
+    static int last = -1;
+    refresh_once_inner();
+    const int now = g_available ? 1 : 0;
+    if (now != last) {
+        printf("[密码机进度] Python %s：%s%s\n", now ? "可用" : "不可用", g_status,
+               now ? "" : "（不画密码机标记和红夫人镜像）");
+        last = now;
+    }
+}
+
+static void refresh_once_inner()
 {
     if (g_libbase == 0) return;
     if (!PyRoot::ensure()) {
@@ -460,7 +475,7 @@ static inline bool is_decoded(float progress) { return progress >= 99.95f; }
 // 绘制侧自行按 is_decoded() 过滤掉修完的，使其从面板消失。
 static inline int gen_total() { return g_available ? g_count[g_active] : 0; }
 
-// 场景内密码机标记直接遍历这里画(同大门)，不走 data[] 和场景侧判据 is_real_generator：
+// 场景内密码机标记直接遍历这里画(同大门)，不走 data[]；Python 不可用时不画(没有写死偏移兜底)：
 // 约瑟夫局每进出一次镜世界，游戏都会对密码机 set_visible → lod_callback 切网格(GeneratorUnit.set_visible，
 // 2026-10-30 反编译)，普通局从不发生；几次之后场景侧判据就挡掉了真实密码机(HUD 走这里所以一直正常)
 static bool get_gen_entry(int i, Entry &out)

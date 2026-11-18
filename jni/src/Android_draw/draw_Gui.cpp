@@ -31,8 +31,6 @@ std::string filter_class_name;
 // 类名缓存：对象地址 -> {第一跳指针(校验用), 类名}。只有读线程碰它，不用加锁。见读取循环里的说明
 static std::unordered_map<uintptr_t, std::pair<uint64_t, std::string>> g_name_cache;
 float dist_scale=11.886;
-float redqueen_x, redqueen_y, redqueen_z;
-float redqueen_mirror_x, redqueen_mirror_y, redqueen_mirror_z;
 typedef struct {
     uintptr_t obj;
     uintptr_t objcoor;
@@ -147,7 +145,7 @@ void calculate_line_reflection(float x1, float y1, float x2, float y2, float xs,
 uintptr_t libbase;
 uintptr_t Arrayaddr, Count, Matrix;
 uintptr_t cur_obj,self_obj,self_camp,namezfcz,namezfc;
-uintptr_t redqueen_obj,redqueen_mirror_obj,mirror_obj,mirror_preview_obj;
+uintptr_t mirror_obj,mirror_preview_obj;
 float mirror_line_x1, mirror_line_y1, mirror_line_x2, mirror_line_y2;   // 本帧镜面在水平面上的直线(两点)，mirror==true 时有效
 int data_count,zfcz,zfc;
 float matrix[16];
@@ -260,7 +258,7 @@ static const CfgItem CFG_ITEMS[] = {
     {"pallet_touch_y", CFG_FLOAT, &AutoPallet::touch_y},          {"pallet_hold_ms", CFG_INT, &AutoPallet::hold_ms},
     {"pallet_jitter_px", CFG_INT, &AutoPallet::jitter_px},        {"pallet_jitter_ms", CFG_INT, &AutoPallet::jitter_ms},
     {"pallet_predict", CFG_BOOL, &AutoPallet::predict_fast},      {"pallet_predict_mps", CFG_FLOAT, &AutoPallet::fast_mps},
-    {"pallet_lead_ms", CFG_INT, &AutoPallet::lead_ms},            {"pallet_state_py2", CFG_BOOL, &AutoPallet::state_from_py},
+    {"pallet_lead_ms", CFG_INT, &AutoPallet::lead_ms},
     {"pallet_width", CFG_FLOAT, &AutoPallet::width},              {"pallet_random", CFG_BOOL, &AutoPallet::random_width},
     {"pallet_width_lo", CFG_FLOAT, &AutoPallet::width_lo},        {"pallet_width_hi", CFG_FLOAT, &AutoPallet::width_hi},
     // 自动校准
@@ -1590,7 +1588,7 @@ void read_thread(long int PD1,long int PD2,long int PD3)
         // 原来是"每轮先把全局清零、扫描中途再赋值"，绘制线程撞进这段(约1ms)就会读到 0，
         // 表现是红夫人模式下镜线约每分钟消失一帧。收在局部里，全局永远要么是上一轮的值、要么是新值。
         // 清零的本意(防跨局残留)仍然保留：局部变量每轮从 0 开始，发布时整体覆盖。
-        uintptr_t rq_local = 0, rq_mirror_local = 0, mirror_local = 0, mirror_preview_local = 0;
+        uintptr_t mirror_local = 0, mirror_preview_local = 0;
         char prophet_local[sizeof(prophet_text)];
         prophet_local[0] = 0;
         // 自动盖板用的板子(类名含 woodplane)。getscene() 不认板子、它们进不了 data[]，所以单独收
@@ -1791,24 +1789,8 @@ void read_thread(long int PD1,long int PD2,long int PD3)
 			}
 			else if (diag_body) body_note(cur_obj, 5, 0);
     			
-			//红夫人模式：本体和镜中红夫人的类名都是 redqueen.gim，只能靠对象字段区分。
-			// 2026-09-22 热更后旧判据失效：镜中红夫人的 +0x70 不再是 65150(鬼魂)，也在地面上，
-			// 于是被当成本体，镜面算错，求生者镜像跟着红夫人跑。
-			// 现在用 +0x6D 实体种类位(实测，镜子放出状态)：
-			//   本体       0x50 = 0x40(角色实体) | 0x10
-			//   镜中红夫人 0x90 = 0x80(不占玩家槽位的角色) | 0x10
-			// 整字节会跳变(见过 0x50->0xD0)，但 0x40 位稳定，所以只看位不看整字节。
-			// 镜面 = 本体与镜中红夫人连线的垂直平分线，已用 Python 侧 MaryMirrorUnit.position/direction 验证。
-			// 镜子没放出时镜中红夫人停在 y≈-1000，下面坐标读取处的 Z>=-300 会让 mirror=false。
 			if (pd1==450){
 			    uintptr_t coorPtr = SceneLayout::coor(cur_obj);
-			    if (strstr(filter_class_name.c_str(), "boss") != NULL && strstr(filter_class_name.c_str(), "redqueen") != NULL && strstr(filter_class_name.c_str(), "mirror") == NULL
-			        && getFloat(coorPtr + 0xa0) != 0 && getFloat(coorPtr + 0xa8) != 0) {
-			        uint8_t kind = 0;
-			        vm_readv(cur_obj + 0x6D, &kind, 1);
-			        if (kind & 0x40)      rq_local = cur_obj;       // 本体
-			        else if (kind & 0x80) rq_mirror_local = cur_obj;   // 镜中红夫人
-			    }
     			if (strstr(filter_class_name.c_str(), "boss") != NULL && strstr(filter_class_name.c_str(), "mirror") != NULL
     			    && getFloat(coorPtr + 0xa0) != 0 && getFloat(coorPtr + 0xa8) != 0)
     			{
@@ -1847,8 +1829,6 @@ void read_thread(long int PD1,long int PD2,long int PD3)
         }
         // 本轮结果一次性发布。prophet_local 为空(这轮没扫到监管)时保留上一轮的文本，
         // 跟原来"prophet_text 从不清零"的行为一致
-        redqueen_obj        = rq_local;
-        redqueen_mirror_obj = rq_mirror_local;
         mirror_obj          = mirror_local;
         mirror_preview_obj  = mirror_preview_local;
         if (show_draw_prophet && room_pid_ok) {
@@ -2089,13 +2069,6 @@ static void DrawGeniusTree(ImDrawList *dl, ImVec2 center, float scale, const PyG
     }
 }
 
-static inline bool is_real_generator(uintptr_t obj)
-{
-    // 活跃位 + 一个密码机专用的辅助值。单用任何一个都不够：
-    //   只判 +0x1a0 -> 未激活的候选机器该值恰好也可能是 500
-    //   只判活跃位  -> 会混进一个位于原点(0,0,0)的占位对象
-    return getFloat(obj + 0x1a0) == 500.0f && getDword(obj + 0x240) == 2;
-}
 
 // ---- VP 矩阵校验(指针范围 + 16 个值全部有限) ----
 // 本机用户态指针都在 0x77xx/0x79xx 段，与启动扫描用的范围一致
@@ -2491,49 +2464,20 @@ void Draw_Main(ImDrawList *Draw){
     const bool matrix_usable = g_matrix_stale <= MATRIX_STALE_MAX;
     
     // ---- 红夫人镜面：两个来源，先放下的镜子，其次准备阶段的预览镜子 ----
-    // (1) 镜子已放下：本体与镜中红夫人连线的垂直平分线(已用 Python 侧 MaryMirrorUnit 验证)。
-    //     镜子没放时镜中红夫人停在 y≈-1000/-2000，Z>=-300 挡掉。
+    // (1) 镜子已放下：Python MaryMirrorUnit(246) 的镜面点 + 法向。
     // (2) 准备放镜(SkillMaryPlaceMirrorPrepare)：镜中红夫人还在地下，但预览镜子已经可见。
     //     预览镜子的 objcoor 是 3x3 旋转(+0x78 起、每行 12 字节) + 位置(+0xa0)：
     //       +0x90/+0x98 = 局部 Z 轴 = 投掷方向 = 镜面法向(与 Python rtc_model.world_transformation 第 3 行一致)
     //     可见位 +0x73 只在准备阶段为 1。
     mirror = false;
     // 来源1(最优先): Python MaryMirrorUnit(246) 的权威镜面点 + 法向(2026-10-18 probe2 实测布局/时机)。
-    //   放下即可用、放下后平面固定不抖；且比下面"本体+247 垂直平分线"早一帧(那一帧 247 镜中红夫人
-    //   还在地下、老来源算不出) —— 正好补上预览→放出的衔接空窗。读不到(没放/非红夫人局)才退回老来源。
+    //   放下即可用、放下后平面固定不抖；且比"本体+247 垂直平分线"(老来源，11-18 删)早一帧
+    //   (那一帧 247 镜中红夫人还在地下) —— 正好补上预览→放出的衔接空窗。读不到就没有镜面(不回退写死偏移)。
     {
         float mpx, mpz, mnx, mnz;
         if (queen_on && PyProgress::mirror_plane(mpx, mpz, mnx, mnz)) {
             mirror_line_x1 = mpx;        mirror_line_y1 = mpz;
             mirror_line_x2 = mpx - mnz;  mirror_line_y2 = mpz + mnx;   // 沿镜面方向 = 法向的垂线
-            mirror = true;
-        }
-    }
-    bool body_valid = false, mirror_valid = false;
-    if (redqueen_obj != 0) {
-        uintptr_t redqueen_coor = SceneLayout::coor(redqueen_obj);
-        if (redqueen_coor != 0) {
-            redqueen_x = getFloat(redqueen_coor + 0xa0);
-            redqueen_z = getFloat(redqueen_coor + 0xa4);
-            redqueen_y = getFloat(redqueen_coor + 0xa8);
-            body_valid = redqueen_z >= -300 && redqueen_x != 0 && redqueen_y != 0;
-        }
-    }
-    if (redqueen_mirror_obj != 0) {
-        uintptr_t mirror_coor = SceneLayout::coor(redqueen_mirror_obj);
-        if (mirror_coor != 0) {
-            redqueen_mirror_x = getFloat(mirror_coor + 0xa0);
-            redqueen_mirror_z = getFloat(mirror_coor + 0xa4);
-            redqueen_mirror_y = getFloat(mirror_coor + 0xa8);
-            mirror_valid = redqueen_mirror_z >= -300 && redqueen_mirror_x != 0 && redqueen_mirror_y != 0;
-        }
-    }
-    if (!mirror && body_valid && mirror_valid) {   // 来源2(兜底): 本体+247 垂直平分线。246 没给出时才用
-        float mx = (redqueen_x + redqueen_mirror_x) / 2.0f, my = (redqueen_y + redqueen_mirror_y) / 2.0f;
-        float dx = redqueen_mirror_x - redqueen_x,      dy = redqueen_mirror_y - redqueen_y;   // 法向
-        if (dx * dx + dy * dy > 1e-4f) {
-            mirror_line_x1 = mx;      mirror_line_y1 = my;
-            mirror_line_x2 = mx - dy; mirror_line_y2 = my + dx;                              // 沿镜面方向
             mirror = true;
         }
     }
@@ -2981,7 +2925,7 @@ void Draw_Main(ImDrawList *Draw){
     if (matrix_usable) draw_wax_aim(Draw);   // 蜡像师喷蜡瞄准线/落点(不是蜡像师时只更新视线朝向)
     if (show_crosshair) draw_crosshair(Draw);
 
-    // ---- 密码机破译进度：按 Python 侧真实世界列表画(同大门)，不走 data[] 和 is_real_generator ----
+    // ---- 密码机破译进度：按 Python 侧真实世界列表画(同大门)，不走 data[]，Python 不可用时不画 ----
     // 约瑟夫局每进出一次镜世界，游戏对密码机 set_visible → lod_callback 切网格，几次之后场景侧判据会挡掉真实密码机，
     // 场景内标记消失而 HUD 正常(2026-10-30)。镜像密码机在 PyProgress 里就没收，这里也就不会画。
     // 坐标优先读场景对象(每帧实时)，没有场景对象时用 position。PyProgress 不可用时实体循环里的老分支兜底
@@ -3420,9 +3364,8 @@ void Draw_Main(ImDrawList *Draw){
     const bool     diag_busy0 = g_scan_busy.load();
     const uint32_t diag_gen0  = g_scan_gen.load();
     const int      diag_count0 = data_count;
-    // 镜中红夫人：优先 Python 侧 247 单位的 model+0x20，读不到才用读线程按 +0x6D 位认的那个
+    // 镜中红夫人：只认 Python 侧 247 单位的 model+0x20(不回退 +0x6D)
     uint64_t mirror_img = PyProgress::mirror_image_obj();
-    if (mirror_img == 0) mirror_img = redqueen_mirror_obj;
 
     // 疯眼控制台第一层地图开着时：循环里收求生者(场景坐标 + 名字)，循环后画到地图上(见 PyMadEye.h)
     const PyMadEye::MapState mad_ms = PyMadEye::state();
@@ -3609,24 +3552,7 @@ void Draw_Main(ImDrawList *Draw){
     		    }
 
     	    else if (strstr(data[i].class_name, "sender") != NULL){
-    	        // 兜底：PyProgress 可用时密码机在实体循环前按 Python 侧列表画(见那里)，这里只在它不可用时走。
-    	        // 判据见上面 is_real_generator() 的注释。
-    	        if (show_draw_secret_mechine && !PyProgress::available() && is_real_generator(data[i].obj)){
-    	            // 走到这里说明 Python 层不可用，拿不到进度，只画 "[密码机] X.X 米"。
-    	            // (原来这里调 PyProgress::lookup 配进度，但它在不可用时恒返回 false，是死代码，2026-11-04 删)
-    	            std::ostringstream oss;
-    	            oss << std::fixed << std::setprecision(1) << dist;
-    	            std::string dist_text = " " + oss.str() + T(" 米", " m");
-    	            const char *head = T("[密码机]", "[Cipher]");
-    	            // 距离在"我是蜡像师且最大仰角能附着"时变绿(WaxAim.h，替代原来 61~63 米)
-    	            auto hs = ImGui::CalcTextSize(head, 0, 25);
-    	            auto ds = ImGui::CalcTextSize(dist_text.c_str(), 0, 25);
-    	            float x0 = r_x - (hs.x + ds.x) / 2.0f;
-    	            Draw->AddText({x0, r_y}, ImColor(255,255,255,255), head);
-    	            Draw->AddText({x0 + hs.x, r_y},
-    	                WaxAim::gen_green(data[i].obj) ? color_green : ImColor(255, 255, 255, 255),
-    	                dist_text.c_str());
-    	        }
+    	        // 密码机只按 PyProgress 的 Python 列表画(实体循环前)。Python 不可用时不画、不回退写死偏移，原因见「[密码机进度]」日志
     	    }
     		}
 	
@@ -3880,7 +3806,7 @@ void Draw_Main(ImDrawList *Draw){
         int up = (mi_read && mi_c[1] > -300) ? 1 : 0;
         if (mirror_img != last_mi || up != last_up)
             diag_log("[框诊断] 镜中红夫人 obj=0x%llx 来源=%s 坐标=(%.1f,%.1f,%.1f) 在地面=%d 我的阵营=%d 有锚点=%d\n",
-                     (unsigned long long)mirror_img, PyProgress::mirror_image_obj() ? "Python247" : (mirror_img ? "场景+0x6D" : "无"),
+                     (unsigned long long)mirror_img, mirror_img ? "Python247" : "无",
                      mi_c[0], mi_c[1], mi_c[2], up, (int)self_camp, (int)has_auth_self);
         last_mi = mirror_img; last_up = up;
     }
@@ -4612,9 +4538,6 @@ void Layout_tick_UI(bool *main_thread_flag) {
                 ImGui::EndTable();
             }
 
-            ImGui::Checkbox(T("板子状态走Python##pallet_py", "Pallet state from Python##pallet_py"), &AutoPallet::state_from_py);
-            help_marker("关=老的场景偏移；开=读游戏脚本里板子的 state(1=立着)。两边都会写「[板子对照]」日志",
-                        "Off = old scene offset; on = read the pallet's script-side state (1 = standing). Both are logged as [板子对照]");
             ImGui::TextDisabled("Python板子: %s", PyPanel::status_text());
 
             // 触发宽度(游戏单位，判定矩形的全宽)：固定 / 随机(每次点完在上下限之间重抽)，范围都是 5~15

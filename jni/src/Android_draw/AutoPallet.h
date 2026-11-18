@@ -14,8 +14,7 @@
 //
 // 一、输入(全是场景对象，坐标 objcoor=[obj+0x28]，+0xa0/+0xa4/+0xa8 = X/高度/Y)
 //   板子   类名含 woodplane 的场景对象(读线程收集后发布过来)
-//   状态   u32 [[obj+0x750]+0x30]，板子立着 == 16。读两次 +0x750 指针，一致才算数
-//          (帝五忍鸽用的是 +0x730，是旧版本的偏移；若辰的候选表里 0x730 排第二)
+//   状态   Python PanelUnit.state == 1(IDLE)，见 PyPanel.h。(若辰原版是场景偏移 [[obj+0x750]+0x30]==16，11-18 换掉)
 //   朝向   objcoor+0xb8 / +0xc0 当作水平方向向量(x, y)，长度 > 1e-5 才可用
 //   自身   PySelf::anchor()，必须是求生者(camp == 2)
 //   监管   PySelf::hunter_bodies()(联合狩猎 2 个)；动作号同样是 [[obj+0x750]+0x30]
@@ -23,7 +22,7 @@
 //          super_armor(霸体：兴奋/破轮轮形态/台球手球形态)不判
 //
 // 二、命中判定 sub_34517C(自身 S, 监管 H, 板子 P，全部只看水平面)
-//   state == 16
+//   板子立着
 //   |S-H| / 11.886 <= 3 米
 //   |S-P| <= 25 单位(约 2.1 米)                       —— 自己要站在板子边上才放得下
 //   普通：把 H-P 投到板子朝向 d 上
@@ -73,10 +72,8 @@ namespace AutoPallet {
 
 // ---- 界面配置(渲染线程写、盖板线程读；跟 show_draw_* 一样直接共享，单个 bool/int/float 的撕裂无害) ----
 static bool  enabled = true;
-// 板子立没立的来源(2026-11-18)：false = 场景偏移 [[obj+0x750]+0x30]==16(老)，true = Python PanelUnit.state==1(IDLE)。
-// 两边每轮都读、变化时打「[板子对照]」日志，开关只决定用哪个做判定。
-// 2026-11-18 上机三次对照通过(立着 16↔1、放板同一轮一起变)，默认改 Python；配置键随之改名 pallet_state_py2，让旧配置里存的 0 失效
-static bool  state_from_py = true;
+// 板子立没立(2026-11-18)：只看 Python PanelUnit.state==1(IDLE)。上机三次和老场景偏移 [[obj+0x750]+0x30]==16 对照通过
+// (立着 16↔1、放板同一轮一起变)，老源已删、不留开关、不回退：读不到就不放板，并记「[盖板] Python 读不到板子状态」
 static float width = 10.8f;                // 固定模式的触发宽度(游戏单位)
 static bool  random_width = false;         // 随机模式：每次点完在下限~上限之间重抽
 static float width_lo = 8.0f, width_hi = 12.0f;
@@ -109,7 +106,6 @@ static const float SELF_BOARD_MAX    = 25.0f;
 static const float HUNTER_SELF_MAX_M = 3.0f;
 static const float CLOWN_RADIUS      = 80.0f;
 static const int   CLOWN_ACTION      = 0x1802CE;
-static const int   BOARD_STANDING    = 16;
 static const int64_t MIN_TAP_INTERVAL_MS = 800;
 static const int64_t CLEAR_LAST_BOARD_MS = 150;
 static const int   LOOP_US           = 10000;   // 10ms 一轮
@@ -180,7 +176,8 @@ static bool read_pos(uint64_t obj, float out[3], uint64_t *coor_out = nullptr)
     return finite3(out);
 }
 
-// [[obj+0x750]+0x30]，前后两次读 +0x750 一致才算数(sub_344D7C 同款)
+// [[obj+0x750]+0x30]，前后两次读 +0x750 一致才算数(sub_344D7C 同款)。
+// 现在只用来读监管动作号(小丑拉锯)，板子状态已改走 Python；这个动作号还是写死偏移，在迁移待办里
 static bool read_state(uint64_t obj, int &state)
 {
     uint64_t c1 = getPtr64(obj + 0x750);
@@ -372,15 +369,14 @@ static void thread_main()
     float    last_lo = -1.f, last_hi = -1.f;
     int64_t  py_refresh_ms = 0;
     int      py_sum_last[4] = {-1, -1, -1, -1};
-    std::unordered_map<uint64_t, std::pair<int, int>> cmp_last;   // 板子 obj -> 上次打日志时的(场景值, Python 值)，-999 = 读不到
-    // 某块板现在立着吗：两边都读；返回按开关选的那个。scene_st/py_st 给日志用(-999 = 读不到)
-    auto board_standing = [&](uint64_t o, const float *pos, int &scene_st, int &py_st, int &how) {
-        int s = -1, p = -1;
-        bool sok = read_state(o, s);
+    std::unordered_map<uint64_t, bool> miss_last;   // 板子 obj -> 上次是不是 Python 读不到(只在切换时记日志)
+    // 某块板现在立着吗：只看 Python。py_st 给日志用(-999 = 读不到)
+    auto board_standing = [&](uint64_t o, const float *pos, int &py_st, int &how) {
+        int p = -1;
         int pi = PyPanel::find(o, pos, how);
         bool pok = pi >= 0 && PyPanel::read_state(pi, p);
-        scene_st = sok ? s : -999; py_st = pok ? p : -999;
-        return state_from_py ? (pok && p == PyPanel::ST_IDLE) : (sok && s == BOARD_STANDING);
+        py_st = pok ? p : -999;
+        return pok && p == PyPanel::ST_IDLE;
     };
 
     while (true) {
@@ -571,20 +567,18 @@ static void thread_main()
             if (hdist(S, bi.pos) > SELF_BOARD_MAX) continue;       // 若辰的预筛([sp+0xcdc])
             near_n++;
 
-            int sst = -999, pst = -999, how = 0;
-            bool standing = board_standing(o, bi.pos, sst, pst, how);
+            int pst = -999, how = 0;
+            bool standing = board_standing(o, bi.pos, pst, how);
             if (standing) standing_n++;
-            {   // 对照日志：只打附近的板、只在任一边的值变了时打
-                auto &last = cmp_last[o];
-                if (last.first != sst || last.second != pst) {
-                    bool ss = sst == BOARD_STANDING, ps = pst == PyPanel::ST_IDLE;
-                    printf("[板子对照] obj=0x%llx 场景=%d%s Python=%d(%s) 配对=%s 位置=(%.1f,%.1f) 离我%.1f%s\n",
-                           (unsigned long long)o, sst, ss ? "(立着)" : "", pst, pst == -999 ? "读不到" : PyPanel::state_name(pst),
-                           PyPanel::how_name(how), bi.pos[0], bi.pos[1], hdist(S, bi.pos),
-                           (sst != -999 && pst != -999 && ss != ps) ? " ← 立没立不一致" : "");
-                    last = {sst, pst};
-                }
-                if (cmp_last.size() > 512) cmp_last.clear();
+            {   // 附近的板 Python 读不到 → 不放板。只在"读得到↔读不到"切换时记一行
+                const bool miss = pst == -999;
+                auto lm = miss_last.find(o);
+                if (lm == miss_last.end() ? miss : lm->second != miss)
+                    printf(miss ? "[盖板] Python 读不到板子状态，不放板 obj=0x%llx 配对=%s 位置=(%.1f,%.1f) 离我%.1f Python板子: %s\n"
+                                : "[盖板] 板子状态恢复可读 obj=0x%llx 配对=%s 位置=(%.1f,%.1f) 离我%.1f Python板子: %s\n",
+                           (unsigned long long)o, PyPanel::how_name(how), bi.pos[0], bi.pos[1], hdist(S, bi.pos), PyPanel::status_text());
+                miss_last[o] = miss;
+                if (miss_last.size() > 512) miss_last.clear();
             }
 
             bool hit = false, hit_pred = false;
@@ -619,17 +613,15 @@ static void thread_main()
         for (int i = 0; i < g_rect_n[w]; i++) g_rects[w][i].candidate = best != 0 && g_rects[w][i].obj == best;
         g_rect_active.store(w);
 
-        // 点完的那块：状态离开 16 = 放下了
+        // 点完的那块：Python 状态离开 1(IDLE) = 放下了
         if (pending) {
-            int sst = -999, pst = -999, how = 0;
+            int pst = -999, how = 0;
             auto pit = infos.find(pending);
-            bool still = pit != infos.end() ? board_standing(pending, pit->second.pos, sst, pst, how) : true;
-            bool known = state_from_py ? pst != -999 : sst != -999;
-            if (known && !still) {
+            bool still = pit != infos.end() ? board_standing(pending, pit->second.pos, pst, how) : true;
+            if (pst != -999 && !still) {
                 g_confirmed++;
-                printf("[盖板] 板子状态已变化 obj=0x%llx 场景=%d Python=%d(%s) 来源=%s 用时=%lldms\n",
-                       (unsigned long long)pending, sst, pst, pst == -999 ? "读不到" : PyPanel::state_name(pst),
-                       state_from_py ? "Python" : "场景", (long long)(t - pending_ms));
+                printf("[盖板] 板子状态已变化 obj=0x%llx Python=%d(%s) 用时=%lldms\n",
+                       (unsigned long long)pending, pst, PyPanel::state_name(pst), (long long)(t - pending_ms));
                 pending = 0;
             } else if (t - pending_ms > 3000) {
                 pending = 0;                                         // 3 秒没倒，不再跟踪
