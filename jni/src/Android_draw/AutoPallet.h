@@ -74,8 +74,9 @@ namespace AutoPallet {
 // ---- 界面配置(渲染线程写、盖板线程读；跟 show_draw_* 一样直接共享，单个 bool/int/float 的撕裂无害) ----
 static bool  enabled = true;
 // 板子立没立的来源(2026-11-18)：false = 场景偏移 [[obj+0x750]+0x30]==16(老)，true = Python PanelUnit.state==1(IDLE)。
-// 两边每轮都读、变化时打「[板子对照]」日志，开关只决定用哪个做判定。Python 那边是先验，上机日志确认后再改默认
-static bool  state_from_py = false;
+// 两边每轮都读、变化时打「[板子对照]」日志，开关只决定用哪个做判定。
+// 2026-11-18 上机三次对照通过(立着 16↔1、放板同一轮一起变)，默认改 Python；配置键随之改名 pallet_state_py2，让旧配置里存的 0 失效
+static bool  state_from_py = true;
 static float width = 10.8f;                // 固定模式的触发宽度(游戏单位)
 static bool  random_width = false;         // 随机模式：每次点完在下限~上限之间重抽
 static float width_lo = 8.0f, width_hi = 12.0f;

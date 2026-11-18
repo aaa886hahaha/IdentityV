@@ -260,7 +260,7 @@ static const CfgItem CFG_ITEMS[] = {
     {"pallet_touch_y", CFG_FLOAT, &AutoPallet::touch_y},          {"pallet_hold_ms", CFG_INT, &AutoPallet::hold_ms},
     {"pallet_jitter_px", CFG_INT, &AutoPallet::jitter_px},        {"pallet_jitter_ms", CFG_INT, &AutoPallet::jitter_ms},
     {"pallet_predict", CFG_BOOL, &AutoPallet::predict_fast},      {"pallet_predict_mps", CFG_FLOAT, &AutoPallet::fast_mps},
-    {"pallet_lead_ms", CFG_INT, &AutoPallet::lead_ms},            {"pallet_state_py", CFG_BOOL, &AutoPallet::state_from_py},
+    {"pallet_lead_ms", CFG_INT, &AutoPallet::lead_ms},            {"pallet_state_py2", CFG_BOOL, &AutoPallet::state_from_py},
     {"pallet_width", CFG_FLOAT, &AutoPallet::width},              {"pallet_random", CFG_BOOL, &AutoPallet::random_width},
     {"pallet_width_lo", CFG_FLOAT, &AutoPallet::width_lo},        {"pallet_width_hi", CFG_FLOAT, &AutoPallet::width_hi},
     // 自动校准
@@ -4612,7 +4612,7 @@ void Layout_tick_UI(bool *main_thread_flag) {
                 ImGui::EndTable();
             }
 
-            ImGui::Checkbox(T("板子状态走Python(实验)##pallet_py", "Pallet state from Python (exp.)##pallet_py"), &AutoPallet::state_from_py);
+            ImGui::Checkbox(T("板子状态走Python##pallet_py", "Pallet state from Python##pallet_py"), &AutoPallet::state_from_py);
             help_marker("关=老的场景偏移；开=读游戏脚本里板子的 state(1=立着)。两边都会写「[板子对照]」日志",
                         "Off = old scene offset; on = read the pallet's script-side state (1 = standing). Both are logged as [板子对照]");
             ImGui::TextDisabled("Python板子: %s", PyPanel::status_text());
