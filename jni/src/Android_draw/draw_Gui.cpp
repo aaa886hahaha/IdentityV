@@ -19,6 +19,7 @@
 #include "PyWaterFight.h"
 #include "PyItems.h"
 #include "PyKnight.h"
+#include "PyMadEye.h"
 #include "WaxAim.h"
 #include <linux/input.h>
 #include <sstream>
@@ -251,13 +252,15 @@ static const CfgItem CFG_ITEMS[] = {
     {"wax_on", CFG_BOOL, &WaxAim::enabled},      {"wax_traj", CFG_BOOL, &WaxAim::show_traj},
     {"wax_always", CFG_BOOL, &WaxAim::show_always}, {"show_crosshair", CFG_BOOL, &show_crosshair},
     {"shot_hide_menu", CFG_BOOL, &shot_hide_menu},
+    // 疯眼
+    {"madeye_map", CFG_BOOL, &PyMadEye::enabled},
     // 自动盖板
     {"pallet_enabled", CFG_BOOL, &AutoPallet::enabled},           {"pallet_show_range", CFG_BOOL, &AutoPallet::show_range},
     {"pallet_show_touch", CFG_BOOL, &AutoPallet::show_touch_point}, {"pallet_touch_x", CFG_FLOAT, &AutoPallet::touch_x},
     {"pallet_touch_y", CFG_FLOAT, &AutoPallet::touch_y},          {"pallet_hold_ms", CFG_INT, &AutoPallet::hold_ms},
     {"pallet_jitter_px", CFG_INT, &AutoPallet::jitter_px},        {"pallet_jitter_ms", CFG_INT, &AutoPallet::jitter_ms},
     {"pallet_predict", CFG_BOOL, &AutoPallet::predict_fast},      {"pallet_predict_mps", CFG_FLOAT, &AutoPallet::fast_mps},
-    {"pallet_lead_ms", CFG_INT, &AutoPallet::lead_ms},
+    {"pallet_lead_ms", CFG_INT, &AutoPallet::lead_ms},            {"pallet_state_py", CFG_BOOL, &AutoPallet::state_from_py},
     {"pallet_width", CFG_FLOAT, &AutoPallet::width},              {"pallet_random", CFG_BOOL, &AutoPallet::random_width},
     {"pallet_width_lo", CFG_FLOAT, &AutoPallet::width_lo},        {"pallet_width_hi", CFG_FLOAT, &AutoPallet::width_hi},
     // 自动校准
@@ -949,6 +952,452 @@ static void wait_array_change(const std::vector<uint64_t> &last_sorted)
     }
 }
 
+// ---- 结构反推(2026-11-15)：坐标链 / 类名链被热更改掉时，拿 Python 真值从本体场景对象出发重新搜 ----
+// 朋友机日志：数组、签名、本体(unit.model+0x20 仍在数组里)都没变，类名链读出的长度无效、+0x28 是空的
+// —— 改的是对象结构。做法：局内向 PySelf 要一份真值(每个本体的 unit.position、unit.model_path)，
+//   坐标链：从本体出发 BFS，每层取 0~0x200 字节里像堆指针的槽位往下走，最多 3 跳，节点里找 12 字节 ≈ position；
+//   类名链：同样 BFS 最多 5 跳(首层 0x200、往下 0x80/0x40)，节点里找 {字符串指针, u32 长度} 且字符串以
+//           model_path 的文件名结尾的位置。
+// 只在一个本体上全量搜，搜出的每条候选链拿新取的真值在全部本体上逐条核对，命中最多的胜出。
+// 现用链(默认 0917 老链)本身核对通过就不换 —— 用户本机老版本行为不变，日志里能看到搜出的是不是老链(用来验算法)。
+// 一个进程搜一次；之后局内本体全部读不出类名，10 秒节流再搜。日志前缀 [结构反推]
+#include <unordered_set>
+namespace LayoutInfer {
+using SceneLayout::Chain;
+static const uint64_t PM = 0x00FFFFFFFFFFFFFFULL;
+static bool   g_done = false;
+static time_t g_last_try = 0;
+static const float TOL_XZ = 10.0f, TOL_H = 6.0f;      // 场景单位(约 11.9 = 1 米)；搜索期间本体在动，留点余量
+
+// 引擎模块(代码/数据/bss)里的指针是虚表、全局，不当作链上的一跳
+static inline bool heap_ptr(uint64_t p)
+{
+    return SceneLayout::ptr_ok(p) && (p & 7) == 0 && !(p >= (uint64_t)libbase && p < (uint64_t)g_bss.taddr);
+}
+static inline bool near3(const float *v, const float *t)
+{
+    return fabsf(v[0] - t[0]) <= TOL_XZ && fabsf(v[1] - t[1]) <= TOL_H && fabsf(v[2] - t[2]) <= TOL_XZ;
+}
+
+struct Node { uint64_t addr; Chain path; };
+
+// 广度优先。win[d] = 第 d 层节点读多少字节(既用来找下一跳，也交给 visit 检查)。返回实际读了多少个节点
+template <typename F>
+static int bfs(uint64_t obj, int max_depth, const int *win, int node_cap, int &depth_reached, F visit)
+{
+    std::vector<Node> cur, nxt;
+    std::unordered_set<uint64_t> seen;
+    Node root; memset(&root, 0, sizeof(root)); root.addr = obj;
+    cur.push_back(root); seen.insert(obj);
+    static uint64_t buf[0x1000 / 8 + 64];                // 尾部余量：见过驱动"读内存超写"
+    int nodes = 0;
+    depth_reached = 0;
+    for (int d = 0; d <= max_depth && !cur.empty(); d++) {
+        depth_reached = d;
+        nxt.clear();
+        for (const Node &nd : cur) {
+            if (nodes >= node_cap) return nodes;
+            const int w = win[d];
+            if (!vm_readv(nd.addr, buf, w)) continue;
+            nodes++;
+            visit(nd, (const uint8_t *)buf, w);
+            if (d == max_depth || nd.path.n >= SceneLayout::MAX_HOP) continue;
+            for (int k = 0; k < w / 8 && (int)nxt.size() < node_cap; k++) {
+                uint64_t p = buf[k] & PM;
+                if (!heap_ptr(p) || !seen.insert(p).second) continue;
+                Node c = nd; c.addr = p; c.path.hop[c.path.n++] = (int16_t)(k * 8);
+                nxt.push_back(c);
+            }
+        }
+        cur.swap(nxt);
+    }
+    return nodes;
+}
+
+// 走完整条链到末端节点
+static bool walk(uint64_t obj, const Chain &c, uint64_t &node)
+{
+    uint64_t p = obj;
+    for (int i = 0; i < c.n; i++) { p = getPtr64(p + c.hop[i]); if (!SceneLayout::ptr_ok(p)) return false; }
+    node = p;
+    return true;
+}
+
+// 模型路径的文件名(小写)，"chr/boss/banshee/h55_banshee.gim" -> "h55_banshee.gim"
+static int basename_lc(const char *path, char *out, int cap)
+{
+    const char *b = path;
+    for (const char *s = path; *s; s++) if (*s == '/' || *s == '\\') b = s + 1;
+    int n = 0;
+    for (; b[n] && n < cap - 1; n++) out[n] = (char)tolower((unsigned char)b[n]);
+    out[n] = 0;
+    return n;
+}
+// p 处长 len 的字符串是否以 base 结尾(不区分大小写)
+static bool str_tail_is(uint64_t p, int len, const char *base, int blen)
+{
+    if (blen <= 0 || len < blen || len > 255) return false;
+    char tmp[256];
+    if (!vm_readv(p + len - blen, tmp, blen)) return false;
+    for (int i = 0; i < blen; i++) if ((char)tolower((unsigned char)tmp[i]) != base[i]) return false;
+    return true;
+}
+
+static bool coor_hit(const PySelf::BodyTruth &t, const Chain &c, bool *whole)
+{
+    uint64_t node;
+    float v[3];
+    if (!t.pos_ok || !walk(t.body, c, node) || !vm_readv(node + c.fin, v, 12) || !near3(v, t.pos)) return false;
+    if (whole) {                                        // 老结构里 +0x1C0 世界矩阵的平移(+0x1F0)也等于位置
+        float m[3];
+        *whole = vm_readv(node + c.fin + 0x150, m, 12) && near3(m, t.pos);
+    }
+    return true;
+}
+static bool name_hit(const PySelf::BodyTruth &t, const Chain &c)
+{
+    char base[128];
+    int blen = basename_lc(t.path, base, sizeof(base));
+    uint64_t node;
+    if (blen < 5 || c.n < 1 || !walk(t.body, c, node)) return false;
+    uint64_t sp = getPtr64(node + c.fin);
+    int len = getDword(node + c.fin + 8);
+    return SceneLayout::ptr_ok(sp) && str_tail_is(sp, len, base, blen);
+}
+
+// ---------- 骨骼链(2026-11-15，11-18 加已知表 + SKEL 内部也搜) ----------
+// 新版第一次上机：方框正常、骨骼不画 —— 骨骼第一跳 ANIM = [M+0x818] 是场景对象自身的字段，跟 +0x28→+0x48、
+// 类名首跳 +0xf8→+0x1e8 一样被挪了。真值 = 骨架算出的世界坐标必须长在这个人身上(NativeBones::skeleton_plausible)。
+// 11-18 第二次上机：第 1 档 0 条 —— 因为 SKEL 内部也动了(名字表 +0x80→+0x88，朋友手找确认 ANIM=[M+0x860])，
+// 原来"SKEL 内部不变"的假设不成立。现在：
+//   第 0 档：SceneLayout::BONE_KNOWN 已知版本逐个核对；
+//   第 1 档：M 的 0~0x1000 里找 ANIM，SKEL=[[ANIM+0x1E8]+0x30]，SKEL 里名字表偏移 0x40~0xF0、串偏移 {0x10,8,0x18,0x20,0} 都试；
+//   第 2 档：BFS 找名字表形状对的 SKEL(同样搜名字表偏移)，再在链上每个节点 0~0x800 找 POSE(两种 POSE 读法都试)。
+static void bone_fmt(const SceneLayout::BoneLayout &b, char *out, size_t cap)
+{
+    char s[120];
+    SceneLayout::format(b.skel, s, sizeof(s));
+    char *p = strstr(s, " 末端");                        // 骨架链的 fin 没意义，不打
+    if (p) *p = 0;
+    snprintf(out, cap, "SKEL=%s 名字表+0x%x 串+0x%x POSE=[第%d节点+0x%x]%s", s, (unsigned)b.names_off, (unsigned)b.str_off,
+             b.pose_base, (unsigned)b.pose_off, b.pose_mode ? "(两跳读法)" : "");
+}
+
+// 布局 bl 在本体 t 上成立吗(会建一次名字表，几百次读)
+static bool bone_hit(const SceneLayout::BoneLayout &bl, const PySelf::BodyTruth &t)
+{
+    if (!t.pos_ok) return false;
+    uint64_t SKEL = 0, POSE = 0;
+    const char *why = "";
+    if (!NativeBones::walk_bone_chain(t.body, bl, SKEL, POSE, why)) return false;
+    NativeBones::NameMap nm;
+    if (!NativeBones::build_namemap(SKEL, nm, bl.names_off, bl.str_off) || NativeBones::namemap_hits(nm) < 10) return false;
+    uint64_t X = SceneLayout::coor(t.body);
+    float wm[16];
+    if (!SceneLayout::ptr_ok(X) || !vm_readv(X + 0x1C0, wm, 64)) return false;
+    float rx[32], ry[32], rz[32]; bool rok[32];
+    for (int k = 0; k < 3; k++) {
+        int g = NativeBones::pose_world(POSE, nm, wm, rx, ry, rz, rok, bl.pose_mode);
+        if (g > 0) return NativeBones::skeleton_plausible(rx, ry, rz, rok, t.pos);
+        if (g == 0) return false;
+    }
+    return false;
+}
+
+// S 像不像 SKEL：在 S+0x40~0xF0 里找 {begin,end} 形状对的名字表，再试几种串偏移，认出 ≥10 根目标骨骼算数。
+// shape = 名字表形状对的偏移个数(诊断用)
+struct SkelFmt { int names_off, str_off, hits; };
+static bool find_skel_fmt(uint64_t S, SkelFmt &f, int *shape = nullptr)
+{
+    static const int STR[] = {0x10, 0x8, 0x18, 0x20, 0x0};
+    uint8_t b[0x100];
+    if (!vm_readv(S, b, sizeof(b))) return false;
+    f.hits = 0;
+    for (int no = 0x40; no <= 0xF0; no += 8) {
+        uint64_t be, en; memcpy(&be, b + no, 8); memcpy(&en, b + no + 8, 8); be &= PM; en &= PM;
+        if (!SceneLayout::ptr_ok(be) || en <= be || ((en - be) & 15) || en - be > 0x2000) continue;
+        if (shape) (*shape)++;
+        for (int so : STR) {
+            NativeBones::NameMap nm;
+            if (!NativeBones::build_namemap(S, nm, no, so)) continue;
+            int h = NativeBones::namemap_hits(nm);
+            if (h >= 10 && h > f.hits) { f.names_off = no; f.str_off = so; f.hits = h; }
+            if (h >= 10) break;
+        }
+        if (f.hits == NativeBones::NUM_TARGET) break;
+    }
+    return f.hits >= 10;
+}
+
+static void infer_bones(const PySelf::BodyTruth *tr, int nt, int npos)
+{
+    using SceneLayout::BoneLayout;
+    const int64_t t0 = mono_ms();
+    auto need = [](int total) { return total <= 1 ? total : (total + 1) / 2; };
+    char s[240];
+    const BoneLayout cur = SceneLayout::bone_layout();
+    int cur_h = 0;
+    for (int i = 0; i < nt; i++) if (bone_hit(cur, tr[i])) cur_h++;
+
+    int prim = -1;
+    for (int i = 0; i < nt && prim < 0; i++) if (tr[i].pos_ok) prim = i;
+    if (prim < 0) return;
+    const uint64_t M = tr[prim].body;
+    uint64_t X = SceneLayout::coor(M);
+    float wm[16];
+    if (!SceneLayout::ptr_ok(X) || !vm_readv(X + 0x1C0, wm, 64)) { printf("[结构反推] 骨骼：世界矩阵读不到，跳过\n"); return; }
+
+    std::vector<BoneLayout> cands;
+    auto add = [&](const BoneLayout &b) {
+        for (const BoneLayout &x : cands) if (SceneLayout::same_bone(x, b)) return;
+        if (cands.size() < 24) cands.push_back(b);
+    };
+
+    // ---- 第 0 档：已知版本表 ----
+    bool known_ok = false;
+    for (int k = 0; k < SceneLayout::NUM_BONE_KNOWN; k++) {
+        add(SceneLayout::BONE_KNOWN[k]);
+        if (bone_hit(SceneLayout::BONE_KNOWN[k], tr[prim])) known_ok = true;
+    }
+    printf("[结构反推] 骨骼：第0档 已知版本 %d 个，%s\n", SceneLayout::NUM_BONE_KNOWN, known_ok ? "有对上的，不再搜" : "都没对上，开始搜");
+
+    if (!known_ok) {
+        // ---- 找 SKEL：第 1 档(ANIM 挪了，ANIM→SKEL 两跳不变，SKEL 内部偏移搜) ----
+        struct SkelCand { Chain path; uint64_t skel; SkelFmt fmt; };
+        std::vector<SkelCand> sk;
+        int reach = 0, shaped = 0;
+        for (int o = 0; o < 0x1000; o += 8) {
+            uint64_t A = getPtr64(M + o);
+            if (!heap_ptr(A)) continue;
+            uint64_t P2 = getPtr64(A + 0x1E8);
+            uint64_t S = SceneLayout::ptr_ok(P2) ? getPtr64(P2 + 0x30) : 0;
+            if (!SceneLayout::ptr_ok(S)) continue;
+            reach++;
+            SkelFmt f; int sh = 0;
+            bool ok = find_skel_fmt(S, f, &sh);
+            if (sh) shaped++;
+            if (!ok) continue;
+            Chain c; memset(&c, 0, sizeof(c)); c.n = 3; c.hop[0] = (int16_t)o; c.hop[1] = 0x1E8; c.hop[2] = 0x30;
+            sk.push_back({c, S, f});
+        }
+        printf("[结构反推] 骨骼：第1档 走得到 [[[M+o]+0x1E8]+0x30] 的偏移 %d 个，其中有名字表形状的 %d 个，认出骨骼的 %d 个\n",
+               reach, shaped, (int)sk.size());
+        int nodes = 0, dr = 0;
+        // ---- 第 2 档：BFS 找名字表形状 ----
+        if (sk.empty()) {
+            static const int WIN_B[4] = {0x1000, 0x400, 0x200, 0x100};
+            std::unordered_set<uint64_t> tried;
+            nodes = bfs(M, 3, WIN_B, 60000, dr, [&](const Node &nd, const uint8_t *b, int len) {
+                if (nd.path.n < 1 || len < 0x100 || sk.size() >= 8) return;
+                bool any = false;                                     // 先在已读到的缓冲里粗筛，省掉多数节点的额外读
+                for (int no = 0x40; no <= 0xF0 && !any; no += 8) {
+                    uint64_t be, en; memcpy(&be, b + no, 8); memcpy(&en, b + no + 8, 8); be &= PM; en &= PM;
+                    any = SceneLayout::ptr_ok(be) && en > be && !((en - be) & 15) && en - be <= 0x2000;
+                }
+                if (!any || !tried.insert(nd.addr).second) return;
+                SkelFmt f;
+                if (find_skel_fmt(nd.addr, f)) sk.push_back({nd.path, nd.addr, f});
+            });
+            printf("[结构反推] 骨骼：第2档 BFS 搜了 %d 个节点(到第 %d 跳)，SKEL 候选 %d 条\n", nodes, dr, (int)sk.size());
+        }
+
+        // ---- 每条 SKEL 链上找 POSE：链上每个节点(不含 SKEL 自己)的 0~0x800，两种 POSE 读法 ----
+        for (size_t k = 0; k < sk.size() && k < 8; k++) {
+            Chain pc = sk[k].path; pc.fin = 0;
+            char ps[120]; SceneLayout::format(pc, ps, sizeof(ps));
+            printf("[结构反推] 骨骼 SKEL候选#%d %s 名字表+0x%x 串+0x%x 认出目标骨骼 %d/%d\n", (int)k, ps,
+                   sk[k].fmt.names_off, sk[k].fmt.str_off, sk[k].fmt.hits, NativeBones::NUM_TARGET);
+            NativeBones::NameMap nm;
+            if (!NativeBones::build_namemap(sk[k].skel, nm, sk[k].fmt.names_off, sk[k].fmt.str_off)) continue;
+            uint64_t node[SceneLayout::MAX_HOP + 1];
+            node[0] = M;
+            bool ok = true;
+            for (int i = 0; i < pc.n && ok; i++) { node[i + 1] = getPtr64(node[i] + pc.hop[i]); ok = SceneLayout::ptr_ok(node[i + 1]); }
+            if (!ok) continue;
+            auto pose_ok = [&](uint64_t Q, int mode) {
+                if (!heap_ptr(Q)) return false;
+                float rx[32], ry[32], rz[32]; bool rok[32];
+                for (int r = 0; r < 3; r++) {
+                    int g = NativeBones::pose_world(Q, nm, wm, rx, ry, rz, rok, mode);
+                    if (g > 0) return NativeBones::skeleton_plausible(rx, ry, rz, rok, tr[prim].pos);
+                    if (g == 0) return false;
+                }
+                return false;
+            };
+            auto mk = [&](int b, int off, int mode) {
+                BoneLayout bl; memset(&bl, 0, sizeof(bl));
+                bl.skel = pc; bl.pose_base = b; bl.pose_off = (int16_t)off;
+                bl.names_off = (int16_t)sk[k].fmt.names_off; bl.str_off = (int16_t)sk[k].fmt.str_off; bl.pose_mode = (int8_t)mode;
+                return bl;
+            };
+            int found = 0;
+            for (int mode = 0; mode < 2; mode++)
+                if (pc.n >= 2 && pose_ok(getPtr64(node[1] + 0x248), mode)) { add(mk(1, 0x248, mode)); found++; }
+            for (int b = 0; b < pc.n && found < 4; b++)
+                for (int off = 0; off < 0x800 && found < 4; off += 8) {
+                    if (b == 1 && off == 0x248) continue;
+                    uint64_t Q = getPtr64(node[b] + off);
+                    for (int mode = 0; mode < 2 && found < 4; mode++)
+                        if (pose_ok(Q, mode)) { add(mk(b, off, mode)); found++; }
+                }
+            if (!found) printf("[结构反推] 骨骼 SKEL候选#%d 链上没找到能算出合理骨架的 POSE\n", (int)k);
+        }
+    }
+
+    // ---- 全部本体核对，挑命中最多的 ----
+    int best = -1, best_h = 0;
+    for (size_t i = 0; i < cands.size(); i++) {
+        int h = 0;
+        for (int j = 0; j < nt; j++) if (bone_hit(cands[i], tr[j])) h++;
+        bone_fmt(cands[i], s, sizeof(s));
+        printf("[结构反推] 骨骼候选#%d %s 命中 %d/%d%s\n", (int)i, s, h, npos,
+               (int)i < SceneLayout::NUM_BONE_KNOWN ? " (已知表)" : "");
+        if (h > best_h) { best_h = h; best = (int)i; }
+    }
+    bone_fmt(cur, s, sizeof(s));
+    if (npos > 0 && cur_h >= need(npos)) printf("[结构反推] 骨骼链 保持现用 %s(命中 %d/%d)\n", s, cur_h, npos);
+    else if (best >= 0 && best_h >= need(npos) && best_h > cur_h) {
+        SceneLayout::set_bone(cands[best]);
+        NativeBones::g_swap_yz.store(-1);               // 换了链，swap_yz 按新链在自身上重新校准
+        char s2[240]; bone_fmt(cands[best], s2, sizeof(s2));
+        printf("[结构反推] 骨骼链 采用 %s(命中 %d/%d)，原 %s 命中 %d\n", s2, best_h, npos, s, cur_h);
+    } else printf("[结构反推] 骨骼链 没有可用候选，保持 %s(命中 %d/%d)\n", s, cur_h, npos);
+    printf("[结构反推] 骨骼 用时 %lld ms\n", (long long)(mono_ms() - t0));
+}
+
+struct Cand { Chain c; int hits; bool whole; };
+static void add_cand(std::vector<Cand> &v, const Chain &c)
+{
+    for (const Cand &x : v) if (SceneLayout::same(x.c, c)) return;
+    if (v.size() < 64) v.push_back({c, 0, false});
+}
+
+static void run()
+{
+    g_done = true;
+    g_last_try = time(NULL);
+    const int64_t t0 = mono_ms();
+    PySelf::BodyTruth tr[PySelf::MAX_TRUTH];
+    int nt = PySelf::get_truth(tr, PySelf::MAX_TRUTH, 600);
+    int npos = 0, nname = 0;
+    for (int i = 0; i < nt; i++) { if (tr[i].pos_ok) npos++; if (tr[i].path[0]) nname++; }
+    printf("[结构反推] 真值 %d 个本体(有坐标 %d、有模型路径 %d)\n", nt, npos, nname);
+    for (int i = 0; i < nt; i++)
+        printf("[结构反推]   本体0x%llx 位置=(%.1f,%.1f,%.1f)%s 路径=%s\n", (unsigned long long)tr[i].body,
+               tr[i].pos[0], tr[i].pos[1], tr[i].pos[2], tr[i].pos_ok ? "" : "(没读到)", tr[i].path[0] ? tr[i].path : "(没读到)");
+    if (nt == 0) { printf("[结构反推] 没拿到真值，下次再试\n"); fflush(stdout); g_done = false; return; }
+
+    char s[160];
+    // ---------- 坐标链 ----------
+    std::vector<Cand> cc;
+    int prim = -1;
+    for (int i = 0; i < nt && prim < 0; i++) if (tr[i].pos_ok) prim = i;
+    if (prim >= 0) {
+        static const int WIN_C[4] = {0x200, 0x200, 0x200, 0x200};
+        const PySelf::BodyTruth &T = tr[prim];
+        int dr = 0;
+        int nodes = bfs(T.body, 3, WIN_C, 20000, dr, [&](const Node &nd, const uint8_t *b, int len) {
+            for (int o = 0; o + 12 <= len; o += 4) {
+                float v[3]; memcpy(v, b + o, 12);
+                if (near3(v, T.pos)) { Chain c = nd.path; c.fin = (int16_t)o; add_cand(cc, c); }
+            }
+        });
+        printf("[结构反推] 坐标：本体0x%llx 搜了 %d 个节点(到第 %d 跳)，候选 %d 条，%lld ms\n",
+               (unsigned long long)T.body, nodes, dr, (int)cc.size(), (long long)(mono_ms() - t0));
+    }
+    // ---------- 类名链 ----------
+    std::vector<Cand> nc;
+    prim = -1;
+    for (int i = 0; i < nt && prim < 0; i++) if (tr[i].path[0]) prim = i;
+    if (prim >= 0) {
+        static const int WIN_N[6] = {0x200, 0x80, 0x80, 0x40, 0x40, 0x40};
+        const PySelf::BodyTruth &T = tr[prim];
+        char base[128];
+        int blen = basename_lc(T.path, base, sizeof(base));
+        std::unordered_set<uint64_t> tried;
+        int dr = 0;
+        const int64_t t1 = mono_ms();
+        int nodes = blen < 5 ? 0 : bfs(T.body, 5, WIN_N, 50000, dr, [&](const Node &nd, const uint8_t *b, int len) {
+            if (nd.path.n < 1) return;
+            for (int k = 0; k + 12 <= len; k += 8) {
+                uint64_t p; memcpy(&p, b + k, 8); p &= PM;
+                uint32_t ln; memcpy(&ln, b + k + 8, 4);
+                if (!SceneLayout::ptr_ok(p) || ln < (uint32_t)blen || ln > 255) continue;
+                if (!tried.insert(p ^ ((uint64_t)ln << 56)).second) continue;
+                if (str_tail_is(p, (int)ln, base, blen)) { Chain c = nd.path; c.fin = (int16_t)k; add_cand(nc, c); }
+            }
+        });
+        printf("[结构反推] 类名：本体0x%llx(%s) 搜了 %d 个节点(到第 %d 跳)，候选 %d 条，%lld ms\n",
+               (unsigned long long)T.body, base, nodes, dr, (int)nc.size(), (long long)(mono_ms() - t1));
+    }
+
+    // ---------- 拿新的真值在全部本体上核对 ----------
+    int nt2 = PySelf::get_truth(tr, PySelf::MAX_TRUTH, 600);
+    if (nt2 > 0) nt = nt2;
+    npos = nname = 0;
+    for (int i = 0; i < nt; i++) { if (tr[i].pos_ok) npos++; if (tr[i].path[0]) nname++; }
+    for (Cand &c : cc) {
+        int whole = 0;
+        for (int i = 0; i < nt; i++) { bool w = false; if (coor_hit(tr[i], c.c, &w)) { c.hits++; if (w) whole++; } }
+        c.whole = c.hits > 0 && whole == c.hits;
+    }
+    for (Cand &c : nc) for (int i = 0; i < nt; i++) if (name_hit(tr[i], c.c)) c.hits++;
+    auto rank = [](const Cand &a, const Cand &b) {
+        if (a.hits != b.hits) return a.hits > b.hits;
+        if (a.whole != b.whole) return a.whole;
+        if (a.c.n != b.c.n) return a.c.n < b.c.n;
+        return a.c.fin < b.c.fin;
+    };
+    std::sort(cc.begin(), cc.end(), rank);
+    std::sort(nc.begin(), nc.end(), rank);
+    for (size_t i = 0; i < cc.size() && i < 10; i++) {
+        SceneLayout::format(cc[i].c, s, sizeof(s));
+        printf("[结构反推] 坐标候选#%d %s 命中 %d/%d 整体(+0x1C0矩阵平移也对)=%d%s\n", (int)i, s, cc[i].hits, npos, (int)cc[i].whole,
+               SceneLayout::same(cc[i].c, SceneLayout::COOR_DEFAULT) ? " ← 老链" : "");
+    }
+    for (size_t i = 0; i < nc.size() && i < 10; i++) {
+        SceneLayout::format(nc[i].c, s, sizeof(s));
+        printf("[结构反推] 类名候选#%d %s 命中 %d/%d%s\n", (int)i, s, nc[i].hits, nname,
+               SceneLayout::same(nc[i].c, SceneLayout::NAME_DEFAULT) ? " ← 老链" : "");
+    }
+
+    // ---------- 决定用哪条：现用链自己核对过半就不动 ----------
+    auto need = [](int total) { return total <= 1 ? total : (total + 1) / 2; };
+    {
+        const Chain cur = SceneLayout::coor_chain();
+        int h = 0;
+        for (int i = 0; i < nt; i++) if (coor_hit(tr[i], cur, nullptr)) h++;
+        SceneLayout::format(cur, s, sizeof(s));
+        if (npos > 0 && h >= need(npos)) printf("[结构反推] 坐标链 保持现用 %s(命中 %d/%d)\n", s, h, npos);
+        else if (!cc.empty() && cc[0].hits >= need(npos) && cc[0].hits > h) {
+            SceneLayout::set_coor(cc[0].c);
+            char s2[160]; SceneLayout::format(cc[0].c, s2, sizeof(s2));
+            printf("[结构反推] 坐标链 采用 %s(命中 %d/%d，整体=%d)，原 %s 命中 %d\n", s2, cc[0].hits, npos, (int)cc[0].whole, s, h);
+        } else printf("[结构反推] 坐标链 没有可用候选，保持 %s(命中 %d/%d)\n", s, h, npos);
+    }
+    {
+        const Chain cur = SceneLayout::name_chain();
+        int h = 0;
+        for (int i = 0; i < nt; i++) if (name_hit(tr[i], cur)) h++;
+        SceneLayout::format(cur, s, sizeof(s));
+        if (nname > 0 && h >= need(nname)) printf("[结构反推] 类名链 保持现用 %s(命中 %d/%d)\n", s, h, nname);
+        else if (!nc.empty() && nc[0].hits >= need(nname) && nc[0].hits > h) {
+            SceneLayout::set_name(nc[0].c);
+            char s2[160]; SceneLayout::format(nc[0].c, s2, sizeof(s2));
+            printf("[结构反推] 类名链 采用 %s(命中 %d/%d)，原 %s 命中 %d\n", s2, nc[0].hits, nname, s, h);
+        } else printf("[结构反推] 类名链 没有可用候选，保持 %s(命中 %d/%d)\n", s, h, nname);
+    }
+    // 骨骼要用世界矩阵(坐标链末端 +0x1C0)，所以排在坐标链定下来之后。重新取一次真值(上面的搜索花了时间、人在动)
+    nt2 = PySelf::get_truth(tr, PySelf::MAX_TRUTH, 600);
+    if (nt2 > 0) nt = nt2;
+    npos = 0;
+    for (int i = 0; i < nt; i++) if (tr[i].pos_ok) npos++;
+    infer_bones(tr, nt, npos);
+    printf("[结构反推] 完成，共 %lld ms\n", (long long)(mono_ms() - t0));
+    fflush(stdout);
+}
+} // namespace LayoutInfer
+
 void read_thread(long int PD1,long int PD2,long int PD3)
 {
     bool waitingLogged = false;
@@ -1030,6 +1479,8 @@ void read_thread(long int PD1,long int PD2,long int PD3)
     // 道具白名单(cur_world.item_mgr._uid2item)：独立线程 100ms 一轮，只在「绘制道具」开着时读
     PyItems::start(libbase);
     PyKnight::start(libbase);
+    // 疯眼控制台第一层地图：读 UIBattleMonitorTop 的换算参数，绘制侧把求生者画上去(见 PyMadEye.h)，100ms 一轮
+    PyMadEye::start(libbase);
     // 蜡像师喷蜡辅助瞄准：独立线程 33ms 一轮，只在我是蜡像师时算(见 WaxAim.h)
     WaxAim::start(libbase);
     // 自动盖板：独立线程 10ms 一轮，板子列表由下面的读取循环每轮发布过去
@@ -1164,6 +1615,12 @@ void read_thread(long int PD1,long int PD2,long int PD3)
         // 真值：局内本体集合(Python 侧 unit.model+0x20)应该都在场景数组里。一个都没中 = 数组锁错/被挪作他用
         const bool truth_ready = PySelf::body_set_ready();
         int truth_hits = 0;
+        // 结构反推(见 LayoutInfer)：本进程第一次在局内拿到本体时搜一次；换了类名链就清类名缓存
+        if (truth_ready && !LayoutInfer::g_done) LayoutInfer::run();
+        static uint32_t name_gen_seen = 0;
+        if (SceneLayout::g_name_gen.load() != name_gen_seen) { name_gen_seen = SceneLayout::g_name_gen.load(); g_name_cache.clear(); }
+        const SceneLayout::Chain name_ch = SceneLayout::name_chain();
+        int body_name_fail = 0;
         // 【临时诊断】本体没进 data[] 的原因，按对象记，原因变了才打一行(0 = 进了 data[])
         static std::unordered_map<uint64_t, int> diag_reason;
         auto body_note = [&](uint64_t obj, int reason, int extra) {
@@ -1199,23 +1656,24 @@ void read_thread(long int PD1,long int PD2,long int PD3)
     	    //   getPtr64 两种情况都返回 0(内部 T result{} 值初始化)，因此改用 vm_readv 拿返回值。
     	    //   读失败 -> 沿用缓存里的类名，让对象继续画出来(坐标仍是实时读的，位置不会错)；
     	    //   代价是万一该地址已换成别的对象，标签会是旧的 —— 比整个消失可接受。
+    	    // 类名链可能被结构反推换掉(SceneLayout.h，老链 +0xf8→+0x0→+0x8→+0x20→+0x20、末端 +0x8 指针 / +0x10 长度)
     	    uint64_t chain_head = 0;
-    	    bool head_ok = vm_readv(cur_obj + 0xf8, &chain_head, 8);
+    	    bool head_ok = vm_readv(cur_obj + name_ch.hop[0], &chain_head, 8);
     	    chain_head &= 0x00FFFFFFFFFFFFFFULL;
     	    auto nc = g_name_cache.find(cur_obj);
     	    if (nc != g_name_cache.end() && (!head_ok || nc->second.first == chain_head)) {
     	        filter_class_name = nc->second.second;
     	    } else {
-    	        uint64_t class_name_obj = getPtr64(getPtr64(getPtr64(getPtr64(chain_head)+0x8)+0x20)+0x20)+0x0;
-    	        int len = getDword(class_name_obj + 0x10);
+    	        uint64_t class_name_obj = SceneLayout::name_node(chain_head, name_ch);
+    	        int len = class_name_obj ? getDword(class_name_obj + name_ch.fin + 8) : 0;
     	        if (len >= 256 || len == 0 || len < 0) {
-    	            if (diag_body) body_note(cur_obj, 2, len);
+    	            if (diag_body) { body_note(cur_obj, 2, len); body_name_fail++; }
     	            continue;
     	        }
     	        filter_class_name.resize(len);
     	        // 内容读不到时 resize 后的缓冲里留着上一个对象类名的前半截，不能当类名、更不能进缓存
     	        // (缓存只靠第一跳校验，写错一次就错一整局)。跳过本轮，下一轮再读
-    	        if (!vm_readv(getPtr64(class_name_obj + 0x8), &filter_class_name[0], len)) {
+    	        if (!vm_readv(getPtr64(class_name_obj + name_ch.fin), &filter_class_name[0], len)) {
     	            if (diag_body) body_note(cur_obj, 3, len);
     	            continue;
     	        }
@@ -1318,7 +1776,7 @@ void read_thread(long int PD1,long int PD2,long int PD3)
     			}
     			//sprintf(data[指针数量].类名, "%s", 过滤类名.c_str());
     			strcpy(data[entity_count].class_name, filter_class_name.c_str());
-    			data[entity_count].objcoor=getPtr64(cur_obj+0x28);
+    			data[entity_count].objcoor=SceneLayout::coor(cur_obj);
     			if (!first_frame_logged){
         			printf("[实体] %s 地址=0x%llX 坐标地址=0x%llX 坐标=(%.1f,%.1f,%.1f) 类名=%s\n",
         			       data[entity_count].str, (unsigned long long)cur_obj,
@@ -1343,7 +1801,7 @@ void read_thread(long int PD1,long int PD2,long int PD3)
 			// 镜面 = 本体与镜中红夫人连线的垂直平分线，已用 Python 侧 MaryMirrorUnit.position/direction 验证。
 			// 镜子没放出时镜中红夫人停在 y≈-1000，下面坐标读取处的 Z>=-300 会让 mirror=false。
 			if (pd1==450){
-			    uintptr_t coorPtr = getPtr64(cur_obj + 0x28);
+			    uintptr_t coorPtr = SceneLayout::coor(cur_obj);
 			    if (strstr(filter_class_name.c_str(), "boss") != NULL && strstr(filter_class_name.c_str(), "redqueen") != NULL && strstr(filter_class_name.c_str(), "mirror") == NULL
 			        && getFloat(coorPtr + 0xa0) != 0 && getFloat(coorPtr + 0xa8) != 0) {
 			        uint8_t kind = 0;
@@ -1359,6 +1817,9 @@ void read_thread(long int PD1,long int PD2,long int PD3)
 			}    						
         }
         g_scan_busy = false;   // 【临时诊断】data[] 改写结束
+        // 局内本体一个都读不出类名：结构可能(又)变了，10 秒节流再搜一次
+        if (truth_ready && truth_hits > 0 && body_name_fail >= truth_hits && time(NULL) - LayoutInfer::g_last_try >= 10)
+            LayoutInfer::g_done = false;
         // 【临时诊断】本体集合里、却根本不在这份快照里的
         if (truth_ready) {
             uint64_t bodies[64];
@@ -1985,7 +2446,7 @@ void Draw_Main(ImDrawList *Draw){
         float anc[3];
         bool has_truth = false;
         if (has_auth_self) {
-            uint64_t coor = getPtr64(auth_self + 0x28);
+            uint64_t coor = SceneLayout::coor(auth_self);
             has_truth = is_user_ptr(coor) && vm_readv(coor + 0xa0, anc, 12) && !(anc[0] == 0 && anc[2] == 0);
         }
         uint64_t cur_slot = libbase + MatrixOffset;
@@ -2050,7 +2511,7 @@ void Draw_Main(ImDrawList *Draw){
     }
     bool body_valid = false, mirror_valid = false;
     if (redqueen_obj != 0) {
-        uintptr_t redqueen_coor = getPtr64(redqueen_obj + 0x28);
+        uintptr_t redqueen_coor = SceneLayout::coor(redqueen_obj);
         if (redqueen_coor != 0) {
             redqueen_x = getFloat(redqueen_coor + 0xa0);
             redqueen_z = getFloat(redqueen_coor + 0xa4);
@@ -2059,7 +2520,7 @@ void Draw_Main(ImDrawList *Draw){
         }
     }
     if (redqueen_mirror_obj != 0) {
-        uintptr_t mirror_coor = getPtr64(redqueen_mirror_obj + 0x28);
+        uintptr_t mirror_coor = SceneLayout::coor(redqueen_mirror_obj);
         if (mirror_coor != 0) {
             redqueen_mirror_x = getFloat(mirror_coor + 0xa0);
             redqueen_mirror_z = getFloat(mirror_coor + 0xa4);
@@ -2079,7 +2540,7 @@ void Draw_Main(ImDrawList *Draw){
     if (!mirror && mirror_preview_obj != 0) {
         uint8_t visible = 0;
         vm_readv(mirror_preview_obj + 0x73, &visible, 1);
-        uintptr_t cp = getPtr64(mirror_preview_obj + 0x28);
+        uintptr_t cp = SceneLayout::coor(mirror_preview_obj);
         if (visible == 1 && cp != 0) {
             float px0 = getFloat(cp + 0xa0), pz0 = getFloat(cp + 0xa4), py0 = getFloat(cp + 0xa8);
             float nx = getFloat(cp + 0x90), ny = getFloat(cp + 0x98);
@@ -2488,7 +2949,7 @@ void Draw_Main(ImDrawList *Draw){
             if (PyProgress::door_opened(door)) continue;          // 已经开了的不用再画
             if (!door.can_open) continue;                         // 还没通电(不可开)的不画
 
-            uintptr_t coor_ptr = getPtr64((uintptr_t)door.scene_obj + 0x28);
+            uintptr_t coor_ptr = SceneLayout::coor((uintptr_t)door.scene_obj);
             if (coor_ptr == 0) continue;
             float mx = getFloat(coor_ptr + 0xa0);
             float mz = getFloat(coor_ptr + 0xa4);          // +0xa4 是高度
@@ -2531,7 +2992,7 @@ void Draw_Main(ImDrawList *Draw){
             if (PyProgress::is_decoded(g.progress)) continue;    // 破译完的机器本身和进度都不画
             float mx = g.x, mz = g.z, my = g.y;                   // x / 高度 / y
             if (g.scene_obj){
-                uintptr_t coor_ptr = getPtr64((uintptr_t)g.scene_obj + 0x28);
+                uintptr_t coor_ptr = SceneLayout::coor((uintptr_t)g.scene_obj);
                 float c[3];
                 if (coor_ptr && vm_readv(coor_ptr + 0xa0, c, 12) && !(c[0] == 0 && c[2] == 0)){
                     mx = c[0]; mz = c[1]; my = c[2];
@@ -2580,7 +3041,7 @@ void Draw_Main(ImDrawList *Draw){
             if (!PyItems::get(i, it)) continue;
             if (!it.owned || it.bind_type == 0 || it.owner_body == 0) continue;
             if (item_is_mine(it, auth_self)) continue;
-            uintptr_t coor_ptr = getPtr64((uintptr_t)it.owner_body + 0x28);
+            uintptr_t coor_ptr = SceneLayout::coor((uintptr_t)it.owner_body);
             float c[3];
             if (!coor_ptr || !vm_readv(coor_ptr + 0xa0, c, 12)) continue;
             float mx = c[0], mz = c[1], my = c[2];                // x / 高度 / y
@@ -2789,7 +3250,7 @@ void Draw_Main(ImDrawList *Draw){
             if (!NativeBones::read_unit(Ms[u], is_self, sk) || !sk.valid) continue;
             if (is_self) continue;                                // 自身只用于 swap 校准,不画(若辰 ignoreSelfBones)
             // 和其它绘制一样：离自己 <1m 的不画(多是自己身上的残留模型),没自身锚点时不过滤
-            uint64_t coor = getPtr64(Ms[u] + 0x28);
+            uint64_t coor = SceneLayout::coor(Ms[u]);
             if (self_obj != 0 && coor >= 0x5000000000ULL && coor < 0x8000000000ULL) {
                 float c[3];
                 if (vm_readv(coor + 0xa0, c, 12)) {
@@ -2963,6 +3424,13 @@ void Draw_Main(ImDrawList *Draw){
     uint64_t mirror_img = PyProgress::mirror_image_obj();
     if (mirror_img == 0) mirror_img = redqueen_mirror_obj;
 
+    // 疯眼控制台第一层地图开着时：循环里收求生者(场景坐标 + 名字)，循环后画到地图上(见 PyMadEye.h)
+    const PyMadEye::MapState mad_ms = PyMadEye::state();
+    const bool mad_on = PyMadEye::enabled && mad_ms.open;
+    struct MadDot { float x, z, h; char name[64]; };
+    static MadDot mad_dots[16];
+    int mad_n = 0;
+
     for (int i = 0; i < data_count; i++){
 
         if (strstr(data[i].class_name, "buzz") != NULL)
@@ -3025,6 +3493,12 @@ void Draw_Main(ImDrawList *Draw){
 		}
 		if (D.Z<=-300){
 		    continue;//跳过地下
+		}
+		// 疯眼地图：放在下面那些"不画"过滤之前收(被扛着的、离得远的也要上地图)。D.X/D.Y = Python 的 (x, z)，D.Z 是高度
+		if (mad_on && data[i].camp == 2 && mad_n < 16 && !ShouldSkipEntity(data[i])) {
+		    MadDot &md = mad_dots[mad_n++];
+		    md.x = D.X; md.z = D.Y; md.h = D.Z;
+		    snprintf(md.name, sizeof(md.name), "%s", data[i].str);
 		}
 		if (data[i].camp == 1 || data[i].camp == 2) char_count++;
 		// 本体是监管时，游戏自己就会显示监管者个体，这里不再重复画任何监管者。
@@ -3359,11 +3833,47 @@ void Draw_Main(ImDrawList *Draw){
 	    if (mirror&&queen_on) draw_mirror_image(i);   // 红夫人镜像(见循环前的 draw_mirror_image)
     }
 
+    // ---- 疯眼控制台第一层地图：求生者画成绿点+名字，自己画黄圈(对照游戏 ico_self，它的锚点在图标底边中点) ----
+    {
+        static bool mad_logged = false;
+        if (mad_on && mad_ms.dw > 0) {
+            const float W = (float)displayInfo.width, H = (float)displayInfo.height;
+            const float fs = ImGui::GetFontSize() * 0.75f;
+            float sx, sy;
+            for (int k = 0; k < mad_n; k++) {
+                PyMadEye::to_screen(mad_ms, mad_dots[k].x, mad_dots[k].z, W, H, sx, sy);
+                Draw->AddCircleFilled({sx, sy}, 9.0f, ImColor(0, 0, 0, 200));
+                Draw->AddCircleFilled({sx, sy}, 7.0f, color_green);
+                fi_text(Draw, sx + 11.0f, sy - fs * 0.5f, fs, ImColor(255, 255, 255, 255), mad_dots[k].name);
+            }
+            float ssx = 0, ssy = 0;
+            if (self_obj != 0) {
+                PyMadEye::to_screen(mad_ms, Z.X, Z.Y, W, H, ssx, ssy);
+                Draw->AddCircle({ssx, ssy}, 10.0f, ImColor(255, 220, 0, 255), 0, 2.5f);
+            }
+            // 每次打开地图记一行：横竖两个像素比应一致(不一致 = 设计分辨率/适配理解错了)；
+            // 自己的屏幕位置用来跟截图里游戏的自己图标对照；地窖图带上各人高度和当前层
+            if (!mad_logged) {
+                mad_logged = true;
+                printf("[疯眼地图] 绘制 屏幕=%.0fx%.0f k横=%.4f k竖=%.4f 自己 世界=(%.1f,%.1f) 屏幕=(%.1f,%.1f) 锚点=%d 求生者%d:",
+                       W, H, W / mad_ms.dw, H / mad_ms.dh, Z.X, Z.Y, ssx, ssy, self_obj != 0, mad_n);
+                for (int k = 0; k < mad_n; k++) {
+                    PyMadEye::to_screen(mad_ms, mad_dots[k].x, mad_dots[k].z, W, H, sx, sy);
+                    printf(" %s(%.0f,%.0f h%.0f ->%.0f,%.0f)", mad_dots[k].name, mad_dots[k].x, mad_dots[k].z, mad_dots[k].h, sx, sy);
+                }
+                printf(" 层=%d\n", mad_ms.floor);
+                fflush(stdout);
+            }
+        } else {
+            mad_logged = false;
+        }
+    }
+
     // ---- 红夫人镜像(镜中红夫人 MaryMirrorImageUnit，键 247)：我是求生者时画，不看「夫人模式」(2026-11-05 用户要求) ----
     // 它的类名跟本体一样是 redqueen.gim、归监管，但不在本体集合([1]/[2]/[236]/[1065])里，原来被本体过滤挡掉，一直没画过。
     // 镜子没放出时它停在地下(y≈-1000)，高度 <= -300 不画。方框/距离跟着各自的开关
     float mi_c[3] = {0, 0, 0};
-    uint64_t mi_coor = mirror_img ? getPtr64(mirror_img + 0x28) : 0;
+    uint64_t mi_coor = mirror_img ? SceneLayout::coor(mirror_img) : 0;
     bool mi_read = mi_coor && vm_readv(mi_coor + 0xa0, mi_c, 12);
     {   // 【临时诊断】镜中红夫人：对象换了 / 升到地面或沉回地下时打一行
         static uint64_t last_mi = 0; static int last_up = -1;
@@ -3420,7 +3930,7 @@ void Draw_Main(ImDrawList *Draw){
             for (int i = 0; i < data_count; i++) if (data[i].obj == M) { idx = i; break; }
             if (idx < 0) { extra = data_count; return 1; }                                   // 不在 data[]
             const DataStruct &e = data[idx];
-            uint64_t fresh = getPtr64(M + 0x28);
+            uint64_t fresh = SceneLayout::coor(M);
             coor_bad = fresh != (uint64_t)e.objcoor;
             if (strstr(e.class_name, "buzz") || strstr(e.class_name, "nvyao.gim")) return 12;
             if (self_obj != 0 && M == self_obj) return -1;
@@ -3465,7 +3975,7 @@ void Draw_Main(ImDrawList *Draw){
             if (it == eps.end()) {
                 eps[M] = {frame_no, 1, r, extra, idx, tear, coor_bad, diag_count0};
                 if (r == 7) {   // 位置字段说在地下/原点，骨骼却画出来了：把两份坐标都打出来，看哪份过期
-                    uint64_t oc = getPtr64(M + 0x28);
+                    uint64_t oc = SceneLayout::coor(M);
                     float pos[3] = {0, 0, 0}, wm[16] = {0};
                     if (oc) { vm_readv(oc + 0xa0, pos, 12); vm_readv(oc + 0x1C0, wm, 64); }
                     diag_log("[框诊断] 缺框开始 本体0x%llx 类名=%s 位置+0xa0=(%.1f,%.1f,%.1f) 世界矩阵平移=(%.1f,%.1f,%.1f) 自身=(%.1f,%.1f,%.1f)\n",
@@ -4000,6 +4510,16 @@ void Layout_tick_UI(bool *main_thread_flag) {
             ImGui::TreePop();
             }
 
+            // 疯眼：控制台第一层地图上画求生者(绿点+名字)，黄圈是自己(用来对照游戏的自己图标)
+            if (sub_fold("疯眼", "Mad Eyes", "sf_madeye", PyMadEye::enabled,
+                         PyMadEye::enabled && battle && my_camp == 1 && my_pid == 80, true)) {
+            ImGui::Checkbox(T("控制台地图显示求生者##madeye", "Survivors on console map##madeye"), &PyMadEye::enabled);
+            help_marker("打开控制台的第一层(全图)时，在游戏地图上画出求生者位置。黄圈是自己，应该落在游戏自己图标的底边中点",
+                        "When the console's full map is open, draw survivors on it. The yellow ring is you and should sit at the bottom-centre of the game's own icon");
+            ImTextT("状态: %s", "Status: %s", PyMadEye::status_text());
+            ImGui::TreePop();
+            }
+
             // 作曲家修机节奏：按游戏判定点(begin_time + 时长 − 判定线偏移)点左右两个修机键，不管技能轨道
             if (sub_fold("作曲家修机", "Composer Fix", "sf_mus", AutoMusician::enabled,
                          AutoMusician::enabled && battle && my_camp == 2 && my_pid == 114, true)) {
@@ -4091,6 +4611,11 @@ void Layout_tick_UI(bool *main_thread_flag) {
                             "Stand next to a pallet and press it; if the game reacts, the touch point is on the pallet button");
                 ImGui::EndTable();
             }
+
+            ImGui::Checkbox(T("板子状态走Python(实验)##pallet_py", "Pallet state from Python (exp.)##pallet_py"), &AutoPallet::state_from_py);
+            help_marker("关=老的场景偏移；开=读游戏脚本里板子的 state(1=立着)。两边都会写「[板子对照]」日志",
+                        "Off = old scene offset; on = read the pallet's script-side state (1 = standing). Both are logged as [板子对照]");
+            ImGui::TextDisabled("Python板子: %s", PyPanel::status_text());
 
             // 触发宽度(游戏单位，判定矩形的全宽)：固定 / 随机(每次点完在上下限之间重抽)，范围都是 5~15
             ImGui::Checkbox(T("随机宽度##pallet_rand", "Random width##pallet_rand"), &AutoPallet::random_width);

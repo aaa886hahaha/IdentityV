@@ -64,6 +64,7 @@
 #include <unordered_map>
 #include <string>
 #include "PySelf.h"
+#include "PyPanel.h"
 #include "TouchHelperA.h"
 
 extern float dist_scale;   // draw_Gui.cpp：1 米 = 11.886 游戏单位
@@ -72,6 +73,9 @@ namespace AutoPallet {
 
 // ---- 界面配置(渲染线程写、盖板线程读；跟 show_draw_* 一样直接共享，单个 bool/int/float 的撕裂无害) ----
 static bool  enabled = true;
+// 板子立没立的来源(2026-11-18)：false = 场景偏移 [[obj+0x750]+0x30]==16(老)，true = Python PanelUnit.state==1(IDLE)。
+// 两边每轮都读、变化时打「[板子对照]」日志，开关只决定用哪个做判定。Python 那边是先验，上机日志确认后再改默认
+static bool  state_from_py = false;
 static float width = 10.8f;                // 固定模式的触发宽度(游戏单位)
 static bool  random_width = false;         // 随机模式：每次点完在下限~上限之间重抽
 static float width_lo = 8.0f, width_hi = 12.0f;
@@ -166,7 +170,7 @@ static inline bool finite3(const float *v)
 // 场景对象坐标：out = {X, Y, 高度}(跟若辰一样把水平两轴放前面)
 static bool read_pos(uint64_t obj, float out[3], uint64_t *coor_out = nullptr)
 {
-    uint64_t coor = getPtr64(obj + 0x28);
+    uint64_t coor = SceneLayout::coor(obj);
     if (coor < 0x5000000000ULL || coor >= 0x8000000000ULL) return false;
     float raw[3];
     if (!vm_readv(coor + 0xa0, raw, sizeof(raw))) return false;
@@ -193,18 +197,21 @@ static inline float hdist(const float *a, const float *b)
     return sqrtf(dx * dx + dy * dy);
 }
 
-// 场景对象类名(五跳链，跟读线程同一条)。监管对象一局只有一两个，按地址缓存
+// 场景对象类名(跟读线程同一条，走 SceneLayout 当前生效的类名链；2026-11-18 补：原来这里还写死老五跳链，新版读不出)。
+// 监管对象一局只有一两个，按地址缓存
 static std::string class_name_of(uint64_t obj)
 {
     static std::unordered_map<uint64_t, std::pair<uint64_t, std::string>> cache;
-    uint64_t head = getPtr64(obj + 0xf8);
+    const SceneLayout::Chain ch = SceneLayout::name_chain();
+    uint64_t head = getPtr64(obj + ch.hop[0]);
     auto it = cache.find(obj);
     if (it != cache.end() && it->second.first == head) return it->second.second;
-    uint64_t name_obj = getPtr64(getPtr64(getPtr64(getPtr64(head) + 0x8) + 0x20) + 0x20);
-    int len = getDword(name_obj + 0x10);
+    uint64_t name_obj = SceneLayout::name_node(head, ch);
+    if (!name_obj) return std::string();
+    int len = getDword(name_obj + ch.fin + 8);
     if (len <= 0 || len >= 256) return std::string();
     std::string s(len, '\0');
-    if (!vm_readv(getPtr64(name_obj + 0x8), &s[0], len)) return std::string();
+    if (!vm_readv(getPtr64(name_obj + ch.fin), &s[0], len)) return std::string();
     if (cache.size() > 16) cache.clear();
     cache[obj] = std::make_pair(head, s);
     return s;
@@ -362,6 +369,18 @@ static void thread_main()
     uint32_t rng = (uint32_t)now_ms() | 1;
     bool     last_random = false;
     float    last_lo = -1.f, last_hi = -1.f;
+    int64_t  py_refresh_ms = 0;
+    int      py_sum_last[4] = {-1, -1, -1, -1};
+    std::unordered_map<uint64_t, std::pair<int, int>> cmp_last;   // 板子 obj -> 上次打日志时的(场景值, Python 值)，-999 = 读不到
+    // 某块板现在立着吗：两边都读；返回按开关选的那个。scene_st/py_st 给日志用(-999 = 读不到)
+    auto board_standing = [&](uint64_t o, const float *pos, int &scene_st, int &py_st, int &how) {
+        int s = -1, p = -1;
+        bool sok = read_state(o, s);
+        int pi = PyPanel::find(o, pos, how);
+        bool pok = pi >= 0 && PyPanel::read_state(pi, p);
+        scene_st = sok ? s : -999; py_st = pok ? p : -999;
+        return state_from_py ? (pok && p == PyPanel::ST_IDLE) : (sok && s == BOARD_STANDING);
+    };
 
     while (true) {
         usleep(LOOP_US);
@@ -477,6 +496,55 @@ static void thread_main()
         memcpy(boards, g_boards[ba], sizeof(uint64_t) * nb);
         if (infos.size() > 256) infos.clear();
 
+        // Python 板子表 1 秒重扫一次；配对统计变了就打一行(看指针配得上几块、靠坐标配上几块、几块配不上)
+        if (t - py_refresh_ms > 1000) {
+            py_refresh_ms = t;
+            int pn = PyPanel::refresh();
+            int c[6] = {0, 0, 0, 0, 0, 0}, nread = 0;
+            for (int i = 0; i < nb; i++) {
+                auto it = infos.find(boards[i]);
+                if (it == infos.end()) continue;
+                int how = 0;
+                PyPanel::find(boards[i], it->second.pos, how);
+                c[how]++; nread++;
+            }
+            int ptr = c[1] + c[3] + c[4] + c[5];
+            if (pn != py_sum_last[0] || ptr != py_sum_last[1] || c[2] != py_sum_last[2] || c[0] != py_sum_last[3]) {
+                printf("[板子Py] %s；场景板 %d 块(已读位置 %d)：model指针 %d、idle模型 %d、putdown模型 %d、destroy模型 %d、坐标 %d、配不上 %d\n",
+                       PyPanel::status_text(), nb, nread, c[1], c[3], c[4], c[5], c[2], c[0]);
+                py_sum_last[0] = pn; py_sum_last[1] = ptr; py_sum_last[2] = c[2]; py_sum_last[3] = c[0];
+            }
+            // 样本(每张 Python 表打一次，表首实例变了 = 换局)：前 3 块的各指针/坐标/状态 + 离它最近的场景板，查配对为什么失败
+            static uint64_t dumped_first = 0;
+            if (pn > 0 && nread > 0 && PyPanel::g_list[0].inst != dumped_first) {
+                dumped_first = PyPanel::g_list[0].inst;
+                for (int k = 0; k < pn && k < 3; k++) {
+                    const PyPanel::Panel &pp = PyPanel::g_list[k];
+                    int st = -999; PyPanel::read_state(k, st);
+                    uint64_t nobj = 0; float nd = 1e9f;
+                    const float pyh[3] = {pp.pos[0], pp.pos[2], pp.pos[1]};   // Python {X,高度,Y} → 本文件约定 {X,Y,高度}
+                    for (int i = 0; i < nb; i++) {
+                        auto it = infos.find(boards[i]);
+                        if (it == infos.end() || !pp.pos_ok) continue;
+                        float d = hdist(pyh, it->second.pos);
+                        if (d < nd) { nd = d; nobj = boards[i]; }
+                    }
+                    printf("[板子Py] 样本#%d inst=0x%llx state=%d model=%d→0x%llx(%s) static=%d idle=0x%llx putdown=0x%llx destroy=0x%llx\n",
+                           k, (unsigned long long)pp.inst, st, (int)pp.model_ok, (unsigned long long)pp.scene,
+                           pp.scene ? class_name_of(pp.scene).c_str() : "-", (int)pp.ssm_ok,
+                           (unsigned long long)pp.st_scene[0], (unsigned long long)pp.st_scene[1], (unsigned long long)pp.st_scene[2]);
+                    if (nobj) {
+                        const BoardInfo &bi = infos[nobj];
+                        printf("[板子Py]   position=(%.1f,%.1f,%.1f) ok=%d ；最近场景板 0x%llx(%s) 位置=(%.1f,%.1f,%.1f) 水平距离 %.1f\n",
+                               pp.pos[0], pp.pos[1], pp.pos[2], (int)pp.pos_ok, (unsigned long long)nobj, class_name_of(nobj).c_str(),
+                               bi.pos[0], bi.pos[1], bi.pos[2], nd);
+                    } else {
+                        printf("[板子Py]   position=(%.1f,%.1f,%.1f) ok=%d ；没算最近场景板\n", pp.pos[0], pp.pos[1], pp.pos[2], (int)pp.pos_ok);
+                    }
+                }
+            }
+        }
+
         uint64_t best = 0;
         float best_d = 1e30f;
         bool  best_pred = false;                     // 命中来自预判(监管还没进区)
@@ -502,10 +570,21 @@ static void thread_main()
             if (hdist(S, bi.pos) > SELF_BOARD_MAX) continue;       // 若辰的预筛([sp+0xcdc])
             near_n++;
 
-            int state = -1;
-            bool state_ok = read_state(o, state);
-            bool standing = state_ok && state == BOARD_STANDING;
+            int sst = -999, pst = -999, how = 0;
+            bool standing = board_standing(o, bi.pos, sst, pst, how);
             if (standing) standing_n++;
+            {   // 对照日志：只打附近的板、只在任一边的值变了时打
+                auto &last = cmp_last[o];
+                if (last.first != sst || last.second != pst) {
+                    bool ss = sst == BOARD_STANDING, ps = pst == PyPanel::ST_IDLE;
+                    printf("[板子对照] obj=0x%llx 场景=%d%s Python=%d(%s) 配对=%s 位置=(%.1f,%.1f) 离我%.1f%s\n",
+                           (unsigned long long)o, sst, ss ? "(立着)" : "", pst, pst == -999 ? "读不到" : PyPanel::state_name(pst),
+                           PyPanel::how_name(how), bi.pos[0], bi.pos[1], hdist(S, bi.pos),
+                           (sst != -999 && pst != -999 && ss != ps) ? " ← 立没立不一致" : "");
+                    last = {sst, pst};
+                }
+                if (cmp_last.size() > 512) cmp_last.clear();
+            }
 
             bool hit = false, hit_pred = false;
             for (int h = 0; standing && h < nh && !hit; h++) {
@@ -541,11 +620,15 @@ static void thread_main()
 
         // 点完的那块：状态离开 16 = 放下了
         if (pending) {
-            int st = -1;
-            if (read_state(pending, st) && st != BOARD_STANDING) {
+            int sst = -999, pst = -999, how = 0;
+            auto pit = infos.find(pending);
+            bool still = pit != infos.end() ? board_standing(pending, pit->second.pos, sst, pst, how) : true;
+            bool known = state_from_py ? pst != -999 : sst != -999;
+            if (known && !still) {
                 g_confirmed++;
-                printf("[盖板] 板子状态已变化 obj=0x%llx state=%d 用时=%lldms\n",
-                       (unsigned long long)pending, st, (long long)(t - pending_ms));
+                printf("[盖板] 板子状态已变化 obj=0x%llx 场景=%d Python=%d(%s) 来源=%s 用时=%lldms\n",
+                       (unsigned long long)pending, sst, pst, pst == -999 ? "读不到" : PyPanel::state_name(pst),
+                       state_from_py ? "Python" : "场景", (long long)(t - pending_ms));
                 pending = 0;
             } else if (t - pending_ms > 3000) {
                 pending = 0;                                         // 3 秒没倒，不再跟踪

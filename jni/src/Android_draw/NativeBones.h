@@ -89,9 +89,10 @@ static int split_biped(const char *name, int &target)
 // 一个骨架里可能有好几套 biped：破轮 polun.skeleton 是三个人拼的，biped / biped01 只有头颈脊椎腿、没手臂，
 // biped03 才 17 个目标全有(2026-10-30 从 chr_boss.idx 的动画 NAME 块读出)。所以按前缀分组，取命中最多的一组，
 // 平手取无前缀那组 —— 普通角色只有 "biped"，结果跟原来一样。
-static bool build_namemap(uint64_t SKEL, NameMap &nm)
+// names_off = 名字表 begin 在 SKEL 里的偏移(老 0x80，end 在其后 +8)；str_off = 名字池节点里字符串的偏移(老 0x10)
+static bool build_namemap(uint64_t SKEL, NameMap &nm, int names_off = 0x80, int str_off = 0x10)
 {
-    uint64_t begin = getPtr64(SKEL + 0x80), end = getPtr64(SKEL + 0x88);
+    uint64_t begin = getPtr64(SKEL + names_off), end = getPtr64(SKEL + names_off + 8);
     if (!is_ptr(begin) || !is_ptr(end) || end <= begin) return false;
     uint64_t bytes = end - begin;
     if ((bytes & 15) != 0 || bytes > 0x2000) return false;
@@ -112,7 +113,7 @@ static bool build_namemap(uint64_t SKEL, NameMap &nm)
         if (!is_ptr(l1)) continue;
         uint64_t l2 = getPtr64(l1 + (uint64_t)(id & 0x3FFF) * 8);
         if (!is_ptr(l2)) continue;
-        if (!vm_readv(l2 + 0x10, name, sizeof(name) - 1)) continue;
+        if (!vm_readv(l2 + str_off, name, sizeof(name) - 1)) continue;
         name[sizeof(name) - 1] = 0;
         int t = -1;
         int g = split_biped(name, t);
@@ -134,61 +135,40 @@ static bool build_namemap(uint64_t SKEL, NameMap &nm)
     return nm.max_idx >= 0;
 }
 
-// 读一个单位(M = model+0x20)的骨架。is_self=true 时顺便做 swap_yz 校准。只走类型1。
-static bool read_unit(uint64_t M, bool is_self, Skeleton &out)
+static int namemap_hits(const NameMap &nm)
 {
-    out.valid = false;
-    if (!is_ptr(M)) { if (is_self) setlog("骨骼: M 无效"); return false; }
-    uint64_t ANIM = getPtr64(M + 0x818);
-    if (!is_ptr(ANIM)) { if (is_self) setlog("骨骼: [M+0x818](ANIM) 无效 —— 可能是类型0/这版偏移不同"); return false; }
-    if (!is_ptr(getPtr64(ANIM + 0x1D8))) { if (is_self) setlog("骨骼: [ANIM+0x1D8] 校验失败"); return false; }
-    uint64_t P2 = getPtr64(ANIM + 0x1E8);
-    uint64_t SKEL = is_ptr(P2) ? getPtr64(P2 + 0x30) : 0;
-    if (!is_ptr(SKEL)) { if (is_self) setlog("骨骼: SKEL([[ANIM+0x1E8]+0x30]) 无效"); return false; }
-    uint64_t X26 = getPtr64(M + 0x28);
-    if (!is_ptr(X26)) { if (is_self) setlog("骨骼: X26([M+0x28]) 无效"); return false; }
-    float wm[16];
-    if (!vm_readv(X26 + 0x1C0, wm, 64)) { if (is_self) setlog("骨骼: 世界矩阵读失败"); return false; }
-    if (getPtr64(M + 0x28) != X26) return false;                       // 防竞态
-    for (int k = 0; k < 16; k++) if (!std::isfinite(wm[k])) return false;
+    int h = 0;
+    for (int t = 0; t < NUM_TARGET; t++) if (nm.idx[t] >= 0) h++;
+    return h;
+}
 
-    auto it = g_namecache.find(SKEL);
-    if (it != g_namecache.end()) {                                     // 命中也要核对：名字表首尾指针 + 校验项的名字 id(2 次读)
-        const NameMap &c = it->second;
-        uint64_t be[2] = {0, 0};
-        uint32_t cid = 0;
-        bool same = vm_readv(SKEL + 0x80, be, 16)
-                 && (be[0] & 0x00FFFFFFFFFFFFFFULL) == c.begin && (be[1] & 0x00FFFFFFFFFFFFFFULL) == c.end
-                 && c.check_i >= 0 && vm_readv(c.begin + (uint64_t)c.check_i * 16, &cid, 4) && cid == c.check_id;
-        if (!same) { g_namecache.erase(it); it = g_namecache.end(); }
-    }
-    if (it == g_namecache.end()) {
-        NameMap nm;
-        if (!build_namemap(SKEL, nm)) { if (is_self) setlog("骨骼: 名字表建不起来(名字池偏移?)"); return false; }
-        if (g_namecache.size() > 32) g_namecache.clear();
-        it = g_namecache.emplace(SKEL, nm).first;
-    }
-    const NameMap &nm = it->second;
-
-    uint64_t POSE = getPtr64(ANIM + 0x248);
-    if (!is_ptr(POSE)) { if (is_self) setlog("骨骼: POSE([ANIM+0x248]) 无效"); return false; }
+// POSE 当前帧的姿态 × 世界矩阵 -> 各目标骨骼的原始世界坐标(未做 swap_yz)。返回算出了几根；pose 双缓冲翻了返回 -1
+// mode 0 = 老双缓冲 ARRAY=[POSE+0x10 / +0x18 按 flag(+0x24)&2]；mode 1 = ARRAY=[[POSE+0x10]+0x18](朋友写法的另一种读法)
+static int pose_world(uint64_t POSE, const NameMap &nm, const float wm[16], float rx[], float ry[], float rz[], bool rok[], int mode = 0)
+{
+    for (int t = 0; t < NUM_TARGET; t++) rok[t] = false;
     uint8_t flag0 = 0;
-    if (!vm_readv(POSE + 0x24, &flag0, 1)) return false;
-    uint64_t ARRAY = getPtr64(POSE + 0x10 + ((flag0 & 2) ? 8 : 0));
-    if (!is_ptr(ARRAY)) { if (is_self) setlog("骨骼: ARRAY(pose双缓冲) 无效"); return false; }
+    uint64_t ARRAY = 0;
+    if (mode == 1) {
+        uint64_t mid = getPtr64(POSE + 0x10);
+        if (!is_ptr(mid)) return 0;
+        ARRAY = getPtr64(mid + 0x18);
+    } else {
+        if (!vm_readv(POSE + 0x24, &flag0, 1)) return 0;
+        ARRAY = getPtr64(POSE + 0x10 + ((flag0 & 2) ? 8 : 0));
+    }
+    if (!is_ptr(ARRAY)) return 0;
     int need = nm.max_idx + 1;
-    if (need < 1 || need > 512) return false;
-    static thread_local float block[512 * 16];
-    if (!vm_readv(ARRAY, block, (size_t)need * 64)) { if (is_self) setlog("骨骼: 姿态数组读失败"); return false; }
-    uint8_t flag1 = 0;
-    if (!vm_readv(POSE + 0x24, &flag1, 1)) return false;
-    if ((flag0 & 2) != (flag1 & 2)) return false;                      // pose 翻了,整帧丢
-
-    // 先把每根算成原始世界 (rx,ry,rz)
-    float rx[32], ry[32], rz[32];
-    bool rok[32];
+    if (need < 1 || need > 512) return 0;
+    static thread_local float block[512 * 16 + 64];
+    if (!vm_readv(ARRAY, block, (size_t)need * 64)) return 0;
+    if (mode == 0) {
+        uint8_t flag1 = 0;
+        if (!vm_readv(POSE + 0x24, &flag1, 1)) return 0;
+        if ((flag0 & 2) != (flag1 & 2)) return -1;                      // pose 翻了,整帧丢
+    }
+    int n = 0;
     for (int t = 0; t < NUM_TARGET; t++) {
-        rok[t] = false;
         int bi = nm.idx[t];
         if (bi < 0 || bi > nm.max_idx) continue;
         const float *m = block + bi * 16;
@@ -200,8 +180,92 @@ static bool read_unit(uint64_t M, bool is_self, Skeleton &out)
         float wz = v0*wm[2] + v1*wm[6] + v2*wm[10] + v3*wm[14];
         if (!(std::isfinite(wx) && std::isfinite(wy) && std::isfinite(wz))) continue;
         if (fabsf(wx) > 1e7f || fabsf(wy) > 1e7f || fabsf(wz) > 1e7f) continue;
-        rx[t] = wx; ry[t] = wy; rz[t] = wz; rok[t] = true;
+        rx[t] = wx; ry[t] = wy; rz[t] = wz; rok[t] = true; n++;
     }
+    return n;
+}
+
+// 结构反推用：这具骨架像不像长在位置 pos(X/高度/Y)的这个人身上 ——
+// ≥10 根算得出、全部在水平 40 单位(约 3.4 米)内、高度在脚下 15 到头上 60 之间(y/z 两种摆法任一成立)，且不是全挤在一个点上
+static bool skeleton_plausible(const float rx[], const float ry[], const float rz[], const bool rok[], const float pos[3])
+{
+    for (int swap = 0; swap < 2; swap++) {
+        int n = 0; bool ok = true;
+        float hmin = 1e9f, hmax = -1e9f;
+        for (int t = 0; t < NUM_TARGET && ok; t++) {
+            if (!rok[t]) continue;
+            float h = swap ? rz[t] : ry[t], y2 = swap ? ry[t] : rz[t];
+            if (fabsf(rx[t] - pos[0]) > 40 || fabsf(y2 - pos[2]) > 40 || h < pos[1] - 15 || h > pos[1] + 60) ok = false;
+            if (h < hmin) hmin = h;
+            if (h > hmax) hmax = h;
+            n++;
+        }
+        if (ok && n >= 10 && hmax - hmin > 3) return true;
+    }
+    return false;
+}
+
+// 按当前骨骼链(SceneLayout::bone_layout)从 M 走到 SKEL，顺带拿到 POSE 的基节点。失败返回 false，why = 断在哪
+static bool walk_bone_chain(uint64_t M, const SceneLayout::BoneLayout &bl, uint64_t &SKEL, uint64_t &POSE, const char *&why)
+{
+    uint64_t node[SceneLayout::MAX_HOP + 1];
+    node[0] = M;
+    for (int i = 0; i < bl.skel.n; i++) {
+        node[i + 1] = getPtr64(node[i] + bl.skel.hop[i]);
+        if (!is_ptr(node[i + 1])) { why = i == 0 ? "骨骼: ANIM(骨架链第1跳) 无效 —— 这版偏移不同?看日志[结构反推]骨骼" : "骨骼: 骨架链中途无效"; return false; }
+    }
+    if (SceneLayout::same_bone(bl, SceneLayout::BONE_DEFAULT) && !is_ptr(getPtr64(node[1] + 0x1D8))) { why = "骨骼: [ANIM+0x1D8] 校验失败"; return false; }
+    SKEL = node[bl.skel.n];
+    if (bl.pose_base < 0 || bl.pose_base >= bl.skel.n) { why = "骨骼: pose_base 越界"; return false; }
+    POSE = getPtr64(node[bl.pose_base] + bl.pose_off);
+    if (!is_ptr(POSE)) { why = "骨骼: POSE 无效"; return false; }
+    return true;
+}
+
+// 读一个单位(M = model+0x20)的骨架。is_self=true 时顺便做 swap_yz 校准。只走类型1。
+static bool read_unit(uint64_t M, bool is_self, Skeleton &out)
+{
+    out.valid = false;
+    if (!is_ptr(M)) { if (is_self) setlog("骨骼: M 无效"); return false; }
+    const SceneLayout::BoneLayout bl = SceneLayout::bone_layout();
+    uint64_t SKEL = 0, POSE = 0;
+    const char *why = "";
+    if (!walk_bone_chain(M, bl, SKEL, POSE, why)) { if (is_self) setlog(why); return false; }
+    const uint64_t ANIM = getPtr64(M + bl.skel.hop[0]);                 // 只给日志用
+    // X26 = 等效 objcoor(老版 [M+0x28]；结构变了按反推出的坐标链走，见 SceneLayout.h)
+    uint64_t X26 = SceneLayout::coor(M);
+    if (!is_ptr(X26)) { if (is_self) setlog("骨骼: X26([M+0x28]) 无效"); return false; }
+    float wm[16];
+    if (!vm_readv(X26 + 0x1C0, wm, 64)) { if (is_self) setlog("骨骼: 世界矩阵读失败"); return false; }
+    if (SceneLayout::coor(M) != X26) return false;                     // 防竞态
+    for (int k = 0; k < 16; k++) if (!std::isfinite(wm[k])) return false;
+
+    auto it = g_namecache.find(SKEL);
+    if (it != g_namecache.end()) {                                     // 命中也要核对：名字表首尾指针 + 校验项的名字 id(2 次读)
+        const NameMap &c = it->second;
+        uint64_t be[2] = {0, 0};
+        uint32_t cid = 0;
+        bool same = vm_readv(SKEL + bl.names_off, be, 16)
+                 && (be[0] & 0x00FFFFFFFFFFFFFFULL) == c.begin && (be[1] & 0x00FFFFFFFFFFFFFFULL) == c.end
+                 && c.check_i >= 0 && vm_readv(c.begin + (uint64_t)c.check_i * 16, &cid, 4) && cid == c.check_id;
+        if (!same) { g_namecache.erase(it); it = g_namecache.end(); }
+    }
+    if (it == g_namecache.end()) {
+        NameMap nm;
+        if (!build_namemap(SKEL, nm, bl.names_off, bl.str_off)) { if (is_self) setlog("骨骼: 名字表建不起来(名字池偏移?)"); return false; }
+        if (g_namecache.size() > 32) g_namecache.clear();
+        it = g_namecache.emplace(SKEL, nm).first;
+    }
+    const NameMap &nm = it->second;
+
+    // 先把每根算成原始世界 (rx,ry,rz)
+    float rx[32], ry[32], rz[32];
+    bool rok[32];
+    uint8_t flag0 = 0;
+    vm_readv(POSE + 0x24, &flag0, 1);
+    int got = pose_world(POSE, nm, wm, rx, ry, rz, rok, bl.pose_mode);
+    if (got == 0 && is_self) setlog("骨骼: 姿态数组读不到(pose 双缓冲/ARRAY)");
+    if (got <= 0) return false;
 
     // swap_yz 校准(自身,一次):比较根骨原始世界与 objcoor(+0xa0 = X/高度/Y)的水平两轴
     int swap = g_swap_yz.load();

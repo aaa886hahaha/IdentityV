@@ -569,7 +569,7 @@ static void read_survivors(uint64_t ubt)
         uint64_t mo = inst_attr(v, h_s_model, "model", ok);
         uint64_t so = ok ? PyCore::get_scene_obj(mo) : 0;
         float pos[3];
-        uint64_t coor = so ? getPtr64(so + 0x28) : 0;
+        uint64_t coor = so ? SceneLayout::coor(so) : 0;
         if (!coor || !vm_readv(coor + 0xa0, pos, 12) || (pos[0] == 0 && pos[2] == 0) || pos[1] < -300) continue;
         Surv &s = g_surv[g_nsurv];
         memcpy(s.pos, pos, 12); s.r = 4.f; s.h = 16.f;
@@ -604,7 +604,7 @@ static void collect_gens(Result &res)
         PyProgress::Entry e;
         if (!PyProgress::get_gen_entry(i, e) || !e.scene_obj) continue;
         Gen &g = g_gen[g_ngen];
-        uint64_t coor = getPtr64(e.scene_obj + 0x28);
+        uint64_t coor = SceneLayout::coor(e.scene_obj);
         float m[12];
         if (!coor || !vm_readv(coor + 0x78, m, 48)) continue;      // +0x78 起 3×3(每行 12 字节)，+0xa0 位置
         float pos[3];
@@ -770,7 +770,7 @@ static void thread_main()
         }
         st.n_surv = g_nsurv;
         uint64_t anchor = 0; float O[3];
-        uint64_t coor = PySelf::anchor(anchor) ? getPtr64(anchor + 0x28) : 0;
+        uint64_t coor = PySelf::anchor(anchor) ? SceneLayout::coor(anchor) : 0;
         if (!coor || !vm_readv(coor + 0xa0, O, 12) || (O[0] == 0 && O[2] == 0)) {
             snprintf(st.why, sizeof(st.why), "%s", T("自身坐标读不到", "self position unreadable")); publish(); continue;
         }

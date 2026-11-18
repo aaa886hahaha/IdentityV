@@ -61,6 +61,8 @@
 #include <unistd.h>
 #include "PyRoot.h"
 #include "PyCore.h"
+#include "SceneLayout.h"
+#include <mutex>
 
 // 命名空间跟文件同名(PySelf)；draw_Gui.cpp 里另有全局变量 `uintptr_t self_obj`，别起成 self_obj 之类重名
 namespace PySelf {
@@ -119,7 +121,8 @@ static inline bool is_copycat_player_type(int t) {
 // flags_ok = 这一轮 dead/stealth/soul/changing/boxed/face_as 读成功了(读不到时身份簿沿用旧值)
 // boxed   = 被送货员装着(GameStateComponent.game_state == Boxed)：位置每 tick 被设成送货员的，不画，改在送货员名字后列出
 // face_as = 千面人变身中扮的号码(FaceManComponent.face_status == Change 时 tar_face_id + 1)，0 = 没变身
-struct CopycatEntry { uint64_t body; int identity; int seat; bool flags_ok, dead, stealth, soul, changing, boxed; int face_as; };
+// ptype   = 来自 units_by_type 哪个键(1088/1210/1211)，身份簿收入/拒收日志用
+struct CopycatEntry { uint64_t body; int identity; int seat; bool flags_ok, dead, stealth, soul, changing, boxed; int face_as; int ptype; };
 
 struct Snapshot {
     uint64_t anchor;                  // 当前操控单位的场景对象，0 = 没读到
@@ -160,6 +163,20 @@ struct Snapshot {
     int64_t  yidhra_ops[MAX_HUNTERS];      // 梦之女巫当前操控的单位 uid(_current_yidhra_puppet_uid)
     int      yidhra_op_count;
 };
+
+// ---- 结构反推用的真值(2026-11-15，见 SceneLayout.h / draw_Gui.cpp layout_infer) ----
+// 读线程要一次：置 g_truth_want，本线程下一轮收本体时顺手读 unit.position / unit.model_path，收完发布、seq+1。
+// 只在要的那一轮读，平时零开销。约瑟夫镜像(out_photo_uid 有值)不收：它的位置是镜像算出来的
+struct BodyTruth { uint64_t body; float pos[3]; bool pos_ok; char path[128]; };
+static const int MAX_TRUTH = 16;
+static std::atomic<bool>     g_truth_want{false};
+static std::atomic<uint32_t> g_truth_seq{0};
+static std::mutex g_truth_mu;
+static BodyTruth g_truth[MAX_TRUTH];
+static int       g_truth_n = 0;
+static BodyTruth g_truth_work[MAX_TRUTH];
+static int       g_truth_work_n = 0;
+static int64_t   g_tr_i_pos = -1, g_tr_i_path = -1;
 
 // 双缓冲发布：写线程填非活跃缓冲，填完再翻转，绘制线程永远读到完整的一份
 static Snapshot g_buf[2];
@@ -417,6 +434,51 @@ static inline bool read_armor(uint64_t d, const Dict &dk, int64_t &idx)
     return idx >= 0 && getPtr64(value_slot(dk, idx)) == PyRoot::g_true;
 }
 
+// 结构反推的真值：unit.position(防竞态：读指针 -> 读对象 -> 再读指针) + unit.model_path
+static void truth_add(uint64_t d, const Dict &dk, uint64_t body)
+{
+    if (g_truth_work_n >= MAX_TRUTH) return;
+    BodyTruth t;
+    memset(&t, 0, sizeof(t));
+    t.body = body;
+    g_tr_i_pos = resolve_index(d, dk, g_tr_i_pos, "position");
+    if (g_tr_i_pos >= 0) {
+        uint64_t slot = value_slot(dk, g_tr_i_pos);
+        for (int k = 0; k < 3 && !t.pos_ok; k++) {
+            uint64_t vp = getPtr64(slot);
+            if (!is_obj(vp)) break;
+            uint8_t b[0x1c];
+            if (!vm_readv(vp, b, sizeof(b)) || getPtr64(slot) != vp) continue;
+            int64_t rc = 0; memcpy(&rc, b, 8);
+            if (rc <= 0) continue;
+            float v[3]; memcpy(v, b + 0x10, 12);
+            bool ok = !(v[0] == 0 && v[2] == 0);
+            for (int a = 0; a < 3; a++) if (!std::isfinite(v[a]) || fabsf(v[a]) > 1e5f) ok = false;
+            if (ok) { memcpy(t.pos, v, 12); t.pos_ok = true; }
+        }
+    }
+    g_tr_i_path = resolve_index(d, dk, g_tr_i_path, "model_path");
+    if (g_tr_i_path >= 0) PyCore::read_str(getPtr64(value_slot(dk, g_tr_i_path)), t.path, sizeof(t.path));
+    if (t.pos_ok || t.path[0]) g_truth_work[g_truth_work_n++] = t;
+}
+
+// 读线程调：要一份真值，最多等 timeout_ms。返回份数(0 = 没拿到)
+static int get_truth(BodyTruth *out, int cap, int timeout_ms)
+{
+    uint32_t s0 = g_truth_seq.load();
+    g_truth_want = true;
+    for (int t = 0; t < timeout_ms; t += 10) {
+        usleep(10 * 1000);
+        if (g_truth_seq.load() == s0) continue;
+        std::lock_guard<std::mutex> lk(g_truth_mu);
+        int n = g_truth_n < cap ? g_truth_n : cap;
+        memcpy(out, g_truth, n * sizeof(BodyTruth));
+        return n;
+    }
+    g_truth_want = false;
+    return 0;
+}
+
 // 扫一类单位：
 //   another_model -> 废弃模型黑名单
 //   model         -> 本体集合(幻灯师分身 is_civilian_puppet==True 不收)
@@ -483,6 +545,7 @@ static void collect_units(uint64_t ubt, int type, Snapshot &res)
         // 约瑟夫镜世界门控：没拍照(photo 未激活)时镜像投影(out_photo_uid>0)整体不收 →
         // 不在本体集合里 → 绘制侧方框/名字/距离/骨骼自然全不画。拍照后才收，按 body_mirror 画成白色。
         if (!(is_mirror && !g_photo_active.load())) add_body(res, body, is_mirror, unit_in_photo, type != 2);
+        if (!is_mirror && g_truth_want.load(std::memory_order_relaxed)) truth_add(d, dk, body);
         // 监管本体(预知监管)只认真身约瑟夫，镜像监管(若有)不当本体
         if (type == 1 && !is_mirror && !(slot ? slot->is_puppet : class_name_has_puppet(cls))) {
             if (res.hunter_body == 0) res.hunter_body = body;
@@ -549,7 +612,7 @@ static bool read_position(uint64_t d, const Dict &dk, uint64_t body, float out[3
             if (known == 0) {
                 g_pos_type = tp;                               // 锁定类型
                 if (body) {                                    // 只为日志：布局对不对得上场景坐标
-                    uint64_t coor = getPtr64(body + 0x28);
+                    uint64_t coor = SceneLayout::coor(body);
                     float s[3];
                     if (is_obj(coor) && vm_readv(coor + 0xa0, s, 12)) {
                         bool m = fabsf(s[0]-v[0]) <= POS_CALIB_TOL && fabsf(s[1]-v[1]) <= POS_CALIB_TOL
@@ -888,10 +951,20 @@ static void collect_copycat(uint64_t ubt, uint64_t um_for_stage, Snapshot &res)
             CopycatEntry e;
             memset(&e, 0, sizeof(e));
             e.body = body;
+            e.ptype = ptype;
             int64_t v = 0;
             g_cc_i_index = resolve_index(d, dk, g_cc_i_index, "copycat_index");
-            if (g_cc_i_index >= 0 && read_int(getPtr64(value_slot(dk, g_cc_i_index)), v) && v >= 0 && v < MAX_COPYCAT)
-                e.seat = (int)v + 1;
+            // 号码读两遍(2026-11-18「13号 ?」)：跨进程读，键校验和取值不是原子的 —— 中间 dict 扩容/页被换出，
+            // 值槽可能已经指向别的属性的小整数。值指针前后一致、两次值相同、键还在原位才认
+            if (g_cc_i_index >= 0) {
+                const uint64_t slot = value_slot(dk, g_cc_i_index);
+                const uint64_t vp = getPtr64(slot);
+                int64_t v2 = -1;
+                if (read_int(vp, v) && v >= 0 && v < MAX_COPYCAT
+                    && getPtr64(slot) == vp && read_int(vp, v2) && v2 == v
+                    && resolve_index(d, dk, g_cc_i_index, "copycat_index") == g_cc_i_index)
+                    e.seat = (int)v + 1;
+            }
             // 同一号码一轮只认第一份(2026-11-10 导演局实测)：导演局里 [1210] 导演分身和 [1088] 真人带同一个 copycat_index，
             // 两份都写身份簿同一格时，状态每轮被分身覆盖(降灵师「等变灵魂」1/0 来回跳了 1.1 万行)、坐标也被换成分身的。
             // [1088] 在 COPYCAT_PLAYER_TYPES 最前面，所以真人优先；重复的只照旧进本体集合，不读状态/坐标、不进簿子
@@ -919,7 +992,9 @@ static void collect_copycat(uint64_t ubt, uint64_t um_for_stage, Snapshot &res)
                 static bool logged[MAX_COPYCAT];
                 if (um_for_stage != seen_um) { seen_um = um_for_stage; memset(logged, 0, sizeof(logged)); memset(g_seat_first_ms, 0, sizeof(g_seat_first_ms)); }
                 const int64_t first = e.seat > 0 ? g_seat_first_ms[e.seat - 1] : 0;
-                if (e.seat > 0 && !logged[e.seat - 1] && (e.identity || (first && now - first > 5000))) {
+                // 号码 >12 或不是 1088 来的：不等身份/5 秒，第一次见到就打(只出现一两帧的怪号码以前一行都留不下)
+                const bool odd = e.seat > 12 || ptype != COPYCAT_PLAYER_TYPE;
+                if (e.seat > 0 && !logged[e.seat - 1] && (odd || e.identity || (first && now - first > 5000))) {
                     logged[e.seat - 1] = true;
                     uint64_t inst = getPtr64(items + i * 8);
                     uint64_t tp = is_obj(inst) ? getPtr64(inst + 8) : 0;
@@ -1036,16 +1111,45 @@ static void book_merge(const Snapshot &res, uint64_t um)
         return;
     }
     bool changed = false;
+    // 新号码进簿子的闸(2026-11-18「会议列表多出 13号 ?」)：簿子一旦 known 就整局锁存，
+    // 以前读坏一帧(号码槽读到别的值)就永久多出一行，而且「新号码」日志要等身份/5 秒，一帧的怪号码一行都不留。
+    // 现在：同一号码要**连续两轮**都读到(body 不为 0 时两轮 body 一致)，且 body 没被别的号码占着，才收进簿子。
+    // 收入/拒收都打日志 —— 列表上的每一行都能在日志里找到来历
+    static int      pend_round[MAX_COPYCAT];     // 上一轮见到这个(未收入)号码的轮次
+    static uint64_t pend_body[MAX_COPYCAT];
+    static bool     rej_logged[MAX_COPYCAT];
+    static int      round_no = 0;
+    round_no++;
     if (is_obj(um) && um != g_book_um) {         // um 读不到(0)时什么都不动
         if (!book_empty(g_book_work)) changed = true;
         memset(&g_book_work, 0, sizeof(g_book_work));
         g_book_um = um;
+        memset(pend_round, 0, sizeof(pend_round)); memset(pend_body, 0, sizeof(pend_body)); memset(rej_logged, 0, sizeof(rej_logged));
     }
     for (int i = 0; i < res.copycat_count; i++) {
         const CopycatEntry &e = res.copycat[i];
         if (e.seat < 1 || e.seat > MAX_COPYCAT) continue;       // 号码读不到就不知道记到哪一格
         CopycatSeat &b = g_book_work.seat[e.seat - 1];
-        if (!b.known) { b.known = true; changed = true; }
+        if (!b.known) {
+            const int k = e.seat - 1;
+            int owner = 0;                                       // body 已经属于簿子里另一个号码 = 同一个人被读出了第二个号码
+            if (e.body) for (int j = 0; j < MAX_COPYCAT; j++)
+                if (j != k && g_book_work.seat[j].known && g_book_work.seat[j].body == e.body) { owner = j + 1; break; }
+            if (owner) {
+                if (!rej_logged[k]) {
+                    rej_logged[k] = true;
+                    printf("[模仿者] 拒收 %d号 键=%d 身份%d body=0x%llx 已属于%d号\n", e.seat, e.ptype, e.identity, (unsigned long long)e.body, owner);
+                    fflush(stdout);
+                }
+                pend_round[k] = 0;
+                continue;
+            }
+            const bool again = pend_round[k] == round_no - 1 && (!e.body || !pend_body[k] || e.body == pend_body[k]);
+            if (!again) { pend_round[k] = round_no; pend_body[k] = e.body; continue; }
+            b.known = true; changed = true;
+            printf("[模仿者] 簿子收入 %d号 键=%d 身份%d body=0x%llx\n", e.seat, e.ptype, e.identity, (unsigned long long)e.body);
+            fflush(stdout);
+        }
         if (e.body && e.body != b.body) { b.body = e.body; changed = true; }
         if (e.identity && e.identity != b.identity) { b.identity = e.identity; changed = true; }
         if (!e.flags_ok) continue;
@@ -1291,8 +1395,17 @@ static bool try_refresh()
     res.in_mirror = self_in_players(res.uid);
 
     // ---- 二、废弃模型黑名单 + 本体集合 + 监管本体 ----
+    const bool truth_round = g_truth_want.load();
+    if (truth_round) g_truth_work_n = 0;
     if (is_obj(ubt))
         for (int i = 0; i < UNIT_TYPE_COUNT; i++) collect_units(ubt, UNIT_TYPES[i], res);
+    if (truth_round && g_truth_work_n > 0) {           // 收到了才发布；一个没收到就留着 want，下一轮再试
+        std::lock_guard<std::mutex> lk(g_truth_mu);
+        memcpy(g_truth, g_truth_work, g_truth_work_n * sizeof(BodyTruth));
+        g_truth_n = g_truth_work_n;
+        g_truth_want = false;
+        g_truth_seq++;
+    }
     book_mark_self(res.anchor);
     // 这一段读不到不算失败：锚点已经拿到了。本体数为 0 时绘制侧会退回按类名画
 
