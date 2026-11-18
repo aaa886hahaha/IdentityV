@@ -145,7 +145,7 @@ void calculate_line_reflection(float x1, float y1, float x2, float y2, float xs,
 uintptr_t libbase;
 uintptr_t Arrayaddr, Count, Matrix;
 uintptr_t cur_obj,self_obj,self_camp,namezfcz,namezfc;
-uintptr_t mirror_obj,mirror_preview_obj;
+uintptr_t mirror_preview_obj;
 float mirror_line_x1, mirror_line_y1, mirror_line_x2, mirror_line_y2;   // 本帧镜面在水平面上的直线(两点)，mirror==true 时有效
 int data_count,zfcz,zfc;
 float matrix[16];
@@ -154,13 +154,10 @@ float angle;
 static bool show_draw_Rect = true;//方框
 static bool show_draw_Bones = true;//原生骨骼(抄若辰链,驱动读)
 static bool show_draw_Line = false;//射线
-static bool show_draw_Camera = false;//相机
 static bool show_draw_Door = true;//门(开门进度，走 Python 层单独绘制，不依赖 getscene)
-static bool show_draw_Box = false;//盒子
 static bool show_draw_Name = true;//名字
 static bool show_draw_Distance = true;//距离
 static bool show_draw_Cellar = true;//地窖
-static bool show_draw_Chair = false;//椅子
 static bool show_draw_Prop = false;//道具
 static bool show_draw_Genius = true;//天赋/辅助特质(走 CPython 链路，见 PyGenius.h)
 static bool show_draw_prophet = true;//预知监管者
@@ -176,7 +173,6 @@ static bool show_demo_window = false;
 static bool show_another_window = false;
 static bool show_window = true;  // 音量键控制：音量下=隐藏，音量上=显示
 static bool voice = true;
-static bool inform_ghost = true; // 显示鬼魂
 static bool show_sohook = false;  // 骨骼与进度覆盖层
 static bool show_genius_tree = true;  // 监管天赋树(径向图，独立可拖动窗口)
 static bool show_crosshair = true;    // 准星(所有角色通用)，位置 = WaxAim::aim_x/aim_y
@@ -227,14 +223,14 @@ static const CfgItem CFG_ITEMS[] = {
     {"english", CFG_BOOL, &g_english},                {"panel_alpha", CFG_FLOAT, &panel_alpha},
     // 绘制设置
     {"show_rect", CFG_BOOL, &show_draw_Rect},          {"show_bones", CFG_BOOL, &show_draw_Bones},
-    {"show_line", CFG_BOOL, &show_draw_Line},          {"show_camera", CFG_BOOL, &show_draw_Camera},
-    {"show_door", CFG_BOOL, &show_draw_Door},          {"show_box", CFG_BOOL, &show_draw_Box},
+    {"show_line", CFG_BOOL, &show_draw_Line},
+    {"show_door", CFG_BOOL, &show_draw_Door},
     {"show_name", CFG_BOOL, &show_draw_Name},          {"show_distance", CFG_BOOL, &show_draw_Distance},
-    {"show_cellar", CFG_BOOL, &show_draw_Cellar},      {"show_chair", CFG_BOOL, &show_draw_Chair},
+    {"show_cellar", CFG_BOOL, &show_draw_Cellar},
     {"show_prop", CFG_BOOL, &show_draw_Prop},          {"show_genius", CFG_BOOL, &show_draw_Genius},
     {"show_prophet", CFG_BOOL, &show_draw_prophet},    {"redqueen_mode", CFG_BOOL, &redqueenmod},
     {"show_cipher", CFG_BOOL, &show_draw_secret_mechine}, {"show_role", CFG_BOOL, &show_draw_Role},
-    {"debug", CFG_BOOL, &Debugging},                   {"show_ghost", CFG_BOOL, &inform_ghost},
+    {"debug", CFG_BOOL, &Debugging},
     {"show_genius_tree", CFG_BOOL, &show_genius_tree},
     // 娱乐模式
     {"copycat_mode", CFG_BOOL, &copycat_mode},         {"waterfight_mode", CFG_BOOL, &waterfight_mode},
@@ -698,14 +694,43 @@ inline bool should_filter(const std::string& name) {
     return false;
 }
 
-// ================== 幽灵/隐身状态判定(合并原有特殊场景排除) ==================
-// +0x70 == 0x1000000 且 +0x1a0 == 450.0 才是"正常在场"的真实角色/道具;
-// 其余取值(包括65150鬼魂视角等)统一视为幽灵态, 由 inform_ghost 决定是否仍然显示。
-// 方框配色也用这一个判据 —— 热更后鬼魂的 +0x70 不再是 65150, 只认 65150 会让鬼魂框不变白。
+// ================== 被游戏屏蔽的单位(白框) ==================
+// 定义(2026-11-19 用户定)：客观存在、但游戏不让我看见的单位 —— 梦之女巫本体(求生者视角)、伊斯人幻影等。
+//   客观存在   = 在本体集合里(Python units_by_type 的活单位；死人/废弃模型/装饰物都不在里面)
+//   游戏屏蔽   = 模型可见位 +0x73 == 0。所有屏蔽路径最终都写它：set_visible(False)，以及伊斯幻影
+//                PhantomGhostUnit.tick 每帧直接写 model.visible(这条不更新 unit.total_visibility，所以不用那个 Python 副本)。
+//   不受距离影响：本体全是 CivilianUnit / ButcherUnit 子类，它们的 lod_callback 只换精度、不动 visible
+//                (远处密码机不可见是 GeneratorUnit/BaseUnit 的 LOD，跟这里无关)。
+// 只决定方框颜色，不挡任何对象，没有开关。+0x73 跟坐标 +0xa0 一样是模型自身字段，换包挪了改这里。
+// 旧判据 "+0x70 != 0x1000000 || +0x1a0 != 450"(对所有对象生效、还混进了"不是角色类型")已删，过渡期只在「[鬼魂对照]」日志里算
+static const uintptr_t MODEL_VISIBLE_OFF = 0x73;
+static inline bool model_hidden(uintptr_t obj)
+{
+    uint8_t v = 1;
+    return vm_readv(obj + MODEL_VISIBLE_OFF, &v, 1) && v == 0;
+}
 bool IsGhostEntity(const DataStruct& obj) {
-    int checkVal = getDword(obj.obj + 0x70);
-    float checkFloat = getFloat(obj.obj + 0x1a0);
-    return (checkVal != 0x1000000 || checkFloat != 450.0f);
+    return PySelf::is_body(obj.obj) && model_hidden(obj.obj);
+}
+
+// 【过渡对照】旧判据和新判据对同一个本体结论不同时记一行(状态变了才记)。上机确认没问题后整段删
+static void ghost_compare_log(const DataStruct& obj, float dist)
+{
+    if (!PySelf::is_body(obj.obj)) return;
+    const uint32_t v70 = getDword(obj.obj + 0x70);
+    const float    f1a0 = getFloat(obj.obj + 0x1a0);
+    const bool old_g = v70 != 0x1000000 || f1a0 != 450.0f;
+    const bool new_g = model_hidden(obj.obj);
+    static std::unordered_map<uint64_t, int> last;
+    const int key = (old_g ? 2 : 0) | (new_g ? 1 : 0);
+    auto it = last.find(obj.obj);
+    if (it != last.end() && it->second == key) return;
+    if (it == last.end() && !old_g && !new_g) { last[obj.obj] = key; return; }   // 首次见且两边都不是鬼魂：不记
+    last[obj.obj] = key;
+    if (last.size() > 256) last.clear();
+    printf("[鬼魂对照] obj=0x%llx %s 新(+0x73隐藏)=%d 旧(+0x70=0x%x +0x1a0=%.0f)=%d 距离%.0f米%s 类名=%s\n",
+           (unsigned long long)obj.obj, obj.str, (int)new_g, v70, f1a0, (int)old_g, dist,
+           old_g != new_g ? " ← 不一致" : "", obj.class_name);
 }
 
 bool ShouldSkipEntity(const DataStruct& obj) {
@@ -719,21 +744,11 @@ bool ShouldSkipEntity(const DataStruct& obj) {
 
     // 废弃模型(形态切换后留在数组里的旧形态)。这条取代了原来那份
     // "红蝶/无常/歌剧/破轮/木偶/冒险家" 的类名黑名单 —— 那份是按角色名猜的,
-    // 漏一个角色就漏一个, 而且只在 inform_ghost 打开时才生效。
+    // 漏一个角色就漏一个。
     // 现在直接问引擎: unit.another_model + 0x20 就是废弃形态的场景对象指针,
     // 精确、跟视角无关、不用维护名单。详见 PySelf.h 文件头。
     if (PySelf::is_stale_model(obj.obj)) return true;
-
-    // 约瑟夫镜世界：镜像投影要专门显示成白色方框，它们的 +0x70(visible) 在对面世界常为 0，
-    // 会被下面 IsGhostEntity 当幽灵在 inform_ghost 关时丢掉。这里显式放行(它们一定是本体集合里的玩家单位)。
-    if (PySelf::body_is_mirror(obj.obj)) return false;
-
-    bool is_ghost_obj = IsGhostEntity(obj);
-
-    // 注意 +0x70 就是 NeoX 模型对象的 visible, 是**渲染剔除的结果**:
-    // 废弃模型恒不可见, 但远处的真实对象同样不可见。所以它只能当"要不要按幽灵显示"的开关,
-    // 绝不能当存在性/真假判据 —— 那会重演"求生者只看得到身边的密码机"。
-    if (is_ghost_obj && !inform_ghost) return true;
+    // 被游戏屏蔽的单位不在这里挡(2026-11-19 删了「显示鬼魂」开关)，只在方框颜色上画白(IsGhostEntity)
     return false;
 }
 
@@ -1588,7 +1603,7 @@ void read_thread(long int PD1,long int PD2,long int PD3)
         // 原来是"每轮先把全局清零、扫描中途再赋值"，绘制线程撞进这段(约1ms)就会读到 0，
         // 表现是红夫人模式下镜线约每分钟消失一帧。收在局部里，全局永远要么是上一轮的值、要么是新值。
         // 清零的本意(防跨局残留)仍然保留：局部变量每轮从 0 开始，发布时整体覆盖。
-        uintptr_t mirror_local = 0, mirror_preview_local = 0;
+        uintptr_t mirror_preview_local = 0;
         char prophet_local[sizeof(prophet_text)];
         prophet_local[0] = 0;
         // 自动盖板用的板子(类名含 woodplane)。getscene() 不认板子、它们进不了 data[]，所以单独收
@@ -1688,7 +1703,6 @@ void read_thread(long int PD1,long int PD2,long int PD3)
     	    }
 
 			int is_dup=0;
-			float pd1 = getFloat(cur_obj + 0x1a0);   // 原来还读一次 +0x298(pd2)，没人用，已删
 			for (int i = 0; i < entity_count; i++){
         		if(cur_obj == data[i].obj){
         		    is_dup=1;
@@ -1724,11 +1738,11 @@ void read_thread(long int PD1,long int PD2,long int PD3)
                 }
             }//预知结束
     		
-			if (strstr(filter_class_name.c_str(), "player") != NULL||strstr(filter_class_name.c_str(), "boss") != NULL || pd1 == 450 || strstr(filter_class_name.c_str(), "scene") != NULL || strstr(filter_class_name.c_str(), "prop") != NULL || strstr(filter_class_name.c_str(), "mirror") != NULL || Debugging )
+			if (strstr(filter_class_name.c_str(), "player") != NULL||strstr(filter_class_name.c_str(), "boss") != NULL || PySelf::is_body(cur_obj) || strstr(filter_class_name.c_str(), "scene") != NULL || strstr(filter_class_name.c_str(), "prop") != NULL || strstr(filter_class_name.c_str(), "mirror") != NULL || Debugging )
 			{
     			data[entity_count].obj = cur_obj;
     			// 阵营/str 必须先清零：下面那串 if-else 只有五个分支，而入口条件里的
-    			// `pd1 == 450` 和 `Debugging` 能让对象进来却一个分支都不命中。
+    			// `PySelf::is_body`(本体集合，类名不带 player/boss 的单位) 和 `Debugging` 能让对象进来却一个分支都不命中。
     			// data[] 是全局数组、原地复用，不清就会**沿用上一帧同下标那个对象的
     			// 阵营和名字** —— 表现是装饰物被当成角色画出来、还顶着别人的名字，
     			// 并且 内核人物数量 虚高。正常游玩时类名基本都能命中 player/boss，
@@ -1789,14 +1803,6 @@ void read_thread(long int PD1,long int PD2,long int PD3)
 			}
 			else if (diag_body) body_note(cur_obj, 5, 0);
     			
-			if (pd1==450){
-			    uintptr_t coorPtr = SceneLayout::coor(cur_obj);
-    			if (strstr(filter_class_name.c_str(), "boss") != NULL && strstr(filter_class_name.c_str(), "mirror") != NULL
-    			    && getFloat(coorPtr + 0xa0) != 0 && getFloat(coorPtr + 0xa8) != 0)
-    			{
-    		    	mirror_local=cur_obj;
-    			}    			
-			}    						
         }
         g_scan_busy = false;   // 【临时诊断】data[] 改写结束
         // 局内本体一个都读不出类名：结构可能(又)变了，10 秒节流再搜一次
@@ -1829,7 +1835,6 @@ void read_thread(long int PD1,long int PD2,long int PD3)
         }
         // 本轮结果一次性发布。prophet_local 为空(这轮没扫到监管)时保留上一轮的文本，
         // 跟原来"prophet_text 从不清零"的行为一致
-        mirror_obj          = mirror_local;
         mirror_preview_obj  = mirror_preview_local;
         if (show_draw_prophet && room_pid_ok) {
             int unknown_pids[2], n_unknown = 0;
@@ -1867,42 +1872,6 @@ void read_thread(long int PD1,long int PD2,long int PD3)
 
 
 
-// ---- 场景对象"是否本局真实存在"判定 ----
-// 游戏把所有候选刷新点、以及角色的每种形态都实例化成对象放进数组，本局/当前只激活其中一部分。
-// 未激活的那些类名、坐标全都正常，光看类名/坐标区分不出来。
-//
-// **判据是 +0x70（代码里原本叫 jxpd/checkVal）**，它是三态的：
-//     0          = 本局根本不存在 / 当前不是活跃形态
-//     0x1000000  = 正常存在
-//     其它非0    = 存在，但处于鬼魂/特殊状态（旧记录里的 65150 属于这一档）
-//
-// 怎么确认的：红蝶本体与 opposite 形态做变身前后差分，两个对象在 0x300 字节里
-// **各自只有 +0x70 这一列发生变化，且方向相反**（本体 0x1000000->0，opposite 0->0x1000000），
-// 同时对照组(9个约瑟夫相机 + 15个密码机)零变化。语义非常干净。
-// 横向验证：约瑟夫相机(每局默认加载但不存在) 4/4 全为 0；求生者 8 个对象里 +0x70!=0 的正好 4 个(实际人数)。
-//
-// 注意 +0x1a0 是"类型"字段(450=角色 500=可交互物)，**不是存在性**：
-// 曾经误用它单独做判据，结果一个不存在的密码机 +0x1a0 恰好就是 500，照样被画出来。
-//
-// 曾经用过 +0x30(实例化节点指针)，**已废弃**：它不稳定，同样是约瑟夫相机，
-// 一局里测到 13个只有1个非空，另一局 9个全部非空，不能用。
-// +0x6D 与 +0x73 都是单字节，分别藏在 +0x6C / +0x70 这两个 dword 里。
-//   +0x73 = 1  -> 当前活跃/在场（常见的 0x1000000 就是这个字节的 dword 形式）
-//   +0x6D      -> 实体种类位域: 0x40=角色/生物  0x10=玩家阵营相关  0x00=纯场景装饰
-static inline unsigned entity_active_byte(uintptr_t obj) { return (getDword(obj + 0x70) >> 24) & 0xFF; }
-static inline unsigned entity_kind_byte(uintptr_t obj) { return (getDword(obj + 0x6C) >> 8)  & 0xFF; }
-
-// **千万不要拿活跃位当"本局是否存在"用**：它是"当前对本机客户端可见"的意思，跟视角走。
-// 实测同一张图，监管视角下 12 台密码机活跃位全是 1，换成求生者视角只剩 1 台是 1。
-// 早先用它做密码机判据，导致求生者只能看到身边那一台，绕了一大圈才发现。
-//
-// 真正视角无关的存在性标记是 +0x240：
-//   实测 约瑟夫相机 7/7 = 0，破轮台 4/4 = 0（这两类都是每局默认加载、本局并不存在的装饰）
-//        密码机 真的 7 个 = 2 / 假的 5 个 = 0，箱子、求生者、监管 全部 = 2
-static inline bool entity_exists(uintptr_t obj)
-{
-    return getDword(obj + 0x240) == 2;
-}
 // 破译进度配色：<20 绿、20~60 黄、>60 红
 static inline ImColor progress_color(float v)
 {
@@ -3252,7 +3221,7 @@ void Draw_Main(ImDrawList *Draw){
     // 抽成 lambda(2026-11-04)：自身那行在循环开头就 continue 掉了，我是求生者时自己的镜像原来画不出来。
     // 现在常规求生者和自身各调一次。会改写 D(反射后的坐标)，调完这一行就不能再用 D
     auto draw_mirror_image = [&](int i) {
-            if (getFloat(data[i].obj+0x1a0)==450&&data[i].camp==2){
+            if (PySelf::is_body(data[i].obj) && data[i].camp==2){
                 std::string ss;
                 // 镜线在 Draw_Main 开头算好(放下的镜子 / 准备阶段预览镜子二选一)，这里只做一次关于直线的对称
                 float orig_x = D.X, orig_y = D.Y;
@@ -3394,7 +3363,7 @@ void Draw_Main(ImDrawList *Draw){
             if (!ShouldSkipEntity(data[i]) && !(D.X==0 && D.Y==0) && D.Z>-300) {
                 Z.X = D.X; Z.Z = D.Z; Z.Y = D.Y;
             }
-            // 我是求生者时自己的镜像也要画(红夫人镜子里的我)。lambda 里自带 camp==2 / 450 判断，监管自身不会画
+            // 我是求生者时自己的镜像也要画(红夫人镜子里的我)。lambda 里自带 camp==2 / 本体集合判断，监管自身不会画
             if (mirror && queen_on && !(D.X==0 && D.Y==0) && D.Z>-300) draw_mirror_image(i);
             continue; // 不管有效无效, 自身都不需要再走下面的常规实体流程
         }
@@ -3470,12 +3439,7 @@ void Draw_Main(ImDrawList *Draw){
         }
         if (W>0){
             if (Debugging){
-                // 调试绘制是独立分支，不走上面任何类别过滤，所以会把每局默认加载的装饰对象
-                // 一起画出来(表现为"同一个位置两份不同地址"、约瑟夫相机等)。这里统一挡掉。
-                // 判据用 +0x240 而不是活跃位：活跃位是"当前对本机可见"，跟视角走，
-                // 求生者视角下大量真实对象的活跃位也是 0，用它会把真东西一起挡掉。
-                // 想看全部对象(比如排查新偏移时)，把下面这行注释掉即可。
-                if (!entity_exists(data[i].obj)) continue;
+                // 调试绘制：标出 data[] 里每个对象的地址和类名(含每局默认加载的装饰对象)
                 std::string test;
                 sprintf(objtext, "%lx", data[i].obj);
                 test += " [";
@@ -3488,59 +3452,13 @@ void Draw_Main(ImDrawList *Draw){
                 Draw->AddText({r_x-(textSize.x/2),r_y}, ImColor(255,200,0,255), test.c_str());
             }
 
-            if (strstr(data[i].class_name, "camera") != NULL && dist < 38){
-                // 约瑟夫的相机每局都会默认加载十几个，跟这局有没有约瑟夫无关。
-                // 实测那些默认加载的 +0x240 全是 0（7/7），本局真实存在的物件是 2。
-                if (!entity_exists(data[i].obj)) continue;
-                if (getDword(data[i].obj + 0xa8)==256){
-		            continue;//跳过使用过的椅子
-		        }
-                std::string s;
-			    if (show_draw_Camera){                          
-                    s += T("[摄影机]", "[Camera]");
-                }
-                auto textSize = ImGui::CalcTextSize(s.c_str(), 0, 25);
-                Draw->AddText({r_x-(textSize.x/2),r_y}, ImColor(255,200,0,255), s.c_str());
-            }
             
 
 		
     		if (data[i].camp==3)
     		{
-    		    if (strstr(data[i].class_name, "dm65_scene_prop_30") != NULL){
-    			    std::string s;
-    		        if (show_draw_Door){
-                        s += T("[大门]", "[Exit Gate]");
-                    }
-                    auto textSize = ImGui::CalcTextSize(s.c_str(), 0, 25);
-                    Draw->AddText({r_x-(textSize.x/2),r_y}, ImColor(255,200,0,255), s.c_str());
-    		    }
-    		
-    		    else if (strstr(data[i].class_name, "dm65_scene_prop_01") != NULL&&dist<38){
-    			    std::string s;
-    		        if (show_draw_Box){                          
-    		            if (getDword(data[i].obj + 0x148)==0){
-    		                continue;//跳过使用过的箱子
-    		            }
-                        s += T("[道具箱]", "[Chest]");
-                    }    
-                    auto textSize = ImGui::CalcTextSize(s.c_str(), 0, 25);
-                    Draw->AddText({r_x-(textSize.x/2),r_y}, color_red, s.c_str());
-    		    }
-
-    		    else if (strstr(data[i].class_name, "dm65_scene_gallow") != NULL&&strstr(data[i].class_name, "bashou") == NULL&&dist<38){
-    			    std::string s;
-    		        if (show_draw_Chair){                          
-    		            if (getDword(data[i].obj + 0xa8)==256){
-    		                continue;//跳过使用过的椅子
-    		            }
-                        s += T("[狂欢之椅]", "[Rocket Chair]");
-                    }
-                    auto textSize = ImGui::CalcTextSize(s.c_str(), 0, 25);
-                    Draw->AddText({r_x-(textSize.x/2),r_y}, color_red, s.c_str());
-    		    }
-    		
-    		    else if (strstr(data[i].class_name, "dm65_scene_prop_76") != NULL){
+    		    // 只剩地窖：getscene() 只认 prop_76(大门/密码机按 Python 列表画，箱子/椅子/相机 2026-11-19 删)
+    		    if (strstr(data[i].class_name, "dm65_scene_prop_76") != NULL){
     			    std::string s;
     		        if (show_draw_Cellar){                                                  
                             s += T("[地窖] ", "[Dungeon] ");
@@ -3551,9 +3469,6 @@ void Draw_Main(ImDrawList *Draw){
                     Draw->AddText({r_x-(textSize.x/2),r_y}, color_purple, s.c_str());
     		    }
 
-    	    else if (strstr(data[i].class_name, "sender") != NULL){
-    	        // 密码机只按 PyProgress 的 Python 列表画(实体循环前)。Python 不可用时不画、不回退写死偏移，原因见「[密码机进度]」日志
-    	    }
     		}
 	
 		    if (show_draw_Prop&&data[i].camp==4){
@@ -3630,6 +3545,7 @@ void Draw_Main(ImDrawList *Draw){
 
                 if (!too_close && (data[i].camp==1||data[i].camp==2)){
                     if (g_diag_box_n < 64) g_diag_box[g_diag_box_n++] = data[i].obj;   // 【临时诊断】
+                    ghost_compare_log(data[i], dist);                                  // 【过渡对照】鬼魂新旧判据
                     // 本帧画了骨骼就用骨骼包围盒当方框(名字/距离/天赋/射线都跟着它走)，没骨骼才用上面写死高度那套
                     {
                         float bx1, by1, bx2, by2;
@@ -3876,13 +3792,13 @@ void Draw_Main(ImDrawList *Draw){
             float ry = py - (matrix[1]*c[0] + matrix[5]*(c[1]+8.5f) + matrix[9]*c[2] + matrix[13]) / cam * py;
             float rw = py - (matrix[1]*c[0] + matrix[5]*(c[1]+28.5f) + matrix[9]*c[2] + matrix[13]) / cam * py;
             if ((ry - rw) / 2 <= 0) return 8;
-            if (ShouldSkipEntity(e)) { extra = PySelf::is_stale_model(M) ? 1 : (IsGhostEntity(e) ? 2 : 3); return 4; }
+            if (ShouldSkipEntity(e)) { extra = PySelf::is_stale_model(M) ? 1 : 3; return 4; }
             if (self_obj != 0 && d < 1.0f) return 10;
             if (e.camp != 1 && e.camp != 2) { extra = e.camp; return 2; }
             return 0;                                                                        // 全部过滤都过得去
         };
         static const char *const RN[] = {"过滤都通过(本帧读到的 data[] 跟循环时不一样?)", "不在data[]", "camp不是1/2",
-                                         "判成局外(in_lobby)", "ShouldSkip(1废弃模型/2幽灵/3类名黑名单)", "不在本体集合",
+                                         "判成局外(in_lobby)", "ShouldSkip(1废弃模型/3类名黑名单)", "不在本体集合",
                                          "", "坐标为0或在地下(extra=1地下)", "W<=0(相机背后)", "距离>=300", "离自己<1m",
                                          "", "类名buzz/nvyao"};
         struct Ep { uint64_t start; int frames; int reason; int extra; int idx; bool tear; bool coor_bad; int count0; };
@@ -4287,9 +4203,6 @@ void Layout_tick_UI(bool *main_thread_flag) {
         if (ImGui::CollapsingHeader(T("绘制设置###draw", "Drawing###draw"))) {
             // 两列表格：复选框按列对齐(SameLine 排的话标签长短不一，第二列对不齐)
             if (ImGui::BeginTable("##draw_tbl", 2, ImGuiTableFlags_SizingFixedFit)) {
-                ImGui::TableNextColumn();
-                ImGui::Checkbox(T("显示鬼魂", "Show Ghosts"), &inform_ghost);
-                help_marker("鬼魂视角/幽灵态的角色也画出来(白框)", "Also draw characters in ghost state (white box)");
                 ImGui::TableNextColumn();
                 // 预知监管和模仿者模式互斥(模仿者局没有监管)
                 if (ImGui::Checkbox(T("预知监管", "Hunter Prophet"), &show_draw_prophet) && show_draw_prophet) { copycat_mode = false; waterfight_mode = false; }

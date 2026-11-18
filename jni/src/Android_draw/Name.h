@@ -269,6 +269,5 @@ static const char* getprop(const char* class_name) {
 static const char* getscene(const char* class_name) {
     if (!class_name) return nullptr;
     if (strstr(class_name, "prop_76")) return g_english ? "Dungeon" : "地窖";
-    if (strstr(class_name, "sender"))  return g_english ? "Cipher Machine" : "电机";
     return nullptr;
 }
