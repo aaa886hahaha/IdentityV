@@ -702,7 +702,7 @@ inline bool should_filter(const std::string& name) {
 //   不受距离影响：本体全是 CivilianUnit / ButcherUnit 子类，它们的 lod_callback 只换精度、不动 visible
 //                (远处密码机不可见是 GeneratorUnit/BaseUnit 的 LOD，跟这里无关)。
 // 只决定方框颜色，不挡任何对象，没有开关。+0x73 跟坐标 +0xa0 一样是模型自身字段，换包挪了改这里。
-// 旧判据 "+0x70 != 0x1000000 || +0x1a0 != 450"(对所有对象生效、还混进了"不是角色类型")已删，过渡期只在「[鬼魂对照]」日志里算
+// 旧判据 "+0x70 != 0x1000000 || +0x1a0 != 450"(对所有对象生效、还混进了"不是角色类型")已删(2026-11-19 对照日志上机核对过：唯一不一致是女巫刚出现时 +0x1a0 还没初始化)
 static const uintptr_t MODEL_VISIBLE_OFF = 0x73;
 static inline bool model_hidden(uintptr_t obj)
 {
@@ -713,25 +713,6 @@ bool IsGhostEntity(const DataStruct& obj) {
     return PySelf::is_body(obj.obj) && model_hidden(obj.obj);
 }
 
-// 【过渡对照】旧判据和新判据对同一个本体结论不同时记一行(状态变了才记)。上机确认没问题后整段删
-static void ghost_compare_log(const DataStruct& obj, float dist)
-{
-    if (!PySelf::is_body(obj.obj)) return;
-    const uint32_t v70 = getDword(obj.obj + 0x70);
-    const float    f1a0 = getFloat(obj.obj + 0x1a0);
-    const bool old_g = v70 != 0x1000000 || f1a0 != 450.0f;
-    const bool new_g = model_hidden(obj.obj);
-    static std::unordered_map<uint64_t, int> last;
-    const int key = (old_g ? 2 : 0) | (new_g ? 1 : 0);
-    auto it = last.find(obj.obj);
-    if (it != last.end() && it->second == key) return;
-    if (it == last.end() && !old_g && !new_g) { last[obj.obj] = key; return; }   // 首次见且两边都不是鬼魂：不记
-    last[obj.obj] = key;
-    if (last.size() > 256) last.clear();
-    printf("[鬼魂对照] obj=0x%llx %s 新(+0x73隐藏)=%d 旧(+0x70=0x%x +0x1a0=%.0f)=%d 距离%.0f米%s 类名=%s\n",
-           (unsigned long long)obj.obj, obj.str, (int)new_g, v70, f1a0, (int)old_g, dist,
-           old_g != new_g ? " ← 不一致" : "", obj.class_name);
-}
 
 bool ShouldSkipEntity(const DataStruct& obj) {
     // 这几类名字命中即直接跳过, 与幽灵判定无关(原本散落在渲染循环里, 现在收拢到一处)
@@ -3549,7 +3530,6 @@ void Draw_Main(ImDrawList *Draw){
 
                 if (!too_close && (data[i].camp==1||data[i].camp==2)){
                     if (g_diag_box_n < 64) g_diag_box[g_diag_box_n++] = data[i].obj;   // 【临时诊断】
-                    ghost_compare_log(data[i], dist);                                  // 【过渡对照】鬼魂新旧判据
                     // 本帧画了骨骼就用骨骼包围盒当方框(名字/距离/天赋/射线都跟着它走)，没骨骼才用上面写死高度那套
                     {
                         float bx1, by1, bx2, by2;
