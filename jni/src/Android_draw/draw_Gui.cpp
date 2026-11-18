@@ -3162,13 +3162,17 @@ void Draw_Main(ImDrawList *Draw){
             NativeBones::Skeleton sk;
             if (!NativeBones::read_unit(Ms[u], is_self, sk) || !sk.valid) continue;
             if (is_self) continue;                                // 自身只用于 swap 校准,不画(若辰 ignoreSelfBones)
-            // 和其它绘制一样：离自己 <1m 的不画(多是自己身上的残留模型),没自身锚点时不过滤
+            // 跟方框同一套过滤：坐标在原点(X 或 Y 为 0)/在地下(高度 <= -300)的不画 —— 梦之女巫还没放出去的信徒
+            // 停在原点(0, 9.7, 0)，方框早就挡了、骨骼原来没挡(2026-11-19 用户报)；离自己 <1m 的不画(多是自己身上的残留模型)
             uint64_t coor = SceneLayout::coor(Ms[u]);
-            if (self_obj != 0 && coor >= 0x5000000000ULL && coor < 0x8000000000ULL) {
+            if (coor >= 0x5000000000ULL && coor < 0x8000000000ULL) {
                 float c[3];
                 if (vm_readv(coor + 0xa0, c, 12)) {
-                    float d = sqrt(pow(c[0]-Z.X,2) + pow(c[2]-Z.Y,2) + pow(c[1]-Z.Z,2)) / dist_scale;
-                    if (d < 1.0f) continue;
+                    if (c[0] == 0 || c[2] == 0 || c[1] <= -300) continue;
+                    if (self_obj != 0) {
+                        float d = sqrt(pow(c[0]-Z.X,2) + pow(c[2]-Z.Y,2) + pow(c[1]-Z.Z,2)) / dist_scale;
+                        if (d < 1.0f) continue;
+                    }
                 }
             }
             ImVec2 bp[NativeBones::NUM_TARGET];
