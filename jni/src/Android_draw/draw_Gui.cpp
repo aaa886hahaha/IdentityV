@@ -1694,7 +1694,10 @@ void read_thread(long int PD1,long int PD2,long int PD3)
     		}
         	// 过滤随从等无关对象。Python 层的角色本体(unit.model+0x20)不过黑名单：台球手球形态的模型是
         	// chr/boss/billy/billy_weapon01.gim(皮肤 14801，BilliardComponent.billiard_change_model 换上)，会被 "weapon" 误杀(2026-10-25)
-        	if (should_filter(filter_class_name) && !PySelf::is_body(cur_obj)) {
+        	// 另一形态(another_model)也不过黑名单(2026-11-19)：球模型开局就建好挂在 another_model 上，换形态只是 model/another_model
+        	// 互换、数组指针集合不变，"数组变了就重扫"不触发。扫描时它不是本体就被扔掉，要等 2 秒保底才捡回来(实测约 1 秒不画)。
+        	// 留在 data[] 里，每帧由本体集合 / 废弃模型黑名单(ShouldSkipEntity)决定画哪个
+        	if (should_filter(filter_class_name) && !PySelf::is_body(cur_obj) && !PySelf::is_stale_model(cur_obj)) {
         		continue;
         	}
         	std::string s;
