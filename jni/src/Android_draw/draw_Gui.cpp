@@ -14,6 +14,7 @@
 #include "AutoPallet.h"
 #include "AutoQte.h"
 #include "AutoMusician.h"
+#include "AutoDrinker.h"
 #include "NativeBones.h"
 #include "GeniusTree.h"
 #include "PyWaterFight.h"
@@ -268,6 +269,12 @@ static const CfgItem CFG_ITEMS[] = {
     {"mus_r_x", CFG_FLOAT, &AutoMusician::r_x},                   {"mus_r_y", CFG_FLOAT, &AutoMusician::r_y},
     {"mus_lead_ms", CFG_INT, &AutoMusician::lead_ms},             {"mus_time_jitter_ms", CFG_INT, &AutoMusician::time_jitter_ms},
     {"mus_hold_ms", CFG_INT, &AutoMusician::hold_ms},             {"mus_jitter_px", CFG_INT, &AutoMusician::jitter_px},
+    // 调酒师自动给酒
+    {"dr_enabled", CFG_BOOL, &AutoDrinker::enabled},              {"dr_hp_mode", CFG_INT, &AutoDrinker::hp_mode},
+    {"dr_only_prefer", CFG_BOOL, &AutoDrinker::only_prefer},
+    {"dr_show_touch", CFG_BOOL, &AutoDrinker::show_touch_point},  {"dr_height", CFG_FLOAT, &AutoDrinker::ui_height},
+    {"dr_off_x", CFG_FLOAT, &AutoDrinker::off_x},                 {"dr_off_y", CFG_FLOAT, &AutoDrinker::off_y},
+    {"dr_hold_ms", CFG_INT, &AutoDrinker::hold_ms},               {"dr_jitter_px", CFG_INT, &AutoDrinker::jitter_px},
     // 窗口
     {"win_main_x", CFG_FLOAT, &cfg_main_x}, {"win_main_y", CFG_FLOAT, &cfg_main_y},
     {"win_tree_x", CFG_FLOAT, &cfg_tree_x}, {"win_tree_y", CFG_FLOAT, &cfg_tree_y},
@@ -1483,6 +1490,8 @@ void read_thread(long int PD1,long int PD2,long int PD3)
     AutoQte::start();
     // 作曲家修机节奏：独立线程，开着且在修机时 3ms 轮询两条轨道(见 AutoMusician.h)
     AutoMusician::start();
+    // 调酒师自动给酒：读 UIBattle.inter_widget_info 里给酒按钮(118)的可见/可点，30ms 一轮(见 AutoDrinker.h)
+    AutoDrinker::start();
 
     while (MatrixOffset==0||ArrayaddrOffset==0)
     {
@@ -2644,6 +2653,25 @@ void Draw_Main(ImDrawList *Draw){
             Draw->AddLine({tp.x - 12, tp.y}, {tp.x + 12, tp.y}, c, 2.0f);
             Draw->AddLine({tp.x, tp.y - 12}, {tp.x, tp.y + 12}, c, 2.0f);
             Draw->AddText({tp.x - 20, tp.y - 64}, c, i == 0 ? T("作曲家左", "Composer L") : T("作曲家右", "Composer R"));
+        }
+    }
+    // 调酒师给酒的预测点击点(浅蓝；选中的那个加粗)：每个有给酒按钮的队友各画一个，对着游戏按钮调「挂点高度」和 X/Y 微调
+    if (AutoDrinker::show_touch_point) {
+        const AutoDrinker::View dv = AutoDrinker::view();
+        for (int i = 0; dv.active && i < dv.n; i++) {
+            const AutoDrinker::Mate &m = dv.m[i];
+            if (!m.wine_vis || !m.scene) continue;
+            float p[3], sx, sy;
+            if (!AutoDrinker::socket_world(m.scene, p)) continue;
+            if (!AutoDrinker::tap_point(matrix, px, py, p, m.before, sx, sy)) continue;
+            bool sel = m.uid == dv.best_uid;
+            ImColor col = m.wine_on ? ImColor(80, 200, 255, 255) : ImColor(150, 150, 150, 255);
+            ImVec2 tp(sx, sy);
+            Draw->AddCircle(tp, 36.0f, col, 32, sel ? 5.0f : 2.5f);
+            if (AutoDrinker::jitter_px > 0) Draw->AddCircle(tp, (float)AutoDrinker::jitter_px, ImColor(255, 255, 0, 255), 24, 2.0f);
+            Draw->AddLine({tp.x - 12, tp.y}, {tp.x + 12, tp.y}, col, 2.0f);
+            Draw->AddLine({tp.x, tp.y - 12}, {tp.x, tp.y + 12}, col, 2.0f);
+            Draw->AddText({tp.x + 42, tp.y - 12}, col, sel ? T("给酒(选中)", "Wine (target)") : T("给酒", "Wine"));
         }
     }
 
@@ -4029,6 +4057,42 @@ static void help_marker(const char *zh, const char *en)
     }
 }
 
+// ---- 详细设置(二级窗口，2026-11-19 用户要求) ----
+// 主菜单只放开关和对局中要随时调的(给酒血量条件/优先队友、盖板触发宽度/预判)；
+// 设完就不管的(触摸点位置、X/Y、按住、随机、提前量、HUD 位置大小、测试按钮、状态计数)放进独立窗口「详细设置」。
+// 每个功能旁边一个小「设置」按钮：打开窗口并展开对应的那一节
+static bool g_settings_open = false;
+static const char *g_settings_focus = nullptr;
+
+// 点一次打开(并展开这一节)，再点一次关闭，像复选框但保持按钮样式；窗口开着时按钮高亮
+static void settings_button(const char *key, const char *cn = "设置", const char *en = "Settings", bool same_line = true)
+{
+    if (same_line) ImGui::SameLine();
+    char id[96];
+    snprintf(id, sizeof(id), "%s##set_%s", g_english ? en : cn, key);
+    const bool on = g_settings_open;
+    if (on) ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
+    if (ImGui::SmallButton(id)) {
+        if (on) { g_settings_open = false; g_settings_focus = nullptr; }
+        else    { g_settings_open = true;  g_settings_focus = key; }
+    }
+    if (on) ImGui::PopStyleColor();
+}
+
+// 详细设置窗口里的一节：被「设置」按钮点名的那节自动展开并滚到可见
+static bool settings_section(const char *cn, const char *en, const char *key)
+{
+    bool focus = g_settings_focus && strcmp(g_settings_focus, key) == 0;
+    if (focus) ImGui::SetNextItemOpen(true, ImGuiCond_Always);
+    char label[96];
+    snprintf(label, sizeof(label), "%s###setsec_%s", g_english ? en : cn, key);
+    bool open = ImGui::CollapsingHeader(label);
+    if (focus) { ImGui::SetScrollHereY(0.0f); g_settings_focus = nullptr; }
+    return open;
+}
+
+static void draw_settings_window();   // 定义在 Layout_tick_UI 后面
+
 void Layout_tick_UI(bool *main_thread_flag) {
     // 启动后第一帧：先记默认值，再读 /data 下的配置(要在 ImGui 上下文建好之后，cfg_set_msg 用到 GetTime)
     static bool cfg_autoloaded = false;
@@ -4227,85 +4291,29 @@ void Layout_tick_UI(bool *main_thread_flag) {
         // 准星：所有角色通用，默认关。位置/样式/大小/粗细整套按角色记(保存配置时写进去)；
         // 位置同时是蜡像师瞄准线对齐用的标记位置。没设过的角色沿用蜡像师的，再没有用默认(游戏蜡枪标记，十字+点)
         if (ImGui::CollapsingHeader(T("准星###xhair", "Crosshair###xhair"))) {
-            float mw = (float)displayInfo.width, mh = (float)displayInfo.height;
-            if (WaxAim::aim_x < 0) WaxAim::aim_x = mw * 0.5f;
-            if (WaxAim::aim_y < 0) WaxAim::aim_y = mh * WAX_MARK_Y;
             ImGui::Checkbox(T("显示准星##xh_on", "Show crosshair##xh_on"), &show_crosshair);
-            ImGui::SameLine();
-            if (ImGui::Button(T("恢复默认##xh_reset", "Reset##xh_reset"))) {
-                // 删掉本角色的记录：回到蜡像师的(当前就是蜡像师则回到默认)
-                if (g_xhair_pid > 0) g_xhair.erase(g_xhair_pid);
-                if (g_xhair_pid == WaxAim::WAX_PID) { g_xh = XhairCfg(); g_xh.x = mw * 0.5f; g_xh.y = mh * WAX_MARK_Y; }
-                else g_xh = xhair_for(g_xhair_pid);
-                WaxAim::aim_x = g_xh.x; WaxAim::aim_y = g_xh.y;
-            }
-            bool changed = false;
-            ImGui::SetNextItemWidth(ImGui::GetFontSize() * 8);
-            if (ImGui::BeginCombo(T("样式##xh_style", "Style##xh_style"), xhair_style_name(g_xh.style))) {
-                for (int s = 0; s < XH_STYLE_N; s++)
-                    if (ImGui::Selectable(xhair_style_name(s), s == g_xh.style)) { g_xh.style = s; changed = true; }
-                ImGui::EndCombo();
-            }
-            changed |= ImGui::SliderFloat(T("大小##xh_size", "Size##xh_size"), &g_xh.size, 3.0f, 60.0f, "%.0f");
-            changed |= ImGui::SliderFloat(T("粗细##xh_thick", "Thickness##xh_thick"), &g_xh.thick, 1.0f, 8.0f, "%.1f");
-            changed |= ImGui::SliderFloat(T("X##xh_x", "X##xh_x"), &WaxAim::aim_x, 0.0f, mw, "%.0f");
-            changed |= ImGui::SliderFloat(T("Y##xh_y", "Y##xh_y"), &WaxAim::aim_y, 0.0f, mh, "%.0f");
-            if (changed && g_xhair_pid > 0) {
-                g_xh.x = WaxAim::aim_x; g_xh.y = WaxAim::aim_y;
-                g_xhair[g_xhair_pid] = g_xh;
-            }
-            if (g_xhair_pid > 0)
-                ImGui::TextColored(ImVec4(0.65f, 0.65f, 0.65f, 1), T("当前角色 pid %d：%s", "Role pid %d: %s"), g_xhair_pid,
-                                   g_xhair.count(g_xhair_pid) ? T("用本角色的设置", "own settings") : T("沿用蜡像师/默认", "from Waxwork/default"));
+            settings_button("xhair");   // 样式/大小/粗细/位置在「详细设置」
         }
 
-        // 固定信息(屏幕 HUD 汇总)：每块独立开关 + 独立 X/Y/大小。调好位置后把初值固化即可
+        // 固定信息(屏幕 HUD 汇总)：主菜单只放开关，位置/大小在「详细设置」
         if (ImGui::CollapsingHeader(T("固定信息###fixed", "Fixed HUD###fixed"))) {
-            float mw = (float)displayInfo.width, mh = (float)displayInfo.height;
-
-            // 局内绘制的天赋行 / 大门：各自独立 bool，跟下面的固定信息面板互不共用
-            ImGui::Checkbox(T("显示天赋", "Show Talents"), &show_draw_Genius);   // 天赋行 + 监管辅助特质行(局内画框那套)
-            ImGui::SameLine();
-            ImGui::Checkbox(T("显示大门", "Show Gates"), &show_draw_Door);
-            ImGui::Separator();
-
-            ImGui::Checkbox(T("密码机/门面板##fi_gen", "Cipher/Gate panel##fi_gen"), &fi_gen_on);
-            if (fi_gen_on) {
-                ImGui::SliderFloat(T("机 X##fi_gen", "Gen X##fi_gen"), &fi_gen_x, 0.0f, mw, "%.0f");
-                ImGui::SliderFloat(T("机 Y##fi_gen", "Gen Y##fi_gen"), &fi_gen_y, 0.0f, mh, "%.0f");
-                ImGui::SliderFloat(T("机 大小##fi_gen", "Gen size##fi_gen"), &fi_gen_size, 10.0f, 60.0f, "%.0f");
+            if (ImGui::BeginTable("##fi_tbl", 2, ImGuiTableFlags_SizingFixedFit)) {
+                ImGui::TableNextColumn();
+                ImGui::Checkbox(T("显示天赋", "Show Talents"), &show_draw_Genius);   // 天赋行 + 监管辅助特质行(局内画框那套)
+                ImGui::TableNextColumn();
+                ImGui::Checkbox(T("显示大门", "Show Gates"), &show_draw_Door);
+                ImGui::TableNextColumn();
+                ImGui::Checkbox(T("密码机/门面板##fi_gen", "Cipher/Gate panel##fi_gen"), &fi_gen_on);
+                ImGui::TableNextColumn();
+                ImGui::Checkbox(T("监管特质/天赋##fi_hunter", "Hunter trait/talent##fi_hunter"), &fi_hunter_on);
+                ImGui::TableNextColumn();
+                ImGui::Checkbox(T("求生者天赋##fi_civ", "Survivor talents##fi_civ"), &fi_civ_on);
+                ImGui::TableNextColumn();
+                ImGui::Checkbox(T("骑士预测##fi_knight", "Knight prediction##fi_knight"), &fi_knight_on);
+                ImGui::EndTable();
             }
-
-            ImGui::Checkbox(T("监管特质/天赋##fi_hunter", "Hunter trait/talent##fi_hunter"), &fi_hunter_on);
-            if (fi_hunter_on) {
-                ImGui::SliderFloat(T("监 X(0=居中)##fi_hunter", "Htr X(0=center)##fi_hunter"), &fi_hunter_x, 0.0f, mw, "%.0f");
-                ImGui::SliderFloat(T("监 Y##fi_hunter", "Htr Y##fi_hunter"), &fi_hunter_y, 0.0f, mh, "%.0f");
-                ImGui::SliderFloat(T("监 大小##fi_hunter", "Htr size##fi_hunter"), &fi_hunter_size, 10.0f, 60.0f, "%.0f");
-            }
-
-            ImGui::Checkbox(T("求生者天赋##fi_civ", "Survivor talents##fi_civ"), &fi_civ_on);
-            if (fi_civ_on) {
-                ImGui::SliderFloat(T("求 X##fi_civ", "Svr X##fi_civ"), &fi_civ_x, 0.0f, mw, "%.0f");
-                ImGui::SliderFloat(T("求 Y##fi_civ", "Svr Y##fi_civ"), &fi_civ_y, 0.0f, mh, "%.0f");
-                ImGui::SliderFloat(T("求 大小##fi_civ", "Svr size##fi_civ"), &fi_civ_size, 10.0f, 60.0f, "%.0f");
-                ImGui::SliderFloat(T("求 间距##fi_civ", "Svr gap##fi_civ"), &fi_civ_gap, 0.0f, 300.0f, "%.0f");
-            }
-
-            ImGui::Checkbox(T("骑士预测##fi_knight", "Knight prediction##fi_knight"), &fi_knight_on);
-            if (fi_knight_on) {
-                ImGui::SliderFloat(T("骑 X(0=居中)##fi_knight", "Kni X(0=center)##fi_knight"), &fi_knight_x, 0.0f, mw, "%.0f");
-                ImGui::SliderFloat(T("骑 Y##fi_knight", "Kni Y##fi_knight"), &fi_knight_y, 0.0f, mh, "%.0f");
-                ImGui::SliderFloat(T("骑 大小##fi_knight", "Kni size##fi_knight"), &fi_knight_size, 10.0f, 60.0f, "%.0f");
-                ImGui::SliderFloat(T("骑 间距##fi_knight", "Kni gap##fi_knight"), &fi_knight_gap, 0.0f, 300.0f, "%.0f");
-            }
-
-            // 模仿者会议阶段的身份列表(开会时代替 in-world 绘制，要开「模仿者」)
-            ImGui::TextUnformatted(T("模仿者会议列表", "Copycat meeting list"));
-            ImGui::SliderFloat(T("会 X##fi_cc", "Mtg X##fi_cc"), &fi_cc_x, 0.0f, mw, "%.0f");
-            ImGui::SliderFloat(T("会 Y##fi_cc", "Mtg Y##fi_cc"), &fi_cc_y, 0.0f, mh, "%.0f");
-            ImGui::SliderFloat(T("会 大小##fi_cc", "Mtg size##fi_cc"), &fi_cc_size, 10.0f, 60.0f, "%.0f");
+            settings_button("fixed", "位置/大小设置", "Position/size", false);
         }
-
 
         // 角色专属：蜡像师 / 红夫人 / 作曲家。三个都自己判断场合(不是对应角色或对局时什么都不做)，默认全开
         if (ImGui::CollapsingHeader(T("角色专属###role", "Role-specific###role"))) {
@@ -4349,34 +4357,49 @@ void Layout_tick_UI(bool *main_thread_flag) {
             // 作曲家修机节奏：按游戏判定点(begin_time + 时长 − 判定线偏移)点左右两个修机键，不管技能轨道
             if (sub_fold("作曲家修机", "Composer Fix", "sf_mus", AutoMusician::enabled,
                          AutoMusician::enabled && battle && my_camp == 2 && my_pid == 114, true)) {
-            if (ImGui::BeginTable("##mus_tbl", 2, ImGuiTableFlags_SizingFixedFit)) {
-                ImGui::TableNextColumn();
-                ImGui::Checkbox(T("开启##auto_mus", "Enable##auto_mus"), &AutoMusician::enabled);
-                ImGui::TableNextColumn();
-                ImGui::Checkbox(T("显示触摸点##mus_tp", "Show Touch Points##mus_tp"), &AutoMusician::show_touch_point);
-                ImGui::TableNextColumn();
-                if (ImGui::Button(T("测试左键##mus_tl", "Test L##mus_tl"))) AutoMusician::request_test_tap(0);
-                ImGui::TableNextColumn();
-                if (ImGui::Button(T("测试右键##mus_tr", "Test R##mus_tr"))) AutoMusician::request_test_tap(1);
-                ImGui::TableNextColumn();
-                ImGui::Checkbox(T("只记日志不点##mus_dry", "Log only##mus_dry"), &AutoMusician::dry_run);
-                ImGui::EndTable();
+            ImGui::Checkbox(T("开启##auto_mus", "Enable##auto_mus"), &AutoMusician::enabled);
+            settings_button("mus");
+            ImGui::TreePop();
             }
-            ImGui::SliderFloat(T("左键 X##mus_lx", "L X##mus_lx"), &AutoMusician::l_x, 0.0f, (float)displayInfo.width, "%.0f");
-            ImGui::SliderFloat(T("左键 Y##mus_ly", "L Y##mus_ly"), &AutoMusician::l_y, 0.0f, (float)displayInfo.height, "%.0f");
-            ImGui::SliderFloat(T("右键 X##mus_rx", "R X##mus_rx"), &AutoMusician::r_x, 0.0f, (float)displayInfo.width, "%.0f");
-            ImGui::SliderFloat(T("右键 Y##mus_ry", "R Y##mus_ry"), &AutoMusician::r_y, 0.0f, (float)displayInfo.height, "%.0f");
-            ImGui::SliderInt(T("提前量(ms)##mus_lead", "Lead (ms)##mus_lead"), &AutoMusician::lead_ms, -50, 100);
-            help_marker("点击比判定点早多少。日志里「相对判定点」是我们按下的时刻，游戏读到还要再晚这么多",
-                        "How early to tap before the judge point");
-            ImGui::SliderInt(T("时机随机(±ms)##mus_tj", "Timing jitter (ms)##mus_tj"), &AutoMusician::time_jitter_ms, 0, 30);
-            ImGui::SliderInt(T("按住(ms)##mus_hold", "Hold (ms)##mus_hold"), &AutoMusician::hold_ms, 8, 60);
-            ImGui::SliderInt(T("位置随机(px)##mus_jp", "Jitter (px)##mus_jp"), &AutoMusician::jitter_px, 0, 40);
-            ImTextT("状态: %s", "Status: %s", AutoMusician::status_text());
-            ImTextT("参数: %s", "Params: %s", AutoMusician::params_text());
-            ImTextT("点击%d 补打%d 错过%d", "taps%d retaps%d missed%d", AutoMusician::g_taps.load(),
-                    AutoMusician::g_retap.load(), AutoMusician::g_missed.load());
-            ImTextT("上次: %s", "Last: %s", AutoMusician::last_result());
+
+            // 调酒师给酒：队友头上的给酒按钮一亮(游戏判定可点)就点。多人同时可点：优先队友 > 上椅多 > 伤重 > 近
+            if (sub_fold("调酒师给酒", "Bartender Wine", "sf_drinker", AutoDrinker::enabled,
+                         AutoDrinker::enabled && battle && my_camp == 2 && my_pid == AutoDrinker::DRINKER_PID, true)) {
+            ImGui::Checkbox(T("开启##auto_dr", "Enable##auto_dr"), &AutoDrinker::enabled);
+            settings_button("drinker");
+            // 对局中要随时调的两项留在主菜单：血量条件、优先队友
+            ImGui::RadioButton(T("半血及更重##dr_hp0", "Half HP or worse##dr_hp0"), &AutoDrinker::hp_mode, 0);
+            ImGui::SameLine();
+            ImGui::RadioButton(T("任意受伤##dr_hp1", "Any injury##dr_hp1"), &AutoDrinker::hp_mode, 1);
+            // 优先队友：一横排按钮(不指定 + 本局队友)，选中的高亮；只排序不独占，换局自动清回不指定
+            {
+                const AutoDrinker::View dv = AutoDrinker::view();
+                const int64_t pref = AutoDrinker::prefer_uid.load();
+                auto pick_btn = [&](const char *label, int64_t uid, int i) {
+                    char id[128];
+                    snprintf(id, sizeof(id), "%s##dr_pref%d", label, i);
+                    const bool sel = uid == pref;
+                    if (sel) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.60f, 0.25f, 1));
+                    if (ImGui::SmallButton(id)) AutoDrinker::prefer_uid.store(uid);
+                    if (sel) ImGui::PopStyleColor();
+                };
+                ImGui::TextUnformatted(T("优先:", "Prefer:"));
+                ImGui::SameLine();
+                pick_btn(T("不指定", "None"), 0, -1);
+                for (int i = 0; i < dv.n; i++) {
+                    char nm[96];
+                    const char *s = nullptr;
+                    for (int k = 0; dv.m[i].scene && k < data_count; k++) if (data[k].obj == dv.m[i].scene && data[k].str[0]) { s = data[k].str; break; }
+                    if (s) snprintf(nm, sizeof(nm), "%s", s); else snprintf(nm, sizeof(nm), "uid %lld", (long long)dv.m[i].uid);
+                    ImGui::SameLine();
+                    pick_btn(nm, dv.m[i].uid, i);
+                }
+                help_marker("多个队友同时能喂时先喂谁：优先队友 > 上椅次数多 > 伤得重 > 离得近。换局自动清空",
+                            "Who to feed first when several can be fed: preferred > more chair hangs > more hurt > nearer. Resets each match");
+                ImGui::Checkbox(T("只给优先队友##dr_only", "Only the preferred mate##dr_only"), &AutoDrinker::only_prefer);
+                help_marker("开着时只给上面选中的队友喂，其他人一律不喂；没选人(不指定)时不生效",
+                            "When on, only the selected mate is fed and nobody else; has no effect while None is selected");
+            }
             ImGui::TreePop();
             }
         }
@@ -4424,21 +4447,10 @@ void Layout_tick_UI(bool *main_thread_flag) {
         if (ImGui::CollapsingHeader(T("自动盖板 / 校准###pallet", "Auto Pallet / QTE###pallet"))) {
             const bool svr_battle = PyScene::in_battle() && PySelf::camp() == 2;
             if (sub_fold("自动盖板", "Auto Pallet", "sf_pallet", AutoPallet::enabled, AutoPallet::enabled && svr_battle, false)) {
-            if (ImGui::BeginTable("##pallet_tbl", 2, ImGuiTableFlags_SizingFixedFit)) {
-                ImGui::TableNextColumn();
-                ImGui::Checkbox(T("开启##auto_pallet", "Enable##auto_pallet"), &AutoPallet::enabled);   // 不能跟折叠框同名，同名 ID 冲突会点不动
-                ImGui::TableNextColumn();
-                ImGui::Checkbox(T("显示判定范围", "Show Range"), &AutoPallet::show_range);
-                ImGui::TableNextColumn();
-                ImGui::Checkbox(T("显示触摸点", "Show Touch Point"), &AutoPallet::show_touch_point);
-                ImGui::TableNextColumn();
-                if (ImGui::Button(T("测试点击", "Test Tap"))) AutoPallet::request_test_tap();
-                help_marker("站在板子旁边按，游戏里有反应说明触摸点对准了放板按钮",
-                            "Stand next to a pallet and press it; if the game reacts, the touch point is on the pallet button");
-                ImGui::EndTable();
-            }
-
-            ImGui::TextDisabled("Python板子: %s", PyPanel::status_text());
+            ImGui::Checkbox(T("开启##auto_pallet", "Enable##auto_pallet"), &AutoPallet::enabled);   // 不能跟折叠框同名，同名 ID 冲突会点不动
+            ImGui::SameLine();
+            ImGui::Checkbox(T("显示判定范围", "Show Range"), &AutoPallet::show_range);
+            settings_button("pallet");
 
             // 触发宽度(游戏单位，判定矩形的全宽)：固定 / 随机(每次点完在上下限之间重抽)，范围都是 5~15
             ImGui::Checkbox(T("随机宽度##pallet_rand", "Random width##pallet_rand"), &AutoPallet::random_width);
@@ -4453,13 +4465,6 @@ void Layout_tick_UI(bool *main_thread_flag) {
                                    AutoPallet::WIDTH_MIN, AutoPallet::WIDTH_MAX, "%.1f");
                 if (AutoPallet::width_lo > AutoPallet::width_hi) AutoPallet::width_hi = AutoPallet::width_lo;   // 拖下限越过上限时上限跟着走
             }
-            ImGui::SliderFloat(T("触摸点 X", "Touch X"), &AutoPallet::touch_x, 0.0f, (float)displayInfo.width, "%.0f");
-            ImGui::SliderFloat(T("触摸点 Y", "Touch Y"), &AutoPallet::touch_y, 0.0f, (float)displayInfo.height, "%.0f");
-            ImGui::SliderInt(T("按住(ms)", "Hold (ms)"), &AutoPallet::hold_ms, 10, 120);
-            ImGui::SliderInt(T("位置随机(px)", "Jitter (px)"), &AutoPallet::jitter_px, 0, 60);   // 只作用于自动点击，测试点击不随机
-            help_marker("自动点击落在触摸点周围这么多像素内的随机位置(测试点击不随机)",
-                        "Auto taps land randomly within this many pixels of the touch point (test tap is exact)");
-            ImGui::SliderInt(T("时长随机(±ms)", "Hold jitter (ms)"), &AutoPallet::jitter_ms, 0, 30);
             // 快速监管预判：实测速度 > 门槛时把监管位置往前推「提前量」再判(多数监管配表移速 4.54~4.71 m/s)
             ImGui::Checkbox(T("快速监管预判##pallet_pred", "Predict fast hunters##pallet_pred"), &AutoPallet::predict_fast);
             help_marker("监管实测速度超过门槛时，按「提前量」把它的位置往前推再判断(多数监管正常移速 4.5~4.7 m/s)",
@@ -4483,38 +4488,13 @@ void Layout_tick_UI(bool *main_thread_flag) {
                     else          ImTextT("监管速度: %s 测量中", "Hunter speed: %s measuring", name);
                 }
             }
-            ImTextT("状态: %s", "Status: %s", AutoPallet::status_text());
-            ImTextT("点击 成功%d 失败%d  确认放下%d", "Tap ok%d fail%d confirmed%d",
-                    AutoPallet::g_tap_ok.load(), AutoPallet::g_tap_fail.load(), AutoPallet::g_confirmed.load());
-            ImTextT("上次: %s", "Last: %s", AutoPallet::last_result());
             ImGui::TreePop();
             }
 
             // 自动校准：按游戏自己的出题参数算指针到完美区中心的时刻，提前「提前量」点校准按钮
             if (sub_fold("自动校准", "Auto QTE", "sf_qte", AutoQte::enabled, AutoQte::enabled && svr_battle, false)) {
-            if (ImGui::BeginTable("##qte_tbl", 2, ImGuiTableFlags_SizingFixedFit)) {
-                ImGui::TableNextColumn();
-                ImGui::Checkbox(T("开启##auto_qte", "Enable##auto_qte"), &AutoQte::enabled);
-                ImGui::TableNextColumn();
-                ImGui::Checkbox(T("显示触摸点##qte_tp", "Show Touch Point##qte_tp"), &AutoQte::show_touch_point);
-                ImGui::TableNextColumn();
-                if (ImGui::Button(T("测试点击##qte_test", "Test Tap##qte_test"))) AutoQte::request_test_tap();
-                help_marker("修机出校准时按，指针停下说明触摸点对准了校准按钮",
-                            "Press during a QTE; if the needle stops, the touch point is on the QTE button");
-                ImGui::EndTable();
-            }
-            ImGui::SliderFloat(T("触摸点 X##qte_x", "Touch X##qte_x"), &AutoQte::touch_x, 0.0f, (float)displayInfo.width, "%.0f");
-            ImGui::SliderFloat(T("触摸点 Y##qte_y", "Touch Y##qte_y"), &AutoQte::touch_y, 0.0f, (float)displayInfo.height, "%.0f");
-            ImGui::SliderInt(T("提前量(ms)##qte_lead", "Lead (ms)##qte_lead"), &AutoQte::lead_ms, 0, 150);
-            help_marker("点击比指针到完美区中心早多少。总是偏晚(过了完美区)就加大，偏早就减小；完美窗口约 ±50ms",
-                        "How early to tap before the needle reaches the perfect zone center. Late -> increase, early -> decrease; window is about +-50ms");
-            ImGui::SliderInt(T("时机随机(±ms)##qte_tj", "Timing jitter (ms)##qte_tj"), &AutoQte::time_jitter_ms, 0, 40);
-            ImGui::SliderInt(T("按住(ms)##qte_hold", "Hold (ms)##qte_hold"), &AutoQte::hold_ms, 10, 120);
-            ImGui::SliderInt(T("位置随机(px)##qte_jp", "Jitter (px)##qte_jp"), &AutoQte::jitter_px, 0, 60);
-            ImTextT("状态: %s", "Status: %s", AutoQte::status_text());
-            ImTextT("命中%d 失败%d 跳过%d", "hit%d fail%d skip%d",
-                    AutoQte::g_hit.load(), AutoQte::g_fail.load(), AutoQte::g_skip.load());
-            ImTextT("上次: %s", "Last: %s", AutoQte::last_result());
+            ImGui::Checkbox(T("开启##auto_qte", "Enable##auto_qte"), &AutoQte::enabled);
+            settings_button("qte");
             ImGui::TreePop();
             }
         }
@@ -4529,6 +4509,8 @@ void Layout_tick_UI(bool *main_thread_flag) {
 
         g_window = ImGui::GetCurrentWindow();
         ImGui::End();
+
+        if (g_settings_open) draw_settings_window();   // 跟主菜单一起受音量键/截图隐藏
     }
 
     // 监管天赋树(径向图)：独立可拖动/缩放窗口。数据用 Info.genius_levels[1..40]，纯显示。
@@ -4585,4 +4567,162 @@ void Layout_tick_UI(bool *main_thread_flag) {
         }
         ImGui::End();
     }
+}
+
+// ---- 详细设置窗口(二级)：设完就不管的参数都在这里，主菜单每个功能旁的「设置」按钮会打开并展开对应一节 ----
+static void draw_settings_window()
+{
+    const float mw = (float)displayInfo.width, mh = (float)displayInfo.height;
+    ImGui::SetNextWindowBgAlpha(panel_alpha);
+    ImGui::SetNextWindowPos(ImVec2(mw * 0.45f, mh * 0.08f), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSizeConstraints(ImVec2(0, 0), ImVec2(mw * 0.6f, mh * 0.9f));
+    if (!ImGui::Begin(T("详细设置###settings", "Settings###settings"), &g_settings_open, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::End();
+        return;
+    }
+    ImGui::TextDisabled("%s", T("设完不常改的参数。改完记得在主菜单点「保存配置」", "Rarely-changed parameters. Use Save Config in the main menu afterwards"));
+
+    // 准星：位置/样式/大小/粗细整套按角色记(保存配置时写进去)；位置同时是蜡像师瞄准线对齐用的标记位置
+    if (settings_section("准星", "Crosshair", "xhair")) {
+        if (WaxAim::aim_x < 0) WaxAim::aim_x = mw * 0.5f;
+        if (WaxAim::aim_y < 0) WaxAim::aim_y = mh * WAX_MARK_Y;
+        if (ImGui::Button(T("恢复默认##xh_reset", "Reset##xh_reset"))) {
+            // 删掉本角色的记录：回到蜡像师的(当前就是蜡像师则回到默认)
+            if (g_xhair_pid > 0) g_xhair.erase(g_xhair_pid);
+            if (g_xhair_pid == WaxAim::WAX_PID) { g_xh = XhairCfg(); g_xh.x = mw * 0.5f; g_xh.y = mh * WAX_MARK_Y; }
+            else g_xh = xhair_for(g_xhair_pid);
+            WaxAim::aim_x = g_xh.x; WaxAim::aim_y = g_xh.y;
+        }
+        bool changed = false;
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 8);
+        if (ImGui::BeginCombo(T("样式##xh_style", "Style##xh_style"), xhair_style_name(g_xh.style))) {
+            for (int s = 0; s < XH_STYLE_N; s++)
+                if (ImGui::Selectable(xhair_style_name(s), s == g_xh.style)) { g_xh.style = s; changed = true; }
+            ImGui::EndCombo();
+        }
+        changed |= ImGui::SliderFloat(T("大小##xh_size", "Size##xh_size"), &g_xh.size, 3.0f, 60.0f, "%.0f");
+        changed |= ImGui::SliderFloat(T("粗细##xh_thick", "Thickness##xh_thick"), &g_xh.thick, 1.0f, 8.0f, "%.1f");
+        changed |= ImGui::SliderFloat(T("X##xh_x", "X##xh_x"), &WaxAim::aim_x, 0.0f, mw, "%.0f");
+        changed |= ImGui::SliderFloat(T("Y##xh_y", "Y##xh_y"), &WaxAim::aim_y, 0.0f, mh, "%.0f");
+        if (changed && g_xhair_pid > 0) {
+            g_xh.x = WaxAim::aim_x; g_xh.y = WaxAim::aim_y;
+            g_xhair[g_xhair_pid] = g_xh;
+        }
+        if (g_xhair_pid > 0)
+            ImGui::TextColored(ImVec4(0.65f, 0.65f, 0.65f, 1), T("当前角色 pid %d：%s", "Role pid %d: %s"), g_xhair_pid,
+                               g_xhair.count(g_xhair_pid) ? T("用本角色的设置", "own settings") : T("沿用蜡像师/默认", "from Waxwork/default"));
+    }
+
+    // 固定信息：每块的 X/Y/大小(开关在主菜单)
+    if (settings_section("固定信息 位置/大小", "Fixed HUD position/size", "fixed")) {
+        ImGui::TextUnformatted(T("密码机/门面板", "Cipher/Gate panel"));
+        ImGui::SliderFloat(T("机 X##fi_gen", "Gen X##fi_gen"), &fi_gen_x, 0.0f, mw, "%.0f");
+        ImGui::SliderFloat(T("机 Y##fi_gen", "Gen Y##fi_gen"), &fi_gen_y, 0.0f, mh, "%.0f");
+        ImGui::SliderFloat(T("机 大小##fi_gen", "Gen size##fi_gen"), &fi_gen_size, 10.0f, 60.0f, "%.0f");
+        ImGui::TextUnformatted(T("监管特质/天赋", "Hunter trait/talent"));
+        ImGui::SliderFloat(T("监 X(0=居中)##fi_hunter", "Htr X(0=center)##fi_hunter"), &fi_hunter_x, 0.0f, mw, "%.0f");
+        ImGui::SliderFloat(T("监 Y##fi_hunter", "Htr Y##fi_hunter"), &fi_hunter_y, 0.0f, mh, "%.0f");
+        ImGui::SliderFloat(T("监 大小##fi_hunter", "Htr size##fi_hunter"), &fi_hunter_size, 10.0f, 60.0f, "%.0f");
+        ImGui::TextUnformatted(T("求生者天赋", "Survivor talents"));
+        ImGui::SliderFloat(T("求 X##fi_civ", "Svr X##fi_civ"), &fi_civ_x, 0.0f, mw, "%.0f");
+        ImGui::SliderFloat(T("求 Y##fi_civ", "Svr Y##fi_civ"), &fi_civ_y, 0.0f, mh, "%.0f");
+        ImGui::SliderFloat(T("求 大小##fi_civ", "Svr size##fi_civ"), &fi_civ_size, 10.0f, 60.0f, "%.0f");
+        ImGui::SliderFloat(T("求 间距##fi_civ", "Svr gap##fi_civ"), &fi_civ_gap, 0.0f, 300.0f, "%.0f");
+        ImGui::TextUnformatted(T("骑士预测", "Knight prediction"));
+        ImGui::SliderFloat(T("骑 X(0=居中)##fi_knight", "Kni X(0=center)##fi_knight"), &fi_knight_x, 0.0f, mw, "%.0f");
+        ImGui::SliderFloat(T("骑 Y##fi_knight", "Kni Y##fi_knight"), &fi_knight_y, 0.0f, mh, "%.0f");
+        ImGui::SliderFloat(T("骑 大小##fi_knight", "Kni size##fi_knight"), &fi_knight_size, 10.0f, 60.0f, "%.0f");
+        ImGui::SliderFloat(T("骑 间距##fi_knight", "Kni gap##fi_knight"), &fi_knight_gap, 0.0f, 300.0f, "%.0f");
+        // 模仿者会议阶段的身份列表(开会时代替 in-world 绘制，要开「模仿者」)
+        ImGui::TextUnformatted(T("模仿者会议列表", "Copycat meeting list"));
+        ImGui::SliderFloat(T("会 X##fi_cc", "Mtg X##fi_cc"), &fi_cc_x, 0.0f, mw, "%.0f");
+        ImGui::SliderFloat(T("会 Y##fi_cc", "Mtg Y##fi_cc"), &fi_cc_y, 0.0f, mh, "%.0f");
+        ImGui::SliderFloat(T("会 大小##fi_cc", "Mtg size##fi_cc"), &fi_cc_size, 10.0f, 60.0f, "%.0f");
+    }
+
+    // 作曲家修机：两个修机键的位置、时机
+    if (settings_section("作曲家修机", "Composer Fix", "mus")) {
+        if (ImGui::BeginTable("##mus_tbl", 2, ImGuiTableFlags_SizingFixedFit)) {
+            ImGui::TableNextColumn();
+            ImGui::Checkbox(T("显示触摸点##mus_tp", "Show Touch Points##mus_tp"), &AutoMusician::show_touch_point);
+            ImGui::TableNextColumn();
+            ImGui::Checkbox(T("只记日志不点##mus_dry", "Log only##mus_dry"), &AutoMusician::dry_run);
+            ImGui::TableNextColumn();
+            if (ImGui::Button(T("测试左键##mus_tl", "Test L##mus_tl"))) AutoMusician::request_test_tap(0);
+            ImGui::TableNextColumn();
+            if (ImGui::Button(T("测试右键##mus_tr", "Test R##mus_tr"))) AutoMusician::request_test_tap(1);
+            ImGui::EndTable();
+        }
+        ImGui::SliderFloat(T("左键 X##mus_lx", "L X##mus_lx"), &AutoMusician::l_x, 0.0f, mw, "%.0f");
+        ImGui::SliderFloat(T("左键 Y##mus_ly", "L Y##mus_ly"), &AutoMusician::l_y, 0.0f, mh, "%.0f");
+        ImGui::SliderFloat(T("右键 X##mus_rx", "R X##mus_rx"), &AutoMusician::r_x, 0.0f, mw, "%.0f");
+        ImGui::SliderFloat(T("右键 Y##mus_ry", "R Y##mus_ry"), &AutoMusician::r_y, 0.0f, mh, "%.0f");
+        ImGui::SliderInt(T("提前量(ms)##mus_lead", "Lead (ms)##mus_lead"), &AutoMusician::lead_ms, -50, 100);
+        help_marker("点击比判定点早多少。日志里「相对判定点」是我们按下的时刻，游戏读到还要再晚这么多",
+                    "How early to tap before the judge point");
+        ImGui::SliderInt(T("时机随机(±ms)##mus_tj", "Timing jitter (ms)##mus_tj"), &AutoMusician::time_jitter_ms, 0, 30);
+        ImGui::SliderInt(T("按住(ms)##mus_hold", "Hold (ms)##mus_hold"), &AutoMusician::hold_ms, 8, 60);
+        ImGui::SliderInt(T("位置随机(px)##mus_jp", "Jitter (px)##mus_jp"), &AutoMusician::jitter_px, 0, 40);
+        ImTextT("状态: %s", "Status: %s", AutoMusician::status_text());
+        ImTextT("参数: %s", "Params: %s", AutoMusician::params_text());
+        ImTextT("点击%d 补打%d 错过%d", "taps%d retaps%d missed%d", AutoMusician::g_taps.load(),
+                AutoMusician::g_retap.load(), AutoMusician::g_missed.load());
+        ImTextT("上次: %s", "Last: %s", AutoMusician::last_result());
+    }
+
+    // 调酒师给酒：点击位置(挂点是模型文件里的固定值，一般不用动)
+    if (settings_section("调酒师给酒", "Bartender Wine", "drinker")) {
+        ImGui::Checkbox(T("显示触摸点##dr_tp", "Show Touch Point##dr_tp"), &AutoDrinker::show_touch_point);
+        ImGui::SliderFloat(T("挂点高度##dr_h", "Socket height##dr_h"), &AutoDrinker::ui_height, 0.0f, 40.0f, "%.2f");
+        help_marker("游戏模型文件里给酒按钮的挂点高度是 13.28(挂在模型根上，不跟动作动)，一般不用改",
+                    "The model file puts the button socket at height 13.28 (on the model root, not a bone); normally leave it");
+        ImGui::SliderFloat(T("X 微调##dr_ox", "X offset##dr_ox"), &AutoDrinker::off_x, -300.0f, 300.0f, "%.0f");
+        ImGui::SliderFloat(T("Y 微调##dr_oy", "Y offset##dr_oy"), &AutoDrinker::off_y, -300.0f, 300.0f, "%.0f");
+        ImGui::SliderInt(T("按住(ms)##dr_hold", "Hold (ms)##dr_hold"), &AutoDrinker::hold_ms, 10, 120);
+        ImGui::SliderInt(T("位置随机(px)##dr_jp", "Jitter (px)##dr_jp"), &AutoDrinker::jitter_px, 0, 40);
+        ImTextT("状态: %s", "Status: %s", AutoDrinker::status_text());
+    }
+
+    // 自动盖板：放板按钮的触摸点、点击手感(触发宽度/预判在主菜单)
+    if (settings_section("自动盖板", "Auto Pallet", "pallet")) {
+        ImGui::Checkbox(T("显示触摸点##pallet_tp", "Show Touch Point##pallet_tp"), &AutoPallet::show_touch_point);
+        ImGui::SameLine();
+        if (ImGui::Button(T("测试点击##pallet_test", "Test Tap##pallet_test"))) AutoPallet::request_test_tap();
+        help_marker("站在板子旁边按，游戏里有反应说明触摸点对准了放板按钮",
+                    "Stand next to a pallet and press it; if the game reacts, the touch point is on the pallet button");
+        ImGui::SliderFloat(T("触摸点 X##pallet_x", "Touch X##pallet_x"), &AutoPallet::touch_x, 0.0f, mw, "%.0f");
+        ImGui::SliderFloat(T("触摸点 Y##pallet_y", "Touch Y##pallet_y"), &AutoPallet::touch_y, 0.0f, mh, "%.0f");
+        ImGui::SliderInt(T("按住(ms)##pallet_hold", "Hold (ms)##pallet_hold"), &AutoPallet::hold_ms, 10, 120);
+        ImGui::SliderInt(T("位置随机(px)##pallet_jp", "Jitter (px)##pallet_jp"), &AutoPallet::jitter_px, 0, 60);   // 只作用于自动点击，测试点击不随机
+        help_marker("自动点击落在触摸点周围这么多像素内的随机位置(测试点击不随机)",
+                    "Auto taps land randomly within this many pixels of the touch point (test tap is exact)");
+        ImGui::SliderInt(T("时长随机(±ms)##pallet_jms", "Hold jitter (ms)##pallet_jms"), &AutoPallet::jitter_ms, 0, 30);
+        ImGui::TextDisabled("Python板子: %s", PyPanel::status_text());
+        ImTextT("状态: %s", "Status: %s", AutoPallet::status_text());
+        ImTextT("点击 成功%d 失败%d  确认放下%d", "Tap ok%d fail%d confirmed%d",
+                AutoPallet::g_tap_ok.load(), AutoPallet::g_tap_fail.load(), AutoPallet::g_confirmed.load());
+        ImTextT("上次: %s", "Last: %s", AutoPallet::last_result());
+    }
+
+    // 自动校准：校准按钮的触摸点、时机
+    if (settings_section("自动校准", "Auto QTE", "qte")) {
+        ImGui::Checkbox(T("显示触摸点##qte_tp", "Show Touch Point##qte_tp"), &AutoQte::show_touch_point);
+        ImGui::SameLine();
+        if (ImGui::Button(T("测试点击##qte_test", "Test Tap##qte_test"))) AutoQte::request_test_tap();
+        help_marker("修机出校准时按，指针停下说明触摸点对准了校准按钮",
+                    "Press during a QTE; if the needle stops, the touch point is on the QTE button");
+        ImGui::SliderFloat(T("触摸点 X##qte_x", "Touch X##qte_x"), &AutoQte::touch_x, 0.0f, mw, "%.0f");
+        ImGui::SliderFloat(T("触摸点 Y##qte_y", "Touch Y##qte_y"), &AutoQte::touch_y, 0.0f, mh, "%.0f");
+        ImGui::SliderInt(T("提前量(ms)##qte_lead", "Lead (ms)##qte_lead"), &AutoQte::lead_ms, 0, 150);
+        help_marker("点击比指针到完美区中心早多少。总是偏晚(过了完美区)就加大，偏早就减小；完美窗口约 ±50ms",
+                    "How early to tap before the needle reaches the perfect zone center. Late -> increase, early -> decrease; window is about +-50ms");
+        ImGui::SliderInt(T("时机随机(±ms)##qte_tj", "Timing jitter (ms)##qte_tj"), &AutoQte::time_jitter_ms, 0, 40);
+        ImGui::SliderInt(T("按住(ms)##qte_hold", "Hold (ms)##qte_hold"), &AutoQte::hold_ms, 10, 120);
+        ImGui::SliderInt(T("位置随机(px)##qte_jp", "Jitter (px)##qte_jp"), &AutoQte::jitter_px, 0, 60);
+        ImTextT("状态: %s", "Status: %s", AutoQte::status_text());
+        ImTextT("命中%d 失败%d 跳过%d", "hit%d fail%d skip%d",
+                AutoQte::g_hit.load(), AutoQte::g_fail.load(), AutoQte::g_skip.load());
+        ImTextT("上次: %s", "Last: %s", AutoQte::last_result());
+    }
+    ImGui::End();
 }
